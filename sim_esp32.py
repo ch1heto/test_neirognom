@@ -53,9 +53,9 @@ while True:
         }
     )
 
-    client.publish(CLIMATE_TOPIC, climate_payload)
-    client.publish(WATER_TOPIC, water_payload)
-    client.publish(SOIL_TOPIC, soil_payload)
+    client.publish(CLIMATE_TOPIC, climate_payload, retain=True)
+    client.publish(WATER_TOPIC, water_payload, retain=True)
+    client.publish(SOIL_TOPIC, soil_payload, retain=True)
 
     print(f"[СИМУЛЯТОР] Отправлены данные: {climate_payload}")
     print(f"[СИМУЛЯТОР] Отправлены данные: {water_payload}")

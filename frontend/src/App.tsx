@@ -27,7 +27,7 @@ type DeviceCardProps = {
   deviceType: 'light' | 'fan' | 'pump' | 'valve'
   timerValue: string
   onTimerChange: (value: string) => void
-  onCommand: (deviceType: string, state: CommandState, duration?: number) => void
+  onCommand: (deviceType: DeviceCardProps['deviceType'], state: CommandState, duration?: number) => void
 }
 
 function metricValue(value: number | null, unit: string) {
@@ -187,44 +187,36 @@ function App() {
   }, [])
 
   const sendCommand = async (
-    deviceType: string,
+    device_type: DeviceCardProps['deviceType'],
     state: CommandState,
     duration?: number,
   ) => {
-    setRequestState(`Отправка команды ${state} для ${deviceType}`)
+    setRequestState(`Отправка команды ${state} для ${device_type}`)
 
     try {
-      const payload: {
-        target_id: string
-        device_type: string
-        state: CommandState
-        duration?: number
-      } = {
-        target_id: 'tray_1',
-        device_type: deviceType,
-        state,
-      }
-
-      if (state === 'TIMER' && duration !== undefined) {
-        payload.duration = Number(duration)
-      }
-
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          target_id: 'tray_1',
+          device_type,
+          state,
+          ...(state === 'TIMER' && duration !== undefined
+            ? { duration: Number(duration) }
+            : {}),
+        }),
       })
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`)
       }
 
-      setRequestState(`Команда ${state} для ${deviceType} отправлена`)
+      setRequestState(`Команда ${state} для ${device_type} отправлена`)
     } catch (error) {
       console.error('Не удалось отправить команду устройству', error)
-      setRequestState(`Ошибка отправки команды ${state} для ${deviceType}`)
+      setRequestState(`Ошибка отправки команды ${state} для ${device_type}`)
     }
   }
 
@@ -252,7 +244,7 @@ function App() {
           </div>
 
           <div className="telemetry-grid">
-            <article className="data-card">
+            <article className="sensor-card">
               <h3>Климат</h3>
               <dl className="metric-list">
                 <div className="metric-row">
@@ -270,7 +262,7 @@ function App() {
               </dl>
             </article>
 
-            <article className="data-card">
+            <article className="sensor-card">
               <h3>Резервуар</h3>
               <dl className="metric-list">
                 <div className="metric-row">
@@ -284,7 +276,7 @@ function App() {
               </dl>
             </article>
 
-            <article className="data-card">
+            <article className="sensor-card">
               <h3>Субстрат</h3>
               <dl className="metric-list">
                 <div className="metric-row">

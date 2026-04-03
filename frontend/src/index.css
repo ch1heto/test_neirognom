@@ -86,20 +86,21 @@ input {
 .telemetry-grid,
 .devices-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+  gap: 24px;
 }
 
-.data-card,
+.sensor-card,
 .device-card {
   background: #ffffff;
   border: 1px solid rgba(218, 235, 224, 0.92);
   border-radius: 16px;
-  padding: 22px;
-  box-shadow: 0 12px 30px rgba(120, 165, 136, 0.08);
+  padding: 24px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
 }
 
-.data-card h3,
+.sensor-card h3,
 .device-card h3 {
   margin: 0;
   font-size: 1rem;
@@ -165,7 +166,7 @@ input {
   min-height: 44px;
   flex: 1;
   border-radius: 12px;
-  border: 1px solid transparent;
+  border: 2px solid transparent;
   cursor: pointer;
   transition:
     transform 0.16s ease,
@@ -180,34 +181,36 @@ input {
   transform: translateY(-1px);
 }
 
-.control-button--primary,
-.timer-control__button {
-  background: #8fd3a8;
+.control-button--primary {
+  background: rgba(255, 255, 255, 0.72);
   border-color: #8fd3a8;
-  color: #234535;
-  box-shadow: 0 8px 18px rgba(143, 211, 168, 0.28);
+  color: #2c5b43;
+  box-shadow: 0 6px 18px rgba(143, 211, 168, 0.14);
 }
 
-.control-button--primary:hover,
-.timer-control__button:hover {
-  background: #7bc896;
+.control-button--primary:hover {
+  background: linear-gradient(180deg, rgba(233, 250, 238, 0.95), rgba(220, 245, 229, 0.95));
   border-color: #7bc896;
+  box-shadow: 0 10px 20px rgba(123, 200, 150, 0.18);
 }
 
 .control-button--secondary {
-  background: #ffffff;
-  border-color: #d6e7dc;
-  color: #6c8477;
+  background: rgba(255, 255, 255, 0.72);
+  border-color: #f0c9cf;
+  color: #9b6c73;
+  box-shadow: 0 6px 18px rgba(240, 201, 207, 0.12);
 }
 
 .control-button--secondary:hover {
-  border-color: #bfd7c7;
-  color: #4f6a5c;
+  background: linear-gradient(180deg, rgba(255, 242, 244, 0.95), rgba(255, 235, 238, 0.95));
+  border-color: #e9b1bb;
+  color: #82565d;
+  box-shadow: 0 10px 20px rgba(233, 177, 187, 0.18);
 }
 
 .timer-control {
   display: flex;
-  gap: 10px;
+  gap: 8px;
 }
 
 .timer-control__input {
@@ -216,7 +219,7 @@ input {
   min-width: 0;
   padding: 0 14px;
   border: 1px solid #d6e7dc;
-  border-radius: 12px;
+  border-radius: 8px;
   background: #fcfffd;
   color: #446154;
 }
@@ -224,11 +227,21 @@ input {
 .timer-control__input:focus {
   outline: none;
   border-color: #9cd8b2;
-  box-shadow: 0 0 0 4px rgba(156, 216, 178, 0.18);
+  box-shadow: 0 0 0 3px rgba(156, 216, 178, 0.22);
 }
 
 .timer-control__button {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: #8fd3a8;
+  color: #2c5b43;
+  box-shadow: 0 6px 18px rgba(143, 211, 168, 0.14);
   white-space: nowrap;
+}
+
+.timer-control__button:hover {
+  background: linear-gradient(180deg, rgba(233, 250, 238, 0.95), rgba(220, 245, 229, 0.95));
+  border-color: #7bc896;
+  box-shadow: 0 10px 20px rgba(123, 200, 150, 0.18);
 }
 
 .dashboard__footer {
@@ -268,10 +281,5 @@ input {
 @media (max-width: 720px) {
   .dashboard {
     padding: 22px 14px 28px;
-  }
-
-  .device-card__actions,
-  .timer-control {
-    flex-direction: column;
   }
 }
