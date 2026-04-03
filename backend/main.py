@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "farm.db"
-BROKER_HOST = "localhost"
+BROKER_HOST = "31.56.208.196"
 BROKER_PORT = 1883
-SENSORS_TOPIC = "farm/+/sensors"
+SENSORS_TOPIC = "farm/+/sensors/#"
 
 
 def init_db() -> None:

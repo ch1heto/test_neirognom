@@ -2,10 +2,8 @@ import { useEffect, useState } from 'react'
 import mqtt from 'mqtt'
 
 const MQTT_WS_URL = 'ws://31.56.208.196:9001'
-const API_URL = 'http://31.56.208.196:8000/api/device/control'
-const CLIMATE_TOPIC = 'farm/tray_1/sensors/climate'
-const WATER_TOPIC = 'farm/tray_1/sensors/water'
-const SOIL_TOPIC = 'farm/tray_1/sensors/soil'
+const API_URL = 'http://127.0.0.1:8000/api/device/control'
+const SENSORS_TOPIC = 'farm/tray_1/sensors/#'
 
 type CommandState = 'ON' | 'OFF' | 'TIMER'
 
@@ -26,10 +24,14 @@ type SoilData = {
 
 type DeviceCardProps = {
   title: string
-  deviceType: string
+  deviceType: 'light' | 'fan' | 'pump' | 'valve'
   timerValue: string
   onTimerChange: (value: string) => void
   onCommand: (deviceType: string, state: CommandState, duration?: number) => void
+}
+
+function metricValue(value: number | null, unit: string) {
+  return value === null ? '-' : `${value} ${unit}`
 }
 
 function DeviceCard({
@@ -79,18 +81,14 @@ function DeviceCard({
           min="0.1"
           value={timerValue}
           onChange={(event) => onTimerChange(event.target.value)}
-          placeholder="0.0"
+          placeholder="1.0"
         />
         <button className="timer-control__button" onClick={handleTimerStart}>
-          Запуск (сек)
+          Включить на время
         </button>
       </div>
     </article>
   )
-}
-
-function metricValue(value: number | null, unit: string) {
-  return value === null ? '-' : `${value} ${unit}`
 }
 
 function App() {
@@ -108,39 +106,83 @@ function App() {
   useEffect(() => {
     const client = mqtt.connect(MQTT_WS_URL)
 
-    client.on('connect', () => {
-      client.subscribe([CLIMATE_TOPIC, WATER_TOPIC, SOIL_TOPIC])
-    })
-
-    client.on('message', (topic, message) => {
+    const onMessageArrived = (topic: string, message: Buffer<ArrayBufferLike>) => {
       try {
         const data = JSON.parse(message.toString()) as
           | ClimateData
           | WaterData
           | SoilData
 
-        if (topic === CLIMATE_TOPIC) {
+        if (topic.endsWith('/climate')) {
           setClimateData(data as ClimateData)
-        }
-
-        if (topic === WATER_TOPIC) {
+        } else if (topic.endsWith('/water')) {
           setWaterData(data as WaterData)
-        }
-
-        if (topic === SOIL_TOPIC) {
+        } else if (topic.endsWith('/soil')) {
           setSoilData(data as SoilData)
         }
       } catch (error) {
         console.error('Не удалось обработать MQTT-сообщение', error)
       }
+    }
+
+    client.on('connect', () => {
+      client.subscribe(SENSORS_TOPIC)
     })
 
+    client.on('message', onMessageArrived)
     client.on('error', (error) => {
       console.error('Ошибка MQTT-подключения', error)
     })
 
     return () => {
       client.end(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    const handleBodyClick = (event: MouseEvent) => {
+      const target = event.target
+
+      if (!(target instanceof HTMLElement)) {
+        return
+      }
+
+      if (target.closest('.dashboard__shell')) {
+        return
+      }
+
+      const leavesCount = Math.floor(Math.random() * 2) + 3
+
+      for (let index = 0; index < leavesCount; index += 1) {
+        const leaf = document.createElement('div')
+        const size = 10 + Math.random() * 10
+        const offsetX = (Math.random() - 0.5) * 36
+        const duration = 1600 + Math.random() * 900
+        const drift = `${(Math.random() - 0.5) * 90}px`
+        const rotation = `${(Math.random() - 0.5) * 120}deg`
+
+        leaf.className = 'leaf'
+        leaf.style.left = `${event.clientX + offsetX}px`
+        leaf.style.top = `${event.clientY - 8}px`
+        leaf.style.width = `${size}px`
+        leaf.style.height = `${size * 0.72}px`
+        leaf.style.setProperty('--leaf-drift', drift)
+        leaf.style.setProperty('--leaf-rotate', rotation)
+        leaf.style.setProperty('--leaf-duration', `${duration}ms`)
+
+        leaf.addEventListener('animationend', () => {
+          leaf.remove()
+        })
+
+        document.body.appendChild(leaf)
+      }
+    }
+
+    document.body.addEventListener('click', handleBodyClick)
+
+    return () => {
+      document.body.removeEventListener('click', handleBodyClick)
+      document.querySelectorAll('.leaf').forEach((leaf) => leaf.remove())
     }
   }, [])
 
@@ -164,7 +206,7 @@ function App() {
       }
 
       if (state === 'TIMER' && duration !== undefined) {
-        payload.duration = duration
+        payload.duration = Number(duration)
       }
 
       const response = await fetch(API_URL, {
@@ -200,8 +242,7 @@ function App() {
           <p className="dashboard__eyebrow">Neuroagronom Platform</p>
           <h1>Панель управления сити-фермой</h1>
           <p className="dashboard__subtitle">
-            Телеметрия климата, воды и субстрата, а также управление исполнительными
-            устройствами в одном интерфейсе.
+            Телеметрия и управление исполнительными устройствами в едином интерфейсе.
           </p>
         </header>
 
