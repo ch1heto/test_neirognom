@@ -1,31 +1,134 @@
 import { useEffect, useState } from 'react'
 import mqtt from 'mqtt'
 
-const SENSOR_TOPIC = 'farm/tray_1/sensors'
 const MQTT_WS_URL = 'ws://31.56.208.196:9001'
 const API_URL = 'http://31.56.208.196:8000/api/device/control'
+const CLIMATE_TOPIC = 'farm/tray_1/sensors/climate'
+const WATER_TOPIC = 'farm/tray_1/sensors/water'
+const SOIL_TOPIC = 'farm/tray_1/sensors/soil'
+
+type CommandState = 'ON' | 'OFF' | 'TIMER'
+
+type ClimateData = {
+  air_temp: number
+  humidity: number
+  lux: number
+}
+
+type WaterData = {
+  water_temp: number
+  distance_cm: number
+}
+
+type SoilData = {
+  moisture_percent: number
+}
+
+type DeviceCardProps = {
+  title: string
+  deviceType: string
+  timerValue: string
+  onTimerChange: (value: string) => void
+  onCommand: (deviceType: string, state: CommandState, duration?: number) => void
+}
+
+function DeviceCard({
+  title,
+  deviceType,
+  timerValue,
+  onTimerChange,
+  onCommand,
+}: DeviceCardProps) {
+  const handleTimerStart = () => {
+    const duration = Number(timerValue)
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return
+    }
+
+    onCommand(deviceType, 'TIMER', duration)
+  }
+
+  return (
+    <article className="device-card">
+      <div className="device-card__header">
+        <h3>{title}</h3>
+        <span className="device-card__type">{deviceType}</span>
+      </div>
+
+      <div className="device-card__actions">
+        <button
+          className="control-button control-button--primary"
+          onClick={() => onCommand(deviceType, 'ON')}
+        >
+          Включить
+        </button>
+        <button
+          className="control-button control-button--secondary"
+          onClick={() => onCommand(deviceType, 'OFF')}
+        >
+          Выключить
+        </button>
+      </div>
+
+      <div className="timer-control">
+        <input
+          className="timer-control__input"
+          type="number"
+          step="0.1"
+          min="0.1"
+          value={timerValue}
+          onChange={(event) => onTimerChange(event.target.value)}
+          placeholder="0.0"
+        />
+        <button className="timer-control__button" onClick={handleTimerStart}>
+          Запуск (сек)
+        </button>
+      </div>
+    </article>
+  )
+}
+
+function metricValue(value: number | null, unit: string) {
+  return value === null ? '-' : `${value} ${unit}`
+}
 
 function App() {
-  const [temperature, setTemperature] = useState<number | null>(null)
-  const [requestState, setRequestState] = useState('Готово к управлению вентилятором')
+  const [climateData, setClimateData] = useState<ClimateData | null>(null)
+  const [waterData, setWaterData] = useState<WaterData | null>(null)
+  const [soilData, setSoilData] = useState<SoilData | null>(null)
+  const [requestState, setRequestState] = useState('Система готова к управлению')
+  const [timerValues, setTimerValues] = useState({
+    light: '1.0',
+    fan: '1.0',
+    pump: '1.0',
+    valve: '1.0',
+  })
 
   useEffect(() => {
     const client = mqtt.connect(MQTT_WS_URL)
 
     client.on('connect', () => {
-      client.subscribe(SENSOR_TOPIC)
+      client.subscribe([CLIMATE_TOPIC, WATER_TOPIC, SOIL_TOPIC])
     })
 
     client.on('message', (topic, message) => {
-      if (topic !== SENSOR_TOPIC) {
-        return
-      }
-
       try {
-        const data = JSON.parse(message.toString()) as { temperature?: number }
+        const data = JSON.parse(message.toString()) as
+          | ClimateData
+          | WaterData
+          | SoilData
 
-        if (typeof data.temperature === 'number') {
-          setTemperature(data.temperature)
+        if (topic === CLIMATE_TOPIC) {
+          setClimateData(data as ClimateData)
+        }
+
+        if (topic === WATER_TOPIC) {
+          setWaterData(data as WaterData)
+        }
+
+        if (topic === SOIL_TOPIC) {
+          setSoilData(data as SoilData)
         }
       } catch (error) {
         console.error('Не удалось обработать MQTT-сообщение', error)
@@ -41,92 +144,155 @@ function App() {
     }
   }, [])
 
-  const sendFanCommand = async (state: 'ON' | 'OFF') => {
-    setRequestState(`Отправка команды ${state}...`)
+  const sendCommand = async (
+    deviceType: string,
+    state: CommandState,
+    duration?: number,
+  ) => {
+    setRequestState(`Отправка команды ${state} для ${deviceType}`)
 
     try {
+      const payload: {
+        target_id: string
+        device_type: string
+        state: CommandState
+        duration?: number
+      } = {
+        target_id: 'tray_1',
+        device_type: deviceType,
+        state,
+      }
+
+      if (state === 'TIMER' && duration !== undefined) {
+        payload.duration = duration
+      }
+
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          target_id: 'tray_1',
-          device_type: 'fan',
-          state,
-        }),
+        body: JSON.stringify(payload),
       })
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`)
       }
 
-      setRequestState(`Команда ${state} отправлена`)
+      setRequestState(`Команда ${state} для ${deviceType} отправлена`)
     } catch (error) {
-      console.error('Не удалось отправить команду вентилятору', error)
-      setRequestState(`Ошибка отправки команды ${state}`)
+      console.error('Не удалось отправить команду устройству', error)
+      setRequestState(`Ошибка отправки команды ${state} для ${deviceType}`)
     }
+  }
+
+  const setTimerValue = (deviceType: keyof typeof timerValues, value: string) => {
+    setTimerValues((current) => ({
+      ...current,
+      [deviceType]: value,
+    }))
   }
 
   return (
     <main className="dashboard">
-      <section className="dashboard__panel">
-        <p className="dashboard__eyebrow">Neuroagronom Control</p>
-        <h1>Панель управления Neuroagronom</h1>
+      <section className="dashboard__shell">
+        <header className="dashboard__header">
+          <p className="dashboard__eyebrow">Neuroagronom Platform</p>
+          <h1>Панель управления сити-фермой</h1>
+          <p className="dashboard__subtitle">
+            Телеметрия климата, воды и субстрата, а также управление исполнительными
+            устройствами в одном интерфейсе.
+          </p>
+        </header>
 
-        <div
-          style={{
-            marginBottom: '24px',
-            padding: '34px 28px',
-            borderRadius: '26px',
-            background:
-              'linear-gradient(145deg, rgba(255,255,255,0.95) 0%, rgba(228,242,255,0.96) 100%)',
-            border: '1px solid rgba(133, 168, 201, 0.28)',
-            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.7), 0 18px 40px rgba(31, 73, 120, 0.12)',
-          }}
-        >
-          <div
-            style={{
-              fontSize: 'clamp(1.7rem, 4vw, 3rem)',
-              fontWeight: 800,
-              lineHeight: 1.15,
-              color: '#12385a',
-            }}
-          >
-            {temperature === null ? 'Ожидание данных...' : `🌡️ Температура: ${temperature} °C`}
+        <section className="dashboard__section">
+          <div className="section-heading">
+            <h2>Телеметрия</h2>
           </div>
-        </div>
 
-        <div
-          style={{
-            display: 'grid',
-            gap: '14px',
-          }}
-        >
-          <button
-            className="dashboard__button"
-            style={{
-              background: 'linear-gradient(135deg, #1d6f42 0%, #2f8f73 100%)',
-              boxShadow: '0 18px 30px rgba(29, 111, 66, 0.28)',
-            }}
-            onClick={() => sendFanCommand('ON')}
-          >
-            Включить вентилятор (ON)
-          </button>
+          <div className="telemetry-grid">
+            <article className="data-card">
+              <h3>Климат</h3>
+              <dl className="metric-list">
+                <div className="metric-row">
+                  <dt>Воздух</dt>
+                  <dd>{metricValue(climateData?.air_temp ?? null, '°C')}</dd>
+                </div>
+                <div className="metric-row">
+                  <dt>Влажность</dt>
+                  <dd>{metricValue(climateData?.humidity ?? null, '%')}</dd>
+                </div>
+                <div className="metric-row">
+                  <dt>Свет</dt>
+                  <dd>{metricValue(climateData?.lux ?? null, 'Lux')}</dd>
+                </div>
+              </dl>
+            </article>
 
-          <button
-            className="dashboard__button"
-            style={{
-              background: 'linear-gradient(135deg, #a72d2d 0%, #d94e4e 100%)',
-              boxShadow: '0 18px 30px rgba(167, 45, 45, 0.26)',
-            }}
-            onClick={() => sendFanCommand('OFF')}
-          >
-            Выключить вентилятор (OFF)
-          </button>
-        </div>
+            <article className="data-card">
+              <h3>Резервуар</h3>
+              <dl className="metric-list">
+                <div className="metric-row">
+                  <dt>Температура воды</dt>
+                  <dd>{metricValue(waterData?.water_temp ?? null, '°C')}</dd>
+                </div>
+                <div className="metric-row">
+                  <dt>Расстояние</dt>
+                  <dd>{metricValue(waterData?.distance_cm ?? null, 'см')}</dd>
+                </div>
+              </dl>
+            </article>
 
-        <p className="dashboard__status">{requestState}</p>
+            <article className="data-card">
+              <h3>Субстрат</h3>
+              <dl className="metric-list">
+                <div className="metric-row">
+                  <dt>Влажность</dt>
+                  <dd>{metricValue(soilData?.moisture_percent ?? null, '%')}</dd>
+                </div>
+              </dl>
+            </article>
+          </div>
+        </section>
+
+        <section className="dashboard__section">
+          <div className="section-heading">
+            <h2>Управление</h2>
+          </div>
+
+          <div className="devices-grid">
+            <DeviceCard
+              title="Фитосвет"
+              deviceType="light"
+              timerValue={timerValues.light}
+              onTimerChange={(value) => setTimerValue('light', value)}
+              onCommand={sendCommand}
+            />
+            <DeviceCard
+              title="Вентиляция"
+              deviceType="fan"
+              timerValue={timerValues.fan}
+              onTimerChange={(value) => setTimerValue('fan', value)}
+              onCommand={sendCommand}
+            />
+            <DeviceCard
+              title="Насос"
+              deviceType="pump"
+              timerValue={timerValues.pump}
+              onTimerChange={(value) => setTimerValue('pump', value)}
+              onCommand={sendCommand}
+            />
+            <DeviceCard
+              title="Клапан"
+              deviceType="valve"
+              timerValue={timerValues.valve}
+              onTimerChange={(value) => setTimerValue('valve', value)}
+              onCommand={sendCommand}
+            />
+          </div>
+        </section>
+
+        <footer className="dashboard__footer">{requestState}</footer>
       </section>
     </main>
   )

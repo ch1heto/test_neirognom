@@ -97,7 +97,8 @@ app.add_middleware(
 class DeviceControlRequest(BaseModel):
     target_id: str
     device_type: str
-    state: Literal["ON", "OFF"]
+    state: Literal["ON", "OFF", "TIMER"]
+    duration: float | None = None
 
 
 @app.get("/")
@@ -108,10 +109,16 @@ def read_root() -> dict[str, str]:
 @app.post("/api/device/control")
 def control_device(request: DeviceControlRequest) -> dict[str, str]:
     topic = f"farm/{request.target_id}/cmd/{request.device_type}"
-    app.state.mqtt_client.publish(topic, request.state)
+    payload = request.state
+
+    if request.state == "TIMER" and request.duration is not None:
+        payload = f"TIMER {request.duration}"
+
+    app.state.mqtt_client.publish(topic, payload)
     return {
         "status": "sent",
         "target_id": request.target_id,
         "device_type": request.device_type,
         "state": request.state,
+        "payload": payload,
     }
