@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react'
 import mqtt from 'mqtt'
 
+const IS_LOCAL =
+  window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
 const MQTT_WS_URL = 'ws://31.56.208.196:9001'
-const API_URL = 'http://127.0.0.1:8000/api/device/control'
+const API_URL = IS_LOCAL
+  ? 'http://127.0.0.1:8000/api/device/control'
+  : 'http://31.56.208.196:8000/api/device/control'
 const SENSORS_TOPIC = 'farm/tray_1/sensors/#'
 
 type CommandState = 'ON' | 'OFF' | 'TIMER'
