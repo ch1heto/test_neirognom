@@ -21,6 +21,8 @@ body,
 body {
   margin: 0;
   min-width: 320px;
+  -webkit-user-select: none;
+  user-select: none;
   background:
     radial-gradient(circle at top, rgba(59, 130, 246, 0.16), transparent 34%),
     radial-gradient(circle at right top, rgba(16, 185, 129, 0.12), transparent 28%),
@@ -30,6 +32,8 @@ body {
 button,
 input {
   font: inherit;
+  -webkit-user-select: auto;
+  user-select: auto;
 }
 
 .dashboard {

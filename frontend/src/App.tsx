@@ -151,7 +151,7 @@ function App() {
         return
       }
 
-      if (target.closest('.dashboard__shell')) {
+      if (target.closest('button, input')) {
         return
       }
 
