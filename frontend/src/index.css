@@ -100,6 +100,7 @@ input {
 .sensor-card,
 .device-card {
   min-width: 0;
+  width: 100%;
   background: #151e32;
   border: 1px solid #1e293b;
   border-radius: 16px;
@@ -124,6 +125,12 @@ input {
   font-size: 1rem;
   font-weight: 700;
   color: #f8fafc;
+}
+
+.sensor-card {
+  display: grid;
+  gap: 16px;
+  align-content: start;
 }
 
 .metric-list {
@@ -164,18 +171,26 @@ input {
 
 .device-card__header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .device-card__type {
   color: #94a3b8;
-  font-size: 0.9rem;
+  font-size: 0.78rem;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  white-space: nowrap;
 }
 
 .device-card__actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -228,7 +243,8 @@ input {
 }
 
 .timer-control {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
 }
 
@@ -298,5 +314,10 @@ input {
 @media (max-width: 720px) {
   .dashboard {
     padding: 22px 14px 28px;
+  }
+
+  .device-card__actions,
+  .timer-control {
+    grid-template-columns: 1fr;
   }
 }

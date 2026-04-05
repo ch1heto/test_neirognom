@@ -243,7 +243,16 @@ function App() {
             <h2>Телеметрия</h2>
           </div>
 
-          <div className="telemetry-grid">
+          <div
+            className="telemetry-grid"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+              gap: '24px',
+              alignItems: 'start',
+              width: '100%',
+            }}
+          >
             <article className="sensor-card">
               <h3>Климат</h3>
               <dl className="metric-list">
@@ -293,7 +302,16 @@ function App() {
             <h2>Управление</h2>
           </div>
 
-          <div className="devices-grid">
+          <div
+            className="devices-grid"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+              gap: '24px',
+              alignItems: 'start',
+              width: '100%',
+            }}
+          >
             <DeviceCard
               title="Фитосвет"
               deviceType="light"
