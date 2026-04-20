@@ -62,6 +62,9 @@ def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
     if isinstance(air_temp, (int, float)) and air_temp > 32:
         anomalies.append(f"Критический перегрев: air_temp={air_temp}")
 
+    if isinstance(air_temp, (int, float)) and air_temp < 18:
+        anomalies.append("Критическое переохлаждение: air_temp=" + str(air_temp))
+
     if isinstance(humidity, (int, float)) and humidity < 30:
         anomalies.append(f"Критическая засуха: humidity={humidity}")
 
@@ -76,6 +79,10 @@ def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
                     anomalies.append(
                         "Быстрый рост температуры воздуха: "
                         f"{first_temp} -> {last_temp} за последние 3 замера"
+                    )
+                if first_temp - last_temp > 3:
+                    anomalies.append(
+                        "Быстрое падение температуры: " + str(first_temp) + " -> " + str(last_temp)
                     )
 
     return anomalies

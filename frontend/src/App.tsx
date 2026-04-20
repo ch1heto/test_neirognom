@@ -165,6 +165,7 @@ function App() {
     pump: '5',
   })
   const terminalRef = useRef<HTMLDivElement | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
   const mqttClientRef = useRef<MqttClient | null>(null)
 
   const loadAiLogs = async () => {
@@ -281,6 +282,10 @@ function App() {
 
     terminalRef.current.scrollTop = terminalRef.current.scrollHeight
   }, [aiLogs, isAiThinking])
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages])
 
   const sendCommand = async (deviceType: DeviceType, state: CommandState, duration?: number) => {
     setRequestState(`Отправка команды ${state} для устройства ${deviceType}`)
@@ -706,6 +711,7 @@ function App() {
                       <span>{message.text}</span>
                     </div>
                   ))}
+                  <div ref={messagesEndRef} />
                 </div>
 
                 <div

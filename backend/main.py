@@ -199,11 +199,11 @@ def format_sensor_payload_russian(payload: dict[str, Any]) -> str:
     parts: list[str] = []
 
     if "air_temp" in payload:
-        parts.append(f"Температура воздуха {format_sensor_value(payload.get('air_temp'), '°C')}")
+        parts.append(f"Температура воздуха {format_sensor_value(payload.get('air_temp'), ' C')}")
     if "humidity" in payload:
         parts.append(f"Влажность {format_sensor_value(payload.get('humidity'), '%')}")
     if "water_temp" in payload:
-        parts.append(f"Температура воды {format_sensor_value(payload.get('water_temp'), '°C')}")
+        parts.append(f"Температура воды {format_sensor_value(payload.get('water_temp'), ' C')}")
 
     return ", ".join(parts) if parts else "Нет данных с датчиков"
 
@@ -323,9 +323,9 @@ def format_latest_data_for_prompt() -> str:
     water_temp = latest_data.get("Темп. воды")
 
     return (
-        f"Текущие показатели: Температура воздуха {format_sensor_value(air_temp, '°C')}, "
+        f"Текущие показатели: Температура воздуха {format_sensor_value(air_temp, ' C')}, "
         f"Влажность {format_sensor_value(humidity, '%')}, "
-        f"Температура воды {format_sensor_value(water_temp, '°C')}"
+        f"Температура воды {format_sensor_value(water_temp, ' C')}"
     )
 
 
