@@ -240,8 +240,6 @@ async def ask_ai(system_prompt: str, user_prompt: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.2,
-        "max_tokens": 200,
     }
     headers = {
         "Authorization": f"Bearer {POLZA_API_KEY}",
