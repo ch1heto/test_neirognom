@@ -1,15 +1,19 @@
 import json
+import os
 import sqlite3
-import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+load_dotenv()
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -17,13 +21,19 @@ DB_PATH = BASE_DIR / "farm.db"
 BROKER_HOST = "31.56.208.196"
 BROKER_PORT = 1883
 SENSORS_TOPIC = "farm/+/sensors/#"
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:7b"
+POLZA_API_KEY = os.getenv("POLZA_API_KEY")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5-nano")
+POLZA_BASE_URL = os.getenv("POLZA_BASE_URL")
 KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
 }
 KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
+CHAT_SYSTEM_PROMPT = (
+    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
+    "только на русском. Никакой латиницы или иероглифов. "
+    "Опирайся на переданные русские данные датчиков."
+)
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -179,60 +189,107 @@ def strip_markdown_backticks(raw_text: str) -> str:
     return cleaned.replace("```", "").strip()
 
 
-def call_ollama(
-    prompt: str,
-    *,
-    format_json: bool,
-    options: dict[str, Any] | None = None,
-) -> str:
-    request_payload: dict[str, Any] = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
+def format_sensor_value(value: Any, suffix: str) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:.1f}{suffix}"
+    return "нет данных"
+
+
+def format_sensor_payload_russian(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    if "air_temp" in payload:
+        parts.append(f"Температура воздуха {format_sensor_value(payload.get('air_temp'), '°C')}")
+    if "humidity" in payload:
+        parts.append(f"Влажность {format_sensor_value(payload.get('humidity'), '%')}")
+    if "water_temp" in payload:
+        parts.append(f"Температура воды {format_sensor_value(payload.get('water_temp'), '°C')}")
+
+    return ", ".join(parts) if parts else "Нет данных с датчиков"
+
+
+def format_telemetry_records_russian(records: list[dict[str, Any]]) -> str:
+    formatted: list[str] = []
+
+    for record in records:
+        payload = record.get("parsed_payload")
+        if not isinstance(payload, dict):
+            continue
+
+        timestamp = str(record.get("timestamp", ""))
+        formatted_payload = format_sensor_payload_russian(payload)
+        if timestamp:
+            formatted.append(f"{timestamp}: {formatted_payload}")
+        else:
+            formatted.append(formatted_payload)
+
+    return "\n".join(formatted) if formatted else "Нет данных с датчиков"
+
+
+async def ask_ai(system_prompt: str, user_prompt: str) -> str:
+    if not POLZA_API_KEY:
+        raise RuntimeError("Не задан POLZA_API_KEY")
+    if not POLZA_BASE_URL:
+        raise RuntimeError("Не задан POLZA_BASE_URL")
+    if not AI_MODEL:
+        raise RuntimeError("Не задан AI_MODEL")
+
+    payload = {
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 200,
     }
-    if format_json:
-        request_payload["format"] = "json"
-    if options:
-        request_payload["options"] = options
+    headers = {
+        "Authorization": f"Bearer {POLZA_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    request = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(request_payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        response = await client.post(POLZA_BASE_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        response_json = response.json()
+
+    choices = response_json.get("choices", [])
+    if not choices:
+        raise RuntimeError("AI не вернул choices")
+
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, list):
+        text_parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
+        content = "".join(text_parts)
+
+    return strip_markdown_backticks(str(content))
+
+
+def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
+    telemetry_russian = format_telemetry_records_russian(records)
+    system_prompt = (
+        "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
+        "только на русском. Никакой латиницы или иероглифов. "
+        "Опирайся на переданные русские данные датчиков."
     )
-
-    with urllib.request.urlopen(request, timeout=40) as response:
-        response_body = response.read().decode("utf-8")
-
-    parsed_response = json.loads(response_body)
-    raw_text = str(parsed_response.get("response", ""))
-    return strip_markdown_backticks(raw_text)
-
-
-def build_decision_prompt(records: list[dict[str, Any]]) -> str:
-    telemetry_json = json.dumps(records, ensure_ascii=False, indent=2)
-    return (
-        "Ты — Нейроагроном, автономный агент управления городской фермой.\n"
-        "У тебя есть данные с датчиков и история предыдущих замеров.\n"
-        "ПРАВИЛА ПРИНЯТИЯ РЕШЕНИЙ:\n\n"
-        "Если температура воздуха (air_temp) > 28°C — включи вентилятор (fan).\n"
-        "Если влажность (humidity) < 50% — включи насос на 5 секунд (pump, duration: 5).\n"
-        "Если температура воды (water_temp) < 18°C — включи свет для обогрева (light).\n"
-        "Если все показатели в норме — не включай ничего.\n"
-        "Анализируй динамику: если температура быстро растёт (разница > 2°C за 3 замера) — это тревожный знак.\n\n"
-        "Отвечай ТОЛЬКО валидным JSON без markdown-обёрток:\n"
-        "{\n"
-        '"thought": "Краткое объяснение решения на русском языке",\n'
-        '"commands": [\n'
-        '{"device_type": "fan", "state": "ON"},\n'
-        '{"device_type": "pump", "state": "TIMER", "duration": 5}\n'
-        "]\n"
-        "}\n"
-        "Если действий не требуется — возвращай пустой массив commands.\n\n"
-        "Последние записи телеметрии:\n"
-        f"{telemetry_json}"
+    user_prompt = (
+        "Проанализируй данные датчиков и верни только валидный JSON без markdown.\n"
+        "Правила:\n"
+        "- Если температура воздуха > 28°C, включи вентилятор fan.\n"
+        "- Если влажность < 50%, включи насос pump на 5 секунд.\n"
+        "- Если температура воды < 18°C, включи свет light.\n"
+        "- Если температура быстро растёт более чем на 2°C за 3 замера, учти это как тревожный признак.\n"
+        "- Если действий не требуется, верни пустой массив commands.\n"
+        "Формат ответа:\n"
+        '{'
+        '"thought":"Краткое объяснение",'
+        '"commands":[{"device_type":"fan","state":"ON"},{"device_type":"pump","state":"TIMER","duration":5}]'
+        '}\n'
+        "Данные датчиков:\n"
+        f"{telemetry_russian}"
     )
+    return system_prompt, user_prompt
 
 
 def get_latest_data_snapshot() -> dict[str, Any]:
@@ -260,22 +317,23 @@ def get_latest_data_snapshot() -> dict[str, Any]:
     return latest_snapshot
 
 
-def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None) -> str:
-    latest_data = json.dumps(get_latest_data_snapshot(), ensure_ascii=False)
-    system_prompt = (
-        "Ты — Нейрогном, экспертный ИИ-агроном и лицо инновационной сити-фермы. "
-        "Твоя цель — консультировать пользователей и демонстрировать возможности системы.\n"
-        "ПРАВИЛА:\n\n"
-        "Отвечай СТРОГО на русском языке. Будь вежлив и дружелюбен. "
-        "Ответ должен быть кратким (2-3 предложения) и законченным.\n\n"
-        f"Если спрашивают о ТЕКУЩЕМ состоянии: отвечай строго по этим данным: {latest_data}. "
-        "Говори, что климат-контроль работает отлично.\n\n"
-        "Если спрашивают, ЧТО ПОСАДИТЬ или общие советы: действуй как эксперт! "
-        "Расскажи, что система идеально подходит для микрозелени, пряных трав, салата "
-        "или даже клубники. Поддерживай энтузиазм пользователя и хвали точность датчиков фермы."
+def format_latest_data_for_prompt() -> str:
+    latest_data = get_latest_data_snapshot()
+
+    air_temp = latest_data.get("Температура")
+    humidity = latest_data.get("Влажность")
+    water_temp = latest_data.get("Темп. воды")
+
+    return (
+        f"Текущие показатели: Температура воздуха {format_sensor_value(air_temp, '°C')}, "
+        f"Влажность {format_sensor_value(humidity, '%')}, "
+        f"Температура воды {format_sensor_value(water_temp, '°C')}"
     )
 
-    prompt_parts = [system_prompt]
+
+def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None) -> str:
+    translated_data_string = format_latest_data_for_prompt()
+    prompt_parts = [f"Данные датчиков: {translated_data_string}"]
 
     if history:
         history_lines: list[str] = []
@@ -436,7 +494,7 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
 
 
 @app.post("/api/ai/decide")
-def ai_decide() -> dict[str, Any]:
+async def ai_decide() -> dict[str, Any]:
     logs: list[str] = []
     telemetry_records = get_recent_telemetry(15)
 
@@ -444,11 +502,12 @@ def ai_decide() -> dict[str, Any]:
         return {"logs": ["В базе нет записей телеметрии."], "thought": "", "commands": []}
 
     try:
-        raw_decision = call_ollama(build_decision_prompt(telemetry_records), format_json=True)
+        system_prompt, user_prompt = build_decision_ai_request(telemetry_records)
+        raw_decision = await ask_ai(system_prompt, user_prompt)
         decision = json.loads(raw_decision)
     except Exception as exc:
         return {
-            "logs": [f"Не удалось получить корректное решение от Ollama: {exc}"],
+            "logs": [f"Не удалось получить корректное решение от AI: {exc}"],
             "thought": "",
             "commands": [],
         }
@@ -489,17 +548,13 @@ def get_logs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any
 
 @app.post("/api/chat")
 @app.post("/api/ai/chat")
-def chat_with_ai(request: ChatRequest) -> dict[str, str]:
-    prompt = build_chat_prompt(request.message, request.history)
+async def chat_with_ai(request: ChatRequest) -> dict[str, str]:
+    user_prompt = build_chat_prompt(request.message, request.history)
 
     try:
-        reply = call_ollama(
-            prompt,
-            format_json=False,
-            options={"temperature": 0.3, "num_predict": 200},
-        )
+        reply = await ask_ai(CHAT_SYSTEM_PROMPT, user_prompt)
     except Exception as exc:
-        return {"reply": f"Не удалось получить ответ от Ollama: {exc}"}
+        return {"reply": f"Не удалось получить ответ от AI: {exc}"}
 
     if not reply:
         reply = "Недостаточно данных для ответа."
