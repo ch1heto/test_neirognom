@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import mqtt from 'mqtt'
+import mqtt, { type MqttClient } from 'mqtt'
 
 const IS_LOCAL =
   window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
@@ -165,6 +165,7 @@ function App() {
     pump: '5',
   })
   const terminalRef = useRef<HTMLDivElement | null>(null)
+  const mqttClientRef = useRef<MqttClient | null>(null)
 
   const loadAiLogs = async () => {
     try {
@@ -183,6 +184,7 @@ function App() {
 
   useEffect(() => {
     const client = mqtt.connect(MQTT_WS_URL)
+    mqttClientRef.current = client
 
     const onMessageArrived = (topic: string, message: Buffer<ArrayBufferLike>) => {
       try {
@@ -208,6 +210,7 @@ function App() {
     })
 
     return () => {
+      mqttClientRef.current = null
       client.end(true)
     }
   }, [])
@@ -382,6 +385,25 @@ function App() {
       ...current,
       [deviceType]: value,
     }))
+  }
+
+  const publishSimulationMode = (mode: 'HEAT' | 'COLD' | 'NORMAL') => {
+    const client = mqttClientRef.current
+
+    if (!client || !client.connected) {
+      setRequestState('Ошибка: MQTT-соединение недоступно для отладки симуляции')
+      return
+    }
+
+    client.publish('farm/sim/control', mode)
+
+    const modeLabel: Record<typeof mode, string> = {
+      HEAT: 'жара',
+      COLD: 'холод',
+      NORMAL: 'нормальный режим',
+    }
+
+    setRequestState(`Команда отладки отправлена: ${modeLabel[mode]}`)
   }
 
   return (
@@ -738,44 +760,117 @@ function App() {
             </section>
           </>
         ) : (
-          <section className="dashboard__section">
-            <div className="section-heading">
-              <h2>Ручное управление</h2>
-            </div>
+          <>
+            <section className="dashboard__section">
+              <div className="section-heading">
+                <h2>Ручное управление</h2>
+              </div>
 
-            <div
-              className="devices-grid"
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                gap: '24px',
-                alignItems: 'start',
-                width: '100%',
-              }}
-            >
-              <DeviceCard
-                title="Насос"
-                deviceType="pump"
-                timerValue={timerValues.pump}
-                onTimerChange={(value) => setTimerValue('pump', value)}
-                onCommand={sendCommand}
-              />
-              <DeviceCard
-                title="Свет"
-                deviceType="light"
-                timerValue={timerValues.light}
-                onTimerChange={(value) => setTimerValue('light', value)}
-                onCommand={sendCommand}
-              />
-              <DeviceCard
-                title="Вентилятор"
-                deviceType="fan"
-                timerValue={timerValues.fan}
-                onTimerChange={(value) => setTimerValue('fan', value)}
-                onCommand={sendCommand}
-              />
-            </div>
-          </section>
+              <div
+                className="devices-grid"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                  gap: '24px',
+                  alignItems: 'start',
+                  width: '100%',
+                }}
+              >
+                <DeviceCard
+                  title="Насос"
+                  deviceType="pump"
+                  timerValue={timerValues.pump}
+                  onTimerChange={(value) => setTimerValue('pump', value)}
+                  onCommand={sendCommand}
+                />
+                <DeviceCard
+                  title="Свет"
+                  deviceType="light"
+                  timerValue={timerValues.light}
+                  onTimerChange={(value) => setTimerValue('light', value)}
+                  onCommand={sendCommand}
+                />
+                <DeviceCard
+                  title="Вентилятор"
+                  deviceType="fan"
+                  timerValue={timerValues.fan}
+                  onTimerChange={(value) => setTimerValue('fan', value)}
+                  onCommand={sendCommand}
+                />
+              </div>
+            </section>
+
+            <section className="dashboard__section">
+              <div className="section-heading">
+                <h2>Отладка симуляции</h2>
+              </div>
+
+              <div
+                className="sensor-card"
+                style={{
+                  display: 'grid',
+                  gap: '16px',
+                  border: '1px solid rgba(255, 190, 92, 0.18)',
+                  background:
+                    'linear-gradient(180deg, rgba(52, 30, 10, 0.32), rgba(17, 21, 14, 0.88))',
+                }}
+              >
+                <p style={{ margin: 0, color: 'rgba(255, 236, 201, 0.78)' }}>
+                  Панель для переключения тестовых режимов ESP32-симулятора через MQTT.
+                </p>
+
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: '12px',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="control-button"
+                    onClick={() => publishSimulationMode('HEAT')}
+                    style={{
+                      background: 'linear-gradient(135deg, #8c2218, #ff6b3d)',
+                      color: '#fff4ec',
+                      border: '1px solid rgba(255, 130, 86, 0.45)',
+                      boxShadow: '0 14px 28px rgba(140, 34, 24, 0.28)',
+                    }}
+                  >
+                    Имитировать жару
+                  </button>
+
+                  <button
+                    type="button"
+                    className="control-button"
+                    onClick={() => publishSimulationMode('COLD')}
+                    style={{
+                      background: 'linear-gradient(135deg, #1c466c, #5aa6ff)',
+                      color: '#eef7ff',
+                      border: '1px solid rgba(112, 178, 255, 0.4)',
+                      boxShadow: '0 14px 28px rgba(28, 70, 108, 0.24)',
+                    }}
+                  >
+                    Имитировать холод
+                  </button>
+
+                  <button
+                    type="button"
+                    className="control-button"
+                    onClick={() => publishSimulationMode('NORMAL')}
+                    style={{
+                      background: 'linear-gradient(135deg, #1d7f52, #79c96a)',
+                      color: '#f4ffe9',
+                      border: '1px solid rgba(133, 198, 107, 0.35)',
+                      boxShadow: '0 14px 28px rgba(29, 127, 82, 0.24)',
+                    }}
+                  >
+                    Вернуть в норму
+                  </button>
+                </div>
+              </div>
+            </section>
+          </>
         )}
 
         <footer className="dashboard__footer">{requestState}</footer>

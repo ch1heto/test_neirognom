@@ -9,19 +9,34 @@ BROKER_HOST = "31.56.208.196"
 BROKER_PORT = 1883
 DEVICE_ID = "tray_1"
 COMMANDS_TOPIC = "farm/tray_1/cmd/#"
+CONTROL_TOPIC = "farm/sim/control"
 CLIMATE_TOPIC = "farm/tray_1/sensors/climate"
 WATER_TOPIC = "farm/tray_1/sensors/water"
+current_mode = "NORMAL"
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         client.subscribe(COMMANDS_TOPIC)
+        client.subscribe(CONTROL_TOPIC)
     else:
         print(f"[СИМУЛЯТОР] Ошибка подключения: {reason_code}")
 
 
 def on_message(client, userdata, msg):
+    global current_mode
+
     payload = msg.payload.decode("utf-8")
+
+    if msg.topic == CONTROL_TOPIC:
+        next_mode = payload.strip().upper()
+        if next_mode in {"HEAT", "COLD", "NORMAL"}:
+            current_mode = next_mode
+            print(f"[СИМУЛЯТОР] Переключение режима: {current_mode}")
+        else:
+            print(f"[СИМУЛЯТОР] Неизвестный режим: {payload}")
+        return
+
     print(f"[СИМУЛЯТОР] Получена команда {msg.topic}: {payload}")
 
 
@@ -32,24 +47,29 @@ client.on_message = on_message
 client.connect(BROKER_HOST, BROKER_PORT, 60)
 client.loop_start()
 
-iteration = 0
-
 while True:
-    iteration += 1
-    air_temp = round(random.uniform(22.0, 27.5), 1)
-
-    if iteration % 20 == 0:
-        air_temp = 33.0
+    if current_mode == "HEAT":
+        air_temp = 35.5
+        humidity = 30.0
+        water_temp = round(random.uniform(20.0, 20.8), 1)
+    elif current_mode == "COLD":
+        air_temp = 12.0
+        humidity = round(random.uniform(48.0, 52.0), 1)
+        water_temp = round(random.uniform(19.0, 20.0), 1)
+    else:
+        air_temp = round(random.uniform(22.0, 24.0), 1)
+        humidity = round(random.uniform(49.0, 51.0), 1)
+        water_temp = round(random.uniform(19.6, 20.4), 1)
 
     climate_payload = json.dumps(
         {
             "air_temp": air_temp,
-            "humidity": round(random.uniform(42.0, 62.0), 1),
+            "humidity": humidity,
         }
     )
     water_payload = json.dumps(
         {
-            "water_temp": round(random.uniform(17.0, 22.0), 1),
+            "water_temp": water_temp,
         }
     )
 
