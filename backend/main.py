@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import os
 import sqlite3
@@ -23,12 +24,19 @@ BROKER_PORT = 1883
 SENSORS_TOPIC = "farm/+/sensors/#"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5-nano")
-POLZA_BASE_URL = os.getenv("POLZA_BASE_URL")
+POLZA_BASE_URL = os.getenv("POLZA_BASE_URL", "https://polza.ai/api/v1/chat/completions")
 KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
 }
 KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
+CHAT_SYSTEM_PROMPT = (
+    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
+    "только на русском. Никакой латиницы или иероглифов. "
+    "Опирайся на переданные русские данные датчиков."
+)
+
+
 CHAT_SYSTEM_PROMPT = (
     "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
     "только на русском. Никакой латиницы или иероглифов. "
@@ -74,6 +82,13 @@ def init_db() -> None:
             """
         )
         connection.commit()
+
+
+CHAT_SYSTEM_PROMPT = (
+    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
+    "только на русском. Никакой латиницы или иероглифов. "
+    "Опирайся на переданные русские данные датчиков."
+)
 
 
 def current_timestamp() -> str:
@@ -274,16 +289,45 @@ def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
     user_prompt = (
         "Проанализируй данные датчиков и верни только валидный JSON без markdown.\n"
         "Правила:\n"
-        "- Если температура воздуха > 28°C, включи вентилятор fan.\n"
-        "- Если влажность < 50%, включи насос pump на 5 секунд.\n"
-        "- Если температура воды < 18°C, включи свет light.\n"
-        "- Если температура быстро растёт более чем на 2°C за 3 замера, учти это как тревожный признак.\n"
+        "- Если температура воздуха > 28 C, включи вентилятор fan командой ON.\n"
+        "- Если температура воздуха < 18 C, включи свет light командой ON и выключи вентилятор fan командой OFF.\n"
+        "- Если влажность < 50 %, включи насос pump командой TIMER на 5 секунд.\n"
+        "- Если температура воды < 18 C, включи свет light командой ON.\n"
+        "- Если температура воды > 26 C, выключи свет light командой OFF.\n"
+        "- Если температура быстро растёт более чем на 2 C за 3 замера, учти это как тревожный признак.\n"
         "- Если действий не требуется, верни пустой массив commands.\n"
         "Формат ответа:\n"
         '{'
         '"thought":"Краткое объяснение",'
-        '"commands":[{"device_type":"fan","state":"ON"},{"device_type":"pump","state":"TIMER","duration":5}]'
+        '"commands":[{"device_type":"fan","state":"ON"},{"device_type":"pump","state":"TIMER","duration":5},{"device_type":"light","state":"OFF"}]'
         '}\n'
+        "Данные датчиков:\n"
+        f"{telemetry_russian}"
+    )
+    return system_prompt, user_prompt
+
+
+def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
+    telemetry_russian = format_telemetry_records_russian(records)
+    system_prompt = (
+        "Ты — Нейрогном, эксперт сити-фермы. Отвечай только валидным JSON без markdown. "
+        "Используй только русский текст в поле thought и только допустимые device_type: fan, pump, light."
+    )
+    user_prompt = (
+        "Проанализируй данные датчиков и верни только валидный JSON без markdown.\n"
+        "Полный набор правил принятия решений:\n"
+        "- Если air_temp > 28 C, включи fan командой ON.\n"
+        "- Если air_temp < 18 C, включи light командой ON для обогрева и обязательно выключи fan командой OFF.\n"
+        "- Если humidity < 50 %, включи pump командой TIMER на 5 секунд.\n"
+        "- Если water_temp < 18 C, включи light командой ON.\n"
+        "- Если water_temp > 26 C, выключи light командой OFF.\n"
+        "- Если температура воздуха быстро растет более чем на 2 C за 3 последних замера, учти это как тревожный признак.\n"
+        "- Если действий не требуется, верни пустой массив commands.\n"
+        "Формат ответа:\n"
+        "{"
+        "\"thought\":\"Краткое объяснение\","
+        "\"commands\":[{\"device_type\":\"fan\",\"state\":\"ON\"},{\"device_type\":\"pump\",\"state\":\"TIMER\",\"duration\":5},{\"device_type\":\"light\",\"state\":\"OFF\"}]"
+        "}\n"
         "Данные датчиков:\n"
         f"{telemetry_russian}"
     )
