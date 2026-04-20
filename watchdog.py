@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import sqlite3
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -10,8 +11,8 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "backend" / "farm.db"
 AI_DECIDE_URL = "http://127.0.0.1:8000/api/ai/decide"
-POLL_INTERVAL_SECONDS = 10
-AI_COOLDOWN_SECONDS = 60
+POLL_INTERVAL_SECONDS = 5
+AI_COOLDOWN_SECONDS = 5
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -102,8 +103,12 @@ def call_ai_decide() -> dict[str, Any]:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
+
     last_ai_call_ts = 0.0
-    print("[WATCHDOG] Запущен. Проверка аномалий каждые 10 секунд.")
+    in_alert_mode = False
+    print("[WATCHDOG] Запущен. Проверка аномалий каждые 5 секунд.")
 
     while True:
         try:
@@ -111,6 +116,7 @@ def main() -> None:
             anomalies = detect_anomalies(records)
 
             if anomalies:
+                in_alert_mode = True
                 print("[WATCHDOG] Обнаружены аномалии:")
                 for anomaly in anomalies:
                     print(f"[WATCHDOG] - {anomaly}")
@@ -132,6 +138,17 @@ def main() -> None:
                             print(f"[WATCHDOG] {log}")
                     else:
                         print("[WATCHDOG] AI вызван, но журнал действий пуст.")
+            elif in_alert_mode:
+                print("[WATCHDOG] Ситуация нормализовалась. Запрашиваю деактивацию устройств...")
+                result = call_ai_decide()
+                last_ai_call_ts = time.time()
+                logs = result.get("logs", [])
+                if isinstance(logs, list) and logs:
+                    for log in logs:
+                        print(f"[WATCHDOG] {log}")
+                else:
+                    print("[WATCHDOG] AI вызван, но журнал действий пуст.")
+                in_alert_mode = False
             else:
                 print("[WATCHDOG] Аномалий не обнаружено.")
         except Exception as exc:
