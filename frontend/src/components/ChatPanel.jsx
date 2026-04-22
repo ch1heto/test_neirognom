@@ -1,5 +1,5 @@
 import GlassCard from './GlassCard'
-import placeholder from '../assets/assistant-placeholder.svg'
+import gnomeAvatar from '../assets/gnome.png'
 import { SendIcon } from './Icons'
 
 function Bubble({ message }) {
@@ -25,13 +25,14 @@ export default function ChatPanel({ messages, input, onInput, onSend, className 
     <GlassCard className={`flex h-full min-h-0 flex-col rounded-[28px] ${className}`}>
       <div className="flex items-start gap-3">
         <div className="glass-panel-soft overflow-hidden rounded-[22px] p-2">
-          <img src={placeholder} alt="Заглушка ассистента" className="h-16 w-16 rounded-[18px] object-cover md:h-20 md:w-20" />
+          <img 
+            src={gnomeAvatar} 
+            alt="Нейрогном" 
+            className="h-16 w-16 rounded-[18px] object-cover md:h-20 md:w-20" 
+          />
         </div>
         <div className="min-w-0 pt-1">
-          <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Чат ассистента</div>
-          <p className="mt-1.5 text-sm leading-6 text-white/64">
-            Тут позже можно подставить фото маскота или реальный портрет ИИ.
-          </p>
+          <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Чат Нейрогнома</div>
           <div className="mt-2 inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300 md:text-sm">
             <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" /> Онлайн
           </div>
