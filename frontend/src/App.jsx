@@ -26,7 +26,7 @@ import {
 } from './components/Icons'
 
 const API_BASE_URL = 'http://localhost:8000'
-const TELEMETRY_POLL_INTERVAL_MS = 4000
+const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 
 function formatTime(date = new Date()) {

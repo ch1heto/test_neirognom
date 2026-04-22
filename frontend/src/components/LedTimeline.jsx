@@ -29,7 +29,7 @@ export default function LedTimeline({
           <div className="absolute left-2 right-2 top-[28px] h-[2px] bg-gradient-to-r from-cyan-300 via-yellow-300 to-fuchsia-400 opacity-80 md:top-[31px]" />
 
           {stages.map((stage, index) => {
-            const active = index <= activeIndex
+            const active = true
             const current = index === activeIndex
 
             return (
