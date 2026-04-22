@@ -1,9 +1,9 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react'
+import { type CSSProperties, useEffect, useRef, useState } from 'react'
 import mqtt, { type MqttClient } from 'mqtt'
 import {
+  Area,
+  AreaChart,
   CartesianGrid,
-  Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -22,17 +22,10 @@ const HISTORY_LIMIT = 36
 type ActiveTab = 'monitor' | 'control'
 type CommandState = 'ON' | 'OFF' | 'TIMER'
 type DeviceType = 'pump' | 'light' | 'fan'
-type ChartMetric = 'temperature' | 'humidity' | 'light'
 
 type ClimateMessage = {
   air_temp?: number
   humidity?: number
-}
-
-type AiCommand = {
-  device_type: DeviceType
-  state: CommandState
-  duration?: number
 }
 
 type AiLog = {
@@ -49,15 +42,6 @@ type TelemetryPoint = {
   light: number
 }
 
-type GaugeCardProps = {
-  label: string
-  value: number
-  suffix: string
-  min: number
-  max: number
-  color: string
-}
-
 type DeviceCardProps = {
   title: string
   deviceType: DeviceType
@@ -68,9 +52,9 @@ type DeviceCardProps = {
 
 const TEXT = {
   appName: 'Нейроагроном',
-  title: 'Продвинутый мониторинг городской фермы',
+  title: 'Dashboard Layout Preview',
   subtitle:
-    'Темная стеклянная панель с живыми датчиками, рельефной историей показаний и отдельной вкладкой ручного управления.',
+    'Темная панель с сохранённой MQTT-логикой, историей телеметрии и подготовленным layout для мониторинга.',
   tabs: {
     monitor: 'Мониторинг',
     control: 'Ручное управление',
@@ -81,9 +65,8 @@ const TEXT = {
     light: 'Освещение',
   },
   sections: {
-    telemetry: 'Датчики',
-    history: 'Горы и равнины',
-    thoughts: 'Поток мыслей ИИ',
+    graph: 'Graph Area',
+    thoughts: 'AI Thoughts',
     control: 'Реле и LED',
     simulation: 'Симуляция',
   },
@@ -108,27 +91,8 @@ const TEXT = {
     commandError: 'Не удалось отправить команду',
     simulationError: 'MQTT недоступен для симуляции',
     simulationSent: 'Команда симуляции отправлена',
-    noThoughts: 'Логи ИИ пока не пришли.',
-  },
-  chart: {
-    temperature: 'Температура',
-    humidity: 'Влажность',
-    light: 'Освещение',
   },
 } as const
-
-const glassCardClassName = 'bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl text-white'
-
-const glassCardStyle: CSSProperties = {
-  background: 'rgba(255, 255, 255, 0.05)',
-  backdropFilter: 'blur(16px)',
-  WebkitBackdropFilter: 'blur(16px)',
-  border: '1px solid rgba(255, 255, 255, 0.1)',
-  borderRadius: 24,
-  color: '#ffffff',
-  boxShadow:
-    'inset 0 1px 0 rgba(255,255,255,0.12), 0 20px 44px rgba(2,6,20,0.32), 0 0 24px rgba(96,165,250,0.08)',
-}
 
 const panelButtonStyle: CSSProperties = {
   border: '1px solid rgba(255,255,255,0.12)',
@@ -158,11 +122,14 @@ const inputStyle: CSSProperties = {
   outline: 'none',
 }
 
-const chartMeta: Record<ChartMetric, { dataKey: ChartMetric; color: string; suffix: string }> = {
-  temperature: { dataKey: 'temperature', color: '#34d399', suffix: '°C' },
-  humidity: { dataKey: 'humidity', color: '#60a5fa', suffix: '%' },
-  light: { dataKey: 'light', color: '#fbbf24', suffix: '%' },
+const cardTitleStyle: CSSProperties = {
+  margin: 0,
+  fontSize: '1rem',
+  fontWeight: 700,
 }
+
+const glassCardClassName =
+  'glass-panel bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] shadow-[inset_0_1px_1px_rgba(255,255,255,0.1)] rounded-[2rem]'
 
 function formatTimeLabel(date = new Date()) {
   return date.toLocaleTimeString('ru-RU', {
@@ -170,90 +137,6 @@ function formatTimeLabel(date = new Date()) {
     minute: '2-digit',
     second: '2-digit',
   })
-}
-
-function parseCommands(commandsJson: string): AiCommand[] {
-  try {
-    const parsed = JSON.parse(commandsJson) as unknown
-    return Array.isArray(parsed) ? (parsed as AiCommand[]) : []
-  } catch {
-    return []
-  }
-}
-
-function formatCommand(command: AiCommand) {
-  if (command.state === 'TIMER' && typeof command.duration === 'number') {
-    return `${command.device_type}: TIMER ${command.duration} sec`
-  }
-
-  return `${command.device_type}: ${command.state}`
-}
-
-function GaugeCard({ label, value, suffix, min, max, color }: GaugeCardProps) {
-  const normalized = Math.min(Math.max((value - min) / (max - min), 0), 1)
-  const radius = 54
-  const stroke = 12
-  const circumference = 2 * Math.PI * radius
-  const dashOffset = circumference * (1 - normalized)
-
-  return (
-    <article
-      className={glassCardClassName}
-      style={{
-        ...glassCardStyle,
-        padding: 24,
-        display: 'grid',
-        gap: 18,
-      }}
-    >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-        <h3 style={{ margin: 0, fontSize: '1rem', fontWeight: 700 }}>{label}</h3>
-        <span style={{ color: 'rgba(226,232,240,0.78)', fontSize: '0.85rem' }}>
-          {min}–{max}
-          {suffix}
-        </span>
-      </div>
-
-      <div style={{ display: 'grid', placeItems: 'center' }}>
-        <svg width="150" height="150" viewBox="0 0 150 150" role="img" aria-label={label}>
-          <circle
-            cx="75"
-            cy="75"
-            r={radius}
-            fill="none"
-            stroke="rgba(255,255,255,0.12)"
-            strokeWidth={stroke}
-          />
-          <circle
-            cx="75"
-            cy="75"
-            r={radius}
-            fill="none"
-            stroke={color}
-            strokeWidth={stroke}
-            strokeLinecap="round"
-            strokeDasharray={circumference}
-            strokeDashoffset={dashOffset}
-            transform="rotate(-90 75 75)"
-            style={{ transition: 'stroke-dashoffset 320ms ease' }}
-          />
-          <text
-            x="75"
-            y="70"
-            textAnchor="middle"
-            fill="#ffffff"
-            fontSize="28"
-            fontWeight="700"
-          >
-            {Math.round(value)}
-          </text>
-          <text x="75" y="94" textAnchor="middle" fill="rgba(191,219,254,0.9)" fontSize="14">
-            {suffix}
-          </text>
-        </svg>
-      </div>
-    </article>
-  )
 }
 
 function DeviceCard({
@@ -277,14 +160,13 @@ function DeviceCard({
     <article
       className={glassCardClassName}
       style={{
-        ...glassCardStyle,
         padding: 20,
         display: 'grid',
         gap: 16,
       }}
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-        <h3 style={{ margin: 0 }}>{title}</h3>
+        <h3 style={cardTitleStyle}>{title}</h3>
         <span style={{ color: 'rgba(148,163,184,0.9)', fontSize: '0.8rem', textTransform: 'uppercase' }}>
           {deviceType}
         </span>
@@ -319,7 +201,6 @@ function DeviceCard({
 
 function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('monitor')
-  const [selectedMetric, setSelectedMetric] = useState<ChartMetric>('temperature')
   const [temperature, setTemperature] = useState(0)
   const [humidity, setHumidity] = useState(0)
   const [light, setLight] = useState(0)
@@ -336,20 +217,6 @@ function App() {
   const thoughtsRef = useRef<HTMLDivElement | null>(null)
   const lightTimerRef = useRef<number | null>(null)
   const lastHistorySignatureRef = useRef('')
-
-  const currentChartMeta = chartMeta[selectedMetric]
-
-  const thoughtLines = useMemo(
-    () =>
-      aiLogs.map((log) => {
-        const commands = parseCommands(log.commands_json)
-        const commandText =
-          commands.length > 0 ? commands.map((command) => formatCommand(command)).join(' | ') : 'no-actions'
-
-        return `[${log.timestamp}] ${log.thought || 'AI обновил состояние без пояснения.'} :: ${commandText}`
-      }),
-    [aiLogs],
-  )
 
   useEffect(() => {
     const loadAiLogs = async () => {
@@ -439,7 +306,7 @@ function App() {
     }
 
     thoughtsRef.current.scrollTop = thoughtsRef.current.scrollHeight
-  }, [thoughtLines])
+  }, [aiLogs])
 
   useEffect(() => {
     return () => {
@@ -517,288 +384,191 @@ function App() {
 
   return (
     <main
+      className="bg-[#030712] p-8 text-white"
       style={{
         minHeight: '100vh',
-        background: '#0a0e22',
+        background: '#030712',
         color: '#fff',
-        padding: '32px 20px 48px',
       }}
     >
-      <div style={{ width: 'min(1280px, 100%)', margin: '0 auto', display: 'grid', gap: 24 }}>
-        <header style={{ display: 'grid', gap: 10 }}>
-          <p
-            style={{
-              margin: 0,
-              fontSize: 12,
-              letterSpacing: '0.14em',
-              textTransform: 'uppercase',
-              color: '#34d399',
-              fontWeight: 700,
-            }}
-          >
+      <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-6">
+        <header className="flex flex-col gap-3">
+          <p className="m-0 text-xs font-bold uppercase tracking-[0.18em] text-gray-300">
             {TEXT.appName}
           </p>
-          <h1 style={{ margin: 0, fontSize: 'clamp(2.1rem, 4vw, 3.6rem)', lineHeight: 1.05 }}>
-            {TEXT.title}
-          </h1>
-          <p style={{ margin: 0, color: '#b8c6db', maxWidth: 760, lineHeight: 1.65 }}>
-            {TEXT.subtitle}
-          </p>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div className="flex max-w-3xl flex-col gap-2">
+              <h1 className="m-0 text-4xl font-semibold leading-tight text-white lg:text-5xl">
+                Professional Glass Dashboard
+              </h1>
+              <p className="m-0 max-w-2xl text-sm leading-7 text-gray-400">
+                Monitoring and control surface with preserved MQTT, telemetry, and AI log logic.
+              </p>
+            </div>
+
+            <div className={`${glassCardClassName} flex items-center gap-4 px-6 py-4`}>
+              <div className="flex h-3 w-3 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(74,222,128,0.65)]" />
+              <div className="flex flex-col">
+                <span className="text-sm font-medium text-white">System Status</span>
+                <span className="text-sm text-gray-400">{requestState}</span>
+              </div>
+            </div>
+          </div>
         </header>
 
-        <section
-          className={glassCardClassName}
-          style={{
-            ...glassCardStyle,
-            padding: 12,
-            display: 'flex',
-            gap: 12,
-            flexWrap: 'wrap',
-          }}
-        >
+        <section className={`${glassCardClassName} flex flex-wrap items-center gap-3 px-4 py-4`}>
           <button
             type="button"
+            className="rounded-2xl border border-white/10 px-5 py-3 text-sm font-medium text-white transition hover:border-white/20 hover:bg-white/10"
             style={activeTab === 'monitor' ? activeTabButtonStyle : panelButtonStyle}
             onClick={() => setActiveTab('monitor')}
           >
-            {TEXT.tabs.monitor}
+            Monitoring
           </button>
           <button
             type="button"
+            className="rounded-2xl border border-white/10 px-5 py-3 text-sm font-medium text-white transition hover:border-white/20 hover:bg-white/10"
             style={activeTab === 'control' ? activeTabButtonStyle : panelButtonStyle}
             onClick={() => setActiveTab('control')}
           >
-            {TEXT.tabs.control}
+            Control
           </button>
         </section>
 
         {activeTab === 'monitor' ? (
-          <>
-            <section style={{ display: 'grid', gap: 16 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-                <h2 style={{ margin: 0, fontSize: '1.15rem' }}>{TEXT.sections.telemetry}</h2>
-                <span style={{ color: '#94a3b8' }}>{requestState}</span>
-              </div>
-
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-                  gap: 20,
-                }}
-              >
-                <GaugeCard
-                  label={TEXT.sensors.temperature}
-                  value={temperature}
-                  suffix="°C"
-                  min={0}
-                  max={40}
-                  color="#34d399"
-                />
-                <GaugeCard
-                  label={TEXT.sensors.humidity}
-                  value={humidity}
-                  suffix="%"
-                  min={0}
-                  max={100}
-                  color="#60a5fa"
-                />
-                <GaugeCard
-                  label={TEXT.sensors.light}
-                  value={light}
-                  suffix="%"
-                  min={0}
-                  max={100}
-                  color="#fbbf24"
-                />
-              </div>
-            </section>
-
-            <section
-              className={glassCardClassName}
-              style={{
-                ...glassCardStyle,
-                padding: 24,
-                display: 'grid',
-                gap: 18,
-              }}
-            >
-              <div
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  gap: 12,
-                  flexWrap: 'wrap',
-                }}
-              >
-                <h2 style={{ margin: 0, fontSize: '1.15rem' }}>{TEXT.sections.history}</h2>
-                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                  {(['temperature', 'humidity', 'light'] as ChartMetric[]).map((metric) => (
-                    <button
-                      key={metric}
-                      type="button"
-                      style={selectedMetric === metric ? activeTabButtonStyle : panelButtonStyle}
-                      onClick={() => setSelectedMetric(metric)}
-                    >
-                      {TEXT.chart[metric]}
-                    </button>
-                  ))}
+          <section className="grid grid-cols-12 gap-6">
+            <div className="col-span-12 grid gap-6 lg:col-span-4">
+              <article className={`${glassCardClassName} flex min-h-[220px] flex-col justify-between p-8`}>
+                <div className="flex flex-col gap-2">
+                  <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Temperature</span>
+                  <h2 className="m-0 text-3xl font-semibold text-white">{temperature.toFixed(1)}°C</h2>
                 </div>
-              </div>
+                <div className="rounded-[1.5rem] border border-white/5 bg-white/[0.02] px-5 py-6 text-sm text-gray-400">
+                  Gauge placeholder
+                </div>
+              </article>
 
-              <div style={{ width: '100%', height: 320 }}>
-                <ResponsiveContainer>
-                  <LineChart data={telemetryHistory}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.08)" strokeDasharray="4 4" />
-                    <XAxis dataKey="time" stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-                    <YAxis
-                      domain={['auto', 'auto']}
-                      stroke="#94a3b8"
-                      tick={{ fill: '#94a3b8', fontSize: 12 }}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        background: 'rgba(15, 23, 42, 0.92)',
-                        border: '1px solid rgba(255,255,255,0.1)',
-                        borderRadius: 14,
-                        color: '#fff',
-                      }}
-                      labelStyle={{ color: '#cbd5e1' }}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey={currentChartMeta.dataKey}
-                      stroke={currentChartMeta.color}
-                      strokeWidth={3}
-                      dot={false}
-                      activeDot={{ r: 5, fill: currentChartMeta.color }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </section>
+              <article className={`${glassCardClassName} flex min-h-[220px] flex-col justify-between p-8`}>
+                <div className="flex flex-col gap-2">
+                  <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Humidity</span>
+                  <h2 className="m-0 text-3xl font-semibold text-white">{humidity.toFixed(1)}%</h2>
+                </div>
+                <div className="rounded-[1.5rem] border border-white/5 bg-white/[0.02] px-5 py-6 text-sm text-gray-400">
+                  Gauge placeholder
+                </div>
+              </article>
 
-            <section
-              className={glassCardClassName}
-              style={{
-                ...glassCardStyle,
-                padding: 24,
-                display: 'grid',
-                gap: 16,
-              }}
-            >
-              <div style={{ display: 'grid', gap: 6 }}>
-                <h2 style={{ margin: 0, fontSize: '1.15rem' }}>{TEXT.sections.thoughts}</h2>
-                <p style={{ margin: 0, color: '#9fb0c6', lineHeight: 1.6 }}>
-                  Автообновляемый поток логов от бэкенда. Кнопка «Запросить решение» удалена.
-                </p>
-              </div>
+              <article className={`${glassCardClassName} flex min-h-[220px] flex-col justify-between p-8`}>
+                <div className="flex flex-col gap-2">
+                  <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Light</span>
+                  <h2 className="m-0 text-3xl font-semibold text-white">{light.toFixed(0)}%</h2>
+                </div>
+                <div className="rounded-[1.5rem] border border-white/5 bg-white/[0.02] px-5 py-6 text-sm text-gray-400">
+                  Gauge placeholder
+                </div>
+              </article>
+            </div>
 
-              <div
-                ref={thoughtsRef}
-                className={glassCardClassName}
-                style={{
-                  ...glassCardStyle,
-                  padding: 16,
-                  maxHeight: 320,
-                  overflowY: 'auto',
-                  background: 'rgba(7, 10, 22, 0.58)',
-                }}
-              >
-                {thoughtLines.length === 0 ? (
-                  <div
-                    className="font-mono text-sm text-green-400"
-                    style={{
-                      fontFamily: 'Consolas, Menlo, Monaco, monospace',
-                      fontSize: 14,
-                      color: '#4ade80',
-                    }}
-                  >
-                    {TEXT.status.noThoughts}
-                  </div>
-                ) : (
-                  <div style={{ display: 'grid', gap: 10 }}>
-                    {thoughtLines.map((line, index) => (
-                      <div
-                        key={`${index}-${line}`}
-                        className="font-mono text-sm text-green-400"
-                        style={{
-                          fontFamily: 'Consolas, Menlo, Monaco, monospace',
-                          fontSize: 14,
-                          color: '#4ade80',
-                          lineHeight: 1.6,
-                          whiteSpace: 'pre-wrap',
-                          wordBreak: 'break-word',
+            <div className="col-span-12 grid gap-6 lg:col-span-8">
+              <article className={`${glassCardClassName} flex min-h-[420px] flex-col p-8`}>
+                <div className="mb-6 flex flex-col gap-2">
+                  <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Telemetry Graph</span>
+                  <h2 className="m-0 text-2xl font-semibold text-white">AreaChart Overview</h2>
+                </div>
+
+                <div className="min-h-0 flex-1 rounded-[1.5rem] border border-white/5 bg-white/[0.02] p-4">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={telemetryHistory}>
+                      <defs>
+                        <linearGradient id="telemetryFill" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.35} />
+                          <stop offset="100%" stopColor="#60a5fa" stopOpacity={0.02} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid stroke="rgba(255,255,255,0.08)" strokeDasharray="4 4" />
+                      <XAxis dataKey="time" stroke="#9ca3af" tick={{ fill: '#9ca3af', fontSize: 12 }} />
+                      <YAxis stroke="#9ca3af" tick={{ fill: '#9ca3af', fontSize: 12 }} />
+                      <Tooltip
+                        contentStyle={{
+                          background: 'rgba(3, 7, 18, 0.94)',
+                          border: '1px solid rgba(255,255,255,0.08)',
+                          borderRadius: 16,
+                          color: '#fff',
                         }}
-                      >
-                        {line}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </section>
-          </>
+                        labelStyle={{ color: '#d1d5db' }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="temperature"
+                        stroke="#60a5fa"
+                        strokeWidth={3}
+                        fill="url(#telemetryFill)"
+                        activeDot={{ r: 5, fill: '#60a5fa' }}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </article>
+
+              <article className={`${glassCardClassName} flex min-h-[320px] flex-col p-8`}>
+                <div className="mb-6 flex flex-col gap-2">
+                  <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Terminal</span>
+                  <h2 className="m-0 text-2xl font-semibold text-white">AI System Log</h2>
+                </div>
+
+                <div
+                  ref={thoughtsRef}
+                  className="min-h-0 flex-1 overflow-y-auto rounded-[1.5rem] border border-white/5 bg-black/20 p-5 font-mono text-sm leading-7 text-gray-200"
+                >
+                  {aiLogs.length > 0 ? (
+                    <div className="flex flex-col gap-3">
+                      {aiLogs.map((log) => (
+                        <div key={log.id} className="border-b border-white/5 pb-3 last:border-b-0 last:pb-0">
+                          <div className="text-gray-400">[{log.timestamp}]</div>
+                          <div className="text-white">{log.thought || 'AI log entry received.'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-gray-400">Awaiting AI logs...</div>
+                  )}
+                </div>
+              </article>
+            </div>
+          </section>
         ) : (
-          <>
-            <section style={{ display: 'grid', gap: 16 }}>
-              <h2 style={{ margin: 0, fontSize: '1.15rem' }}>{TEXT.sections.control}</h2>
+          <section className="grid gap-6">
+            <div className="grid gap-6 lg:grid-cols-3">
+              <DeviceCard
+                title={TEXT.devices.pump}
+                deviceType="pump"
+                timerValue={timerValues.pump}
+                onTimerChange={(value) => setTimerValue('pump', value)}
+                onSendCommand={sendCommand}
+              />
+              <DeviceCard
+                title={TEXT.devices.light}
+                deviceType="light"
+                timerValue={timerValues.light}
+                onTimerChange={(value) => setTimerValue('light', value)}
+                onSendCommand={sendCommand}
+              />
+              <DeviceCard
+                title={TEXT.devices.fan}
+                deviceType="fan"
+                timerValue={timerValues.fan}
+                onTimerChange={(value) => setTimerValue('fan', value)}
+                onSendCommand={sendCommand}
+              />
+            </div>
 
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-                  gap: 20,
-                }}
-              >
-                <DeviceCard
-                  title={TEXT.devices.pump}
-                  deviceType="pump"
-                  timerValue={timerValues.pump}
-                  onTimerChange={(value) => setTimerValue('pump', value)}
-                  onSendCommand={sendCommand}
-                />
-                <DeviceCard
-                  title={TEXT.devices.light}
-                  deviceType="light"
-                  timerValue={timerValues.light}
-                  onTimerChange={(value) => setTimerValue('light', value)}
-                  onSendCommand={sendCommand}
-                />
-                <DeviceCard
-                  title={TEXT.devices.fan}
-                  deviceType="fan"
-                  timerValue={timerValues.fan}
-                  onTimerChange={(value) => setTimerValue('fan', value)}
-                  onSendCommand={sendCommand}
-                />
-              </div>
-            </section>
-
-            <section
-              className={glassCardClassName}
-              style={{
-                ...glassCardStyle,
-                padding: 24,
-                display: 'grid',
-                gap: 16,
-              }}
-            >
-              <div style={{ display: 'grid', gap: 6 }}>
-                <h2 style={{ margin: 0, fontSize: '1.15rem' }}>{TEXT.sections.simulation}</h2>
-                <p style={{ margin: 0, color: '#9fb0c6', lineHeight: 1.6 }}>
-                  Быстрые тестовые переключатели режима симулятора через MQTT.
-                </p>
+            <section className={`${glassCardClassName} grid gap-4 p-8`}>
+              <div className="flex flex-col gap-2">
+                <span className="text-sm uppercase tracking-[0.16em] text-gray-400">Simulation</span>
+                <h2 className="m-0 text-2xl font-semibold text-white">MQTT Scenario Controls</h2>
               </div>
 
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                  gap: 12,
-                }}
-              >
+              <div className="grid gap-3 lg:grid-cols-3">
                 <button type="button" style={panelButtonStyle} onClick={() => publishSimulationMode('HEAT')}>
                   {TEXT.actions.heat}
                 </button>
@@ -810,7 +580,7 @@ function App() {
                 </button>
               </div>
             </section>
-          </>
+          </section>
         )}
       </div>
     </main>
