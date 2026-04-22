@@ -1,5 +1,5 @@
 import GlassCard from './GlassCard'
-import gnomeAvatar from '../assets/gnome.png'
+import gnomeAvatar from '../assets/gnome.gif'
 import { SendIcon } from './Icons'
 
 function Bubble({ message }) {
@@ -23,18 +23,25 @@ function Bubble({ message }) {
 export default function ChatPanel({ messages, input, onInput, onSend, className = "" }) {
   return (
     <GlassCard className={`flex h-full min-h-0 flex-col rounded-[28px] ${className}`}>
-      <div className="flex items-start gap-3">
-        <div className="glass-panel-soft overflow-hidden rounded-[22px] p-2">
+      <div className="flex items-center gap-5 shrink-0">
+        <div 
+          className="relative h-20 w-20 shrink-0 overflow-hidden md:h-24 md:w-24 opacity-85 transition-opacity hover:opacity-100"
+          style={{
+            maskImage: 'radial-gradient(circle, black 30%, transparent 75%)',
+            WebkitMaskImage: 'radial-gradient(circle, black 30%, transparent 75%)'
+          }}
+        >
           <img 
             src={gnomeAvatar} 
             alt="Нейрогном" 
-            className="h-16 w-16 rounded-[18px] object-cover md:h-20 md:w-20" 
+            className="h-full w-full object-cover scale-[1.25] brightness-110 contrast-125" 
           />
+          <div className="absolute inset-0 bg-violet-500/25 mix-blend-color pointer-events-none" />
         </div>
-        <div className="min-w-0 pt-1">
-          <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Чат Нейрогнома</div>
-          <div className="mt-2 inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300 md:text-sm">
-            <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" /> Онлайн
+        <div className="min-w-0">
+          <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Чат ассистента</div>
+          <div className="mt-1.5 inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300">
+            <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" /> Онлайн
           </div>
         </div>
       </div>
