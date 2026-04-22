@@ -4,7 +4,7 @@ function createSmoothPath(values) {
   const max = Math.max(...values)
   const min = Math.min(...values)
   const getPoint = (value, index) => {
-    const x = (index / (values.length - 1)) * 100
+    const x = (index / (values.length - 1)) * 400
     const y = 100 - ((value - min) / Math.max(max - min, 1)) * 56 - 20
     return { x, y }
   }
@@ -29,7 +29,7 @@ function Sparkline({ values, color, title }) {
   const glowId = `glow-${title.replace(/\s+/g, '-').toLowerCase()}`
 
   return (
-    <svg viewBox="0 0 100 100" className="h-24 w-full overflow-visible">
+    <svg viewBox="0 0 400 100" className="h-28 w-full overflow-visible" preserveAspectRatio="none">
       <defs>
         <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.38" />
@@ -48,7 +48,7 @@ function Sparkline({ values, color, title }) {
         <line
           key={value}
           x1="0"
-          x2="100"
+          x2="400"
           y1={value}
           y2={value}
           stroke="rgba(255,255,255,0.08)"
@@ -57,7 +57,7 @@ function Sparkline({ values, color, title }) {
         />
       ))}
 
-      <path d={`${path} L 100 100 L 0 100 Z`} fill={`url(#${gradientId})`} />
+      <path d={`${path} L 400 100 L 0 100 Z`} fill={`url(#${gradientId})`} />
       <path
         d={path}
         fill="none"
@@ -82,31 +82,34 @@ export default function MetricCard({
   values,
 }) {
   return (
-    <GlassCard soft className="overflow-hidden rounded-[26px] px-5 py-4">
-      <div className="flex items-start gap-4">
-        <div
-          className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[18px] border border-white/10"
-          style={{
-            backgroundColor: `${color}20`,
-            color,
-            boxShadow: `inset 0 1px 0 rgba(255,255,255,0.12), 0 0 24px ${color}18`,
-          }}
-        >
-          {icon}
-        </div>
-        <div className="min-w-0">
-          <div className="text-[17px] text-white/78">{title}</div>
-          <div className="mt-2 flex items-end gap-2">
-            <span className="text-[38px] font-semibold leading-none tracking-tight md:text-[40px]">{value}</span>
-            <span className="pb-1 text-lg text-white/68">{unit}</span>
+    <GlassCard soft className="overflow-hidden rounded-[28px] px-6 py-5">
+      <div className="flex flex-col gap-6 md:flex-row md:items-center">
+        <div className="flex shrink-0 items-center gap-5 md:w-64">
+          <div
+            className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-white/10"
+            style={{
+              backgroundColor: `${color}15`,
+              color,
+              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.1), 0 8px 20px ${color}15`,
+            }}
+          >
+            {icon}
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-medium uppercase tracking-wider text-white/40">{title}</div>
+            <div className="mt-1 flex items-baseline gap-1.5">
+              <span className="text-4xl font-bold tracking-tight text-white">{value}</span>
+              <span className="text-lg text-white/50">{unit}</span>
+            </div>
+            <div className="mt-1 text-[13px] font-medium" style={{ color: `${color}cc` }}>
+              {norm}
+            </div>
           </div>
         </div>
-      </div>
-      <div className="mt-2 rounded-[20px] bg-white/[0.02] px-1 py-2">
-        <Sparkline values={values} color={color} title={title} />
-      </div>
-      <div className="mt-1 text-[15px] font-medium" style={{ color }}>
-        Норма: {norm}
+
+        <div className="flex-1 min-w-0">
+          <Sparkline values={values} color={color} title={title} />
+        </div>
       </div>
     </GlassCard>
   )
