@@ -17,11 +17,10 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "farm.db"
-BROKER_HOST = "31.56.208.196"
-BROKER_PORT = 1883
+BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
+BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 SENSORS_TOPIC = "farm/+/sensors/#"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5-nano")

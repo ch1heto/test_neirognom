@@ -1,12 +1,14 @@
 import json
 import random
 import time
-
+import os
+from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
+load_dotenv()
 
-BROKER_HOST = "31.56.208.196"
-BROKER_PORT = 1883
+BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
+BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 DEVICE_ID = "tray_1"
 COMMANDS_TOPIC = "farm/tray_1/cmd/#"
 CONTROL_TOPIC = "farm/sim/control"
