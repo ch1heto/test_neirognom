@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import json
 import os
 import sqlite3
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -30,17 +31,13 @@ KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/water",
 }
 KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
+AI_COOLDOWN_SECONDS = 5
 CHAT_SYSTEM_PROMPT = (
-    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
-    "только на русском. Никакой латиницы или иероглифов. "
-    "Опирайся на переданные русские данные датчиков."
-)
-
-
-CHAT_SYSTEM_PROMPT = (
-    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
-    "только на русском. Никакой латиницы или иероглифов. "
-    "Опирайся на переданные русские данные датчиков."
+    "Ты — Нейрогном, дружелюбный помощник сити-фермы. "
+    "Отвечай естественно и по-человечески, кратко, только на русском. "
+    "Упоминай датчики, температуру, влажность или климат фермы только если пользователь явно спрашивает "
+    "о состоянии фермы, показаниях датчиков или климате. "
+    "В остальных случаях не пересказывай данные датчиков и просто поддерживай обычный разговор."
 )
 
 
@@ -82,14 +79,6 @@ def init_db() -> None:
             """
         )
         connection.commit()
-
-
-CHAT_SYSTEM_PROMPT = (
-    "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
-    "только на русском. Никакой латиницы или иероглифов. "
-    "Опирайся на переданные русские данные датчиков."
-)
-
 
 def current_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -166,6 +155,68 @@ def get_recent_telemetry(limit: int = 15) -> list[dict[str, Any]]:
         record["parsed_payload"] = parse_json_payload(str(record["payload"]))
         records.append(record)
     return records
+
+
+def get_last_climate_records(limit: int = 3) -> list[dict[str, Any]]:
+    with get_db_connection() as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT id, topic, payload, timestamp
+            FROM telemetry
+            WHERE topic = 'farm/tray_1/sensors/climate'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        record = dict(row)
+        parsed_payload = parse_json_payload(str(record["payload"]))
+        if isinstance(parsed_payload, dict):
+            record["parsed_payload"] = parsed_payload
+            records.append(record)
+    return records
+
+
+def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
+    anomalies: list[str] = []
+
+    if not records:
+        return anomalies
+
+    latest_payload = records[-1].get("parsed_payload", {})
+    if not isinstance(latest_payload, dict):
+        latest_payload = {}
+
+    air_temp = latest_payload.get("air_temp")
+    humidity = latest_payload.get("humidity")
+
+    if isinstance(air_temp, (int, float)) and air_temp > 28:
+        anomalies.append(f"Перегрев воздуха: air_temp={air_temp}")
+
+    if isinstance(air_temp, (int, float)) and air_temp < 18:
+        anomalies.append(f"Переохлаждение воздуха: air_temp={air_temp}")
+
+    if isinstance(humidity, (int, float)) and humidity < 50:
+        anomalies.append(f"Низкая влажность: humidity={humidity}")
+
+    if len(records) >= 3:
+        first_payload = records[0].get("parsed_payload", {})
+        last_payload = records[-1].get("parsed_payload", {})
+        if isinstance(first_payload, dict) and isinstance(last_payload, dict):
+            first_temp = first_payload.get("air_temp")
+            last_temp = last_payload.get("air_temp")
+            if isinstance(first_temp, (int, float)) and isinstance(last_temp, (int, float)):
+                if last_temp - first_temp > 2:
+                    anomalies.append(
+                        "Быстрый рост температуры воздуха: "
+                        f"{first_temp} -> {last_temp} за последние 3 замера"
+                    )
+
+    return anomalies
 
 
 def get_recent_ai_logs(limit: int = 50) -> list[dict[str, Any]]:
@@ -277,34 +328,6 @@ async def ask_ai(system_prompt: str, user_prompt: str) -> str:
         content = "".join(text_parts)
 
     return strip_markdown_backticks(str(content))
-
-
-def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
-    telemetry_russian = format_telemetry_records_russian(records)
-    system_prompt = (
-        "Ты — Нейрогном, эксперт сити-фермы. Отвечай кратко (1-2 предложения), "
-        "только на русском. Никакой латиницы или иероглифов. "
-        "Опирайся на переданные русские данные датчиков."
-    )
-    user_prompt = (
-        "Проанализируй данные датчиков и верни только валидный JSON без markdown.\n"
-        "Правила:\n"
-        "- Если температура воздуха > 28 C, включи вентилятор fan командой ON.\n"
-        "- Если температура воздуха < 18 C, включи свет light командой ON и выключи вентилятор fan командой OFF.\n"
-        "- Если влажность < 50 %, включи насос pump командой TIMER на 5 секунд.\n"
-        "- Если температура воды < 18 C, включи свет light командой ON.\n"
-        "- Если температура воды > 26 C, выключи свет light командой OFF.\n"
-        "- Если температура быстро растёт более чем на 2 C за 3 замера, учти это как тревожный признак.\n"
-        "- Если действий не требуется, верни пустой массив commands.\n"
-        "Формат ответа:\n"
-        '{'
-        '"thought":"Краткое объяснение",'
-        '"commands":[{"device_type":"fan","state":"ON"},{"device_type":"pump","state":"TIMER","duration":5},{"device_type":"light","state":"OFF"}]'
-        '}\n'
-        "Данные датчиков:\n"
-        f"{telemetry_russian}"
-    )
-    return system_prompt, user_prompt
 
 
 def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
@@ -471,6 +494,62 @@ def on_message(client, userdata, msg) -> None:
         print(f"[БЭКЕНД] Данные от {device_id}: {payload}")
 
 
+def print_watchdog_ai_logs(result: dict[str, Any]) -> None:
+    logs = result.get("logs", [])
+    if isinstance(logs, list) and logs:
+        for log in logs:
+            print(f"[WATCHDOG] {log}")
+    else:
+        print("[WATCHDOG] AI вызван, но журнал действий пуст.")
+
+
+async def internal_watchdog() -> None:
+    last_ai_call_ts = 0.0
+    in_alert_mode = False
+    loop = asyncio.get_running_loop()
+    print("[WATCHDOG] Запущен внутри FastAPI. Проверка аномалий каждые 5 сек.")
+
+    while True:
+        try:
+            records = get_last_climate_records(3)
+            anomalies = detect_anomalies(records)
+
+            if anomalies:
+                in_alert_mode = True
+                print("[WATCHDOG] Обнаружены аномалии:")
+                for anomaly in anomalies:
+                    print(f"[WATCHDOG] - {anomaly}")
+
+                now = loop.time()
+                cooldown_left = AI_COOLDOWN_SECONDS - (now - last_ai_call_ts)
+                if cooldown_left > 0:
+                    print(f"[WATCHDOG] AI не вызывается: cooldown ещё {int(cooldown_left)} сек.")
+                else:
+                    print("[WATCHDOG] Вызываю ai_decide() напрямую ...")
+                    result = await ai_decide()
+                    last_ai_call_ts = loop.time()
+                    print_watchdog_ai_logs(result)
+            elif in_alert_mode:
+                now = loop.time()
+                cooldown_left = AI_COOLDOWN_SECONDS - (now - last_ai_call_ts)
+                if cooldown_left > 0:
+                    print(f"[WATCHDOG] Норма восстановлена, ожидаю cooldown ещё {int(cooldown_left)} сек.")
+                else:
+                    print("[WATCHDOG] Ситуация нормализовалась. Запрашиваю деактивацию устройств ...")
+                    result = await ai_decide()
+                    last_ai_call_ts = loop.time()
+                    print_watchdog_ai_logs(result)
+                    in_alert_mode = False
+            else:
+                print("[WATCHDOG] Аномалий не обнаружено.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[WATCHDOG] Ошибка: {exc}")
+
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -482,10 +561,14 @@ async def lifespan(app: FastAPI):
     mqtt_client.loop_start()
 
     app.state.mqtt_client = mqtt_client
+    watchdog_task = asyncio.create_task(internal_watchdog())
 
     try:
         yield
     finally:
+        watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await watchdog_task
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
 
