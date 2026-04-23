@@ -29,7 +29,7 @@ function Sparkline({ values, color, title }) {
   const glowId = `glow-${title.replace(/\s+/g, '-').toLowerCase()}`
 
   return (
-    <svg viewBox="0 0 400 100" className="h-28 w-full overflow-visible" preserveAspectRatio="none">
+    <svg viewBox="0 0 400 100" className="h-28 w-full overflow-visible [@media_(min-width:1280px)_and_(max-width:1799px)]:h-22" preserveAspectRatio="none">
       <defs>
         <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.38" />
@@ -82,9 +82,9 @@ export default function MetricCard({
   values,
 }) {
   return (
-    <GlassCard soft className="overflow-hidden rounded-[28px] px-6 py-5">
-      <div className="flex flex-col gap-6 md:flex-row md:items-center">
-        <div className="flex shrink-0 items-center gap-5 md:w-64">
+    <GlassCard soft className="overflow-hidden rounded-[28px] px-6 py-5 [@media_(min-width:1280px)_and_(max-width:1799px)]:px-5 [@media_(min-width:1280px)_and_(max-width:1799px)]:py-4">
+      <div className="flex flex-col gap-6 md:flex-row md:items-center [@media_(min-width:1280px)_and_(max-width:1799px)]:gap-4">
+        <div className="flex shrink-0 items-center gap-5 md:w-64 [@media_(min-width:1280px)_and_(max-width:1799px)]:w-56 [@media_(min-width:1280px)_and_(max-width:1799px)]:gap-4">
           <div
             className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-white/10"
             style={{
