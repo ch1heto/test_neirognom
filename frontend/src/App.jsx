@@ -7,10 +7,6 @@ import LedTimeline from './components/LedTimeline'
 import MetricCard from './components/MetricCard'
 import ThoughtStream from './components/ThoughtStream'
 import {
-  initialDevices,
-  initialMessages,
-  initialMetrics,
-  initialThoughts,
   ledStages,
   sparklineSeries,
 } from './data/mock'
@@ -24,9 +20,10 @@ import {
   ThermometerIcon,
 } from './components/Icons'
 
-const API_BASE_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:8000'
-  : ''
+const API_BASE_URL =
+  window.location.hostname === 'localhost'
+    ? 'http://localhost:8000'
+    : `${window.location.protocol}//${window.location.hostname}:8000`
 const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 
@@ -94,10 +91,15 @@ async function requestJson(path, options = {}) {
 
 export default function App() {
   const [mode, setMode] = useState('monitoring')
-  const [metrics, setMetrics] = useState(initialMetrics)
-  const [devices, setDevices] = useState(initialDevices)
-  const [thoughts, setThoughts] = useState(initialThoughts)
-  const [messages, setMessages] = useState(initialMessages)
+  const [metrics, setMetrics] = useState({ waterTemp: 0, airHumidity: 0, airTemp: 0 })
+  const [devices, setDevices] = useState({
+    fans: { title: 'Вентиляция', subtitle: 'Обдув', level: 0, enabled: false },
+    lights: { title: 'Освещение', subtitle: 'Фитолампы', level: 0, enabled: false },
+    pumps: { title: 'Полив', subtitle: 'Насосы', level: 0, enabled: false },
+    led: { title: 'LED', scenario: 'Ожидание' }
+  })
+  const [thoughts, setThoughts] = useState([])
+  const [messages, setMessages] = useState([])
   const [chatInput, setChatInput] = useState('')
   const [currentTime, setCurrentTime] = useState(formatTime())
   const [currentDate, setCurrentDate] = useState(formatDate())
@@ -170,13 +172,21 @@ export default function App() {
         const data = await requestJson('/api/logs?limit=5')
         if (!isMounted || !Array.isArray(data)) return
 
-        setThoughts(
-          data.map((entry) => ({
+        setThoughts((prev) => {
+          const serverLogs = data.map((entry) => ({
             id: `log-${entry.id ?? makeId()}`,
             text: entry.thought || 'Нет записанной мысли.',
             time: formatTimestampLabel(entry.timestamp),
-          })),
-        )
+          }))
+
+          const serverIds = new Set(serverLogs.map((log) => log.id))
+
+          const localLogs = prev.filter(
+            (log) => !serverIds.has(log.id) && !log.id.startsWith('log-')
+          )
+
+          return [...localLogs, ...serverLogs].slice(0, 15)
+        })
       } catch (error) {
         console.error('Failed to load AI logs', error)
       }

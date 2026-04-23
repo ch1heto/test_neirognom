@@ -511,7 +511,7 @@ async def internal_watchdog() -> None:
 
     while True:
         try:
-            records = get_last_climate_records(3)
+            records = await asyncio.to_thread(get_last_climate_records, 3)
             anomalies = detect_anomalies(records)
 
             if anomalies:
@@ -651,7 +651,7 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
 @app.post("/api/ai/decide")
 async def ai_decide() -> dict[str, Any]:
     logs: list[str] = []
-    telemetry_records = get_recent_telemetry(15)
+    telemetry_records = await asyncio.to_thread(get_recent_telemetry, 15)
 
     if not telemetry_records:
         return {"logs": ["В базе нет записей телеметрии."], "thought": "", "commands": []}
@@ -684,7 +684,7 @@ async def ai_decide() -> dict[str, Any]:
         thought = "Модель не дала пояснения."
         logs.insert(0, f"Мысль Нейроагронома: {thought}")
 
-    save_ai_log(thought, normalized_commands)
+    await asyncio.to_thread(save_ai_log, thought, normalized_commands)
 
     if not normalized_commands:
         logs.append("Действия не требуются.")
@@ -704,7 +704,7 @@ def get_logs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any
 @app.post("/api/chat")
 @app.post("/api/ai/chat")
 async def chat_with_ai(request: ChatRequest) -> dict[str, str]:
-    user_prompt = build_chat_prompt(request.message, request.history)
+    user_prompt = await asyncio.to_thread(build_chat_prompt, request.message, request.history)
 
     try:
         reply = await ask_ai(CHAT_SYSTEM_PROMPT, user_prompt)
