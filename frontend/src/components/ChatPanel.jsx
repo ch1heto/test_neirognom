@@ -13,8 +13,12 @@ function Bubble({ message }) {
             : 'border border-emerald-200/12 bg-emerald-400/14 text-white'
         }`}
       >
-        <div>{message.text}</div>
-        <div className="mt-2 text-right text-[11px] text-white/42">{message.time}</div>
+        <div className="text-sm leading-6 text-white">
+          {message.text}
+          <span className="ml-2 inline-block text-[11px] text-white/42 align-baseline">
+            {message.time}
+          </span>
+        </div>
       </div>
     </div>
   )
@@ -23,9 +27,9 @@ function Bubble({ message }) {
 export default function ChatPanel({ messages, input, onInput, onSend, className = "" }) {
   return (
     <GlassCard className={`flex h-full min-h-0 flex-col rounded-[28px] ${className}`}>
-      <div className="flex items-center gap-5 shrink-0">
+      <div className="flex items-center gap-3 shrink-0">
         <div 
-          className="relative h-20 w-20 shrink-0 overflow-hidden md:h-24 md:w-24 opacity-85 transition-opacity hover:opacity-100"
+          className="relative h-14 w-14 shrink-0 overflow-hidden md:h-16 md:w-16 opacity-85 transition-opacity hover:opacity-100"
           style={{
             maskImage: 'radial-gradient(circle, black 30%, transparent 75%)',
             WebkitMaskImage: 'radial-gradient(circle, black 30%, transparent 75%)'
@@ -39,21 +43,21 @@ export default function ChatPanel({ messages, input, onInput, onSend, className 
           <div className="absolute inset-0 bg-violet-500/25 mix-blend-color pointer-events-none" />
         </div>
         <div className="min-w-0">
-          <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Чат ассистента</div>
+          <div className="text-[18px] font-semibold tracking-tight md:text-[20px]">Чат ассистента</div>
           <div className="mt-1.5 inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300">
             <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" /> Онлайн
           </div>
         </div>
       </div>
 
-      <div className="custom-scrollbar mt-4 flex-1 space-y-3 overflow-y-auto pr-1">
+      <div className="custom-scrollbar mt-2 flex-1 space-y-2 overflow-y-auto pr-1">
         {messages.map((message) => (
           <Bubble key={message.id} message={message} />
         ))}
       </div>
 
       <form
-        className="mt-4 flex items-center gap-3"
+        className="mt-2 flex items-center gap-2"
         onSubmit={(event) => {
           event.preventDefault()
           onSend()

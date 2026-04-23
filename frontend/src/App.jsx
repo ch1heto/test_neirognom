@@ -242,7 +242,7 @@ export default function App() {
         title: 'Влажность воздуха',
         value: metrics.airHumidity,
         unit: '%',
-        norm: '60 – 75 %',
+        norm: '52 – 60 %',
         color: '#71F16A',
         values: sparklineSeries.airHumidity,
         icon: <HumidityIcon className="h-6 w-6" />,

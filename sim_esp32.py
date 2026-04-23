@@ -58,7 +58,7 @@ while True:
         water_temp = round(random.uniform(19.0, 20.0), 1)
     else:
         air_temp = round(random.uniform(22.0, 24.0), 1)
-        humidity = round(random.uniform(49.0, 51.0), 1)
+        humidity = round(random.uniform(52.0, 60.0), 1)
         water_temp = round(random.uniform(19.6, 20.4), 1)
 
     climate_payload = json.dumps(
