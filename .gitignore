@@ -19,4 +19,5 @@ frontend/dist/
 
 # Logs / misc
 *.log
-.DS_Store
+backend/*.db-shm
+backend/*.db-wal
