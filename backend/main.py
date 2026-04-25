@@ -28,7 +28,7 @@ from db import (
     save_telemetry,
     update_device_status,
 )
-from tools import TOOLS_SCHEMA, get_current_metrics, get_history, get_crop_rules
+from tools import TOOLS_SCHEMA, get_current_metrics, get_history, get_crop_rules, get_recent_anomalies
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
@@ -49,7 +49,6 @@ KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/water",
 }
 KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
-AI_COOLDOWN_SECONDS = 5
 HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
 RAW_RETENTION_HOURS = 24
 ANOMALY_EVENT_COOLDOWN_MINUTES = 5
@@ -309,6 +308,8 @@ def build_hourly_trend_notes(hourly_rows: list[dict[str, Any]]) -> list[str]:
         ("air_temp_avg", "Температура воздуха", 0.7),
         ("humidity_avg", "Влажность", 3.0),
         ("water_temp_avg", "Температура воды", 0.7),
+        ("ph_avg", "pH", 0.2),
+        ("ec_avg", "EC", 0.2),
     ]
     notes: list[str] = []
 
@@ -363,8 +364,10 @@ def build_advisor_response(crop: str) -> dict[str, Any]:
         value = current.get(metric_name)
         metric_range = crop_ranges.get(metric_name)
         if value is None:
-            if metric_name in {"ph", "ec"}:
-                risks.append(f"Данных по {title} пока недостаточно.")
+            if metric_name == "ph":
+                risks.append("Данных по pH пока нет.")
+            elif metric_name == "ec":
+                risks.append("Данных по EC пока нет.")
             continue
         if metric_range is None:
             continue
@@ -392,8 +395,12 @@ def build_advisor_response(crop: str) -> dict[str, Any]:
         recommendations.append("Проверьте вентиляцию и не увеличивайте интенсивность освещения до стабилизации температуры.")
     if current.get("humidity") is not None and current["humidity"] < 50:
         recommendations.append("Проверьте влажность субстрата и режим увлажнения, но не включайте оборудование без ручной проверки.")
-    if current.get("ph") is None or current.get("ec") is None:
-        recommendations.append("Данных по pH и EC пока недостаточно, поэтому рекомендации по питательному раствору ограничены.")
+    if current.get("ph") is None and current.get("ec") is None:
+        recommendations.append("Данных по pH и EC пока нет, поэтому рекомендации по питательному раствору ограничены.")
+    elif current.get("ph") is None:
+        recommendations.append("Данных по pH пока нет, поэтому рекомендации по кислотности раствора ограничены.")
+    elif current.get("ec") is None:
+        recommendations.append("Данных по EC пока нет, поэтому рекомендации по концентрации раствора ограничены.")
 
     if not risks:
         risks.append("Существенных рисков по доступным данным не обнаружено.")
@@ -482,7 +489,17 @@ def format_telemetry_records_russian(records: list[dict[str, Any]]) -> str:
     return "\n".join(formatted) if formatted else "Нет данных с датчиков"
 
 
-async def ask_ai(system_prompt: str, user_prompt: str, message_history: list = None) -> str:
+def add_analysis_step(analysis_steps: list[str] | None, step: str) -> None:
+    if analysis_steps is not None and step not in analysis_steps:
+        analysis_steps.append(step)
+
+
+async def ask_ai(
+    system_prompt: str,
+    user_prompt: str,
+    message_history: list = None,
+    analysis_steps: list[str] | None = None,
+) -> str:
     # Собираем контекст сообщений
     messages = [{"role": "system", "content": system_prompt}]
     if message_history:
@@ -515,11 +532,17 @@ async def ask_ai(system_prompt: str, user_prompt: str, message_history: list = N
                 args = json.loads(tool_call.function.arguments)
 
                 if func_name == "get_current_metrics":
+                    add_analysis_step(analysis_steps, "Получаю текущие показатели фермы")
                     result = get_current_metrics()
                 elif func_name == "get_history":
+                    add_analysis_step(analysis_steps, "Получаю почасовую историю показателей")
                     result = get_history(args.get("metric_name"), args.get("hours", 24))
                 elif func_name == "get_crop_rules":
+                    add_analysis_step(analysis_steps, "Проверяю правила выбранной культуры")
                     result = get_crop_rules(args.get("crop_name"))
+                elif func_name == "get_recent_anomalies":
+                    add_analysis_step(analysis_steps, "Проверяю последние события anomaly_events")
+                    result = get_recent_anomalies(args.get("hours", 24))
                 else:
                     result = {"error": f"Неизвестная функция {func_name}"}
 
@@ -537,39 +560,13 @@ async def ask_ai(system_prompt: str, user_prompt: str, message_history: list = N
     return "Я слишком долго думал над этим вопросом и запутался. Пожалуйста, переформулируйте."
 
 
-def build_decision_ai_request(records: list[dict[str, Any]]) -> tuple[str, str]:
-    telemetry_russian = format_telemetry_records_russian(records)
-    system_prompt = (
-        "Ты — Нейрогном, эксперт сити-фермы. Отвечай только валидным JSON без markdown. "
-        "Используй только русский текст в поле thought и только допустимые device_type: fan, pump, light."
-    )
-    user_prompt = (
-        "Проанализируй данные датчиков и верни только валидный JSON без markdown.\n"
-        "Полный набор правил принятия решений:\n"
-        "- Если air_temp > 28 C, включи fan командой ON.\n"
-        "- Если air_temp < 18 C, включи light командой ON для обогрева и обязательно выключи fan командой OFF.\n"
-        "- Если humidity < 50 %, включи pump командой TIMER на 5 секунд.\n"
-        "- Если water_temp < 18 C, включи light командой ON.\n"
-        "- Если water_temp > 26 C, выключи light командой OFF.\n"
-        "- Если температура воздуха 18-28 C и влажность выше 50%, это считается нормой. В этом случае верни команды на выключение всех активных устройств, например fan OFF и light OFF.\n"
-        "- Если температура воздуха быстро растет более чем на 2 C за 3 последних замера, учти это как тревожный признак.\n"
-        "- Если действий не требуется, верни пустой массив commands.\n"
-        "Формат ответа:\n"
-        "{"
-        "\"thought\":\"Краткое объяснение\","
-        "\"commands\":[{\"device_type\":\"fan\",\"state\":\"ON\"},{\"device_type\":\"pump\",\"state\":\"TIMER\",\"duration\":5},{\"device_type\":\"light\",\"state\":\"OFF\"}]"
-        "}\n"
-        "Данные датчиков:\n"
-        f"{telemetry_russian}"
-    )
-    return system_prompt, user_prompt
-
-
 def get_latest_data_snapshot() -> dict[str, Any]:
     latest_snapshot: dict[str, Any] = {
         "Температура": None,
         "Влажность": None,
         "Темп. воды": None,
+        "pH": None,
+        "EC": None,
     }
 
     for record in reversed(get_recent_telemetry(10)):
@@ -587,6 +584,11 @@ def get_latest_data_snapshot() -> dict[str, Any]:
             if latest_snapshot["Темп. воды"] is None:
                 latest_snapshot["Темп. воды"] = payload.get("water_temp")
 
+        if latest_snapshot["pH"] is None:
+            latest_snapshot["pH"] = payload.get("ph", payload.get("pH"))
+        if latest_snapshot["EC"] is None:
+            latest_snapshot["EC"] = payload.get("ec", payload.get("EC"))
+
     return latest_snapshot
 
 
@@ -596,11 +598,16 @@ def format_latest_data_for_prompt() -> str:
     air_temp = latest_data.get("Температура")
     humidity = latest_data.get("Влажность")
     water_temp = latest_data.get("Темп. воды")
+    ph = latest_data.get("pH")
+    ec = latest_data.get("EC")
+    ph_text = format_sensor_value(ph, "") if ph is not None else "данных по pH пока нет"
+    ec_text = format_sensor_value(ec, "") if ec is not None else "данных по EC пока нет"
 
     return (
         f"Текущие показатели: Температура воздуха {format_sensor_value(air_temp, ' C')}, "
         f"Влажность {format_sensor_value(humidity, '%')}, "
-        f"Температура воды {format_sensor_value(water_temp, ' C')}"
+        f"Температура воды {format_sensor_value(water_temp, ' C')}, "
+        f"pH {ph_text}, EC {ec_text}"
     )
 
 
@@ -624,63 +631,6 @@ def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None)
     return "\n\n".join(prompt_parts)
 
 
-def normalize_commands(raw_commands: Any) -> tuple[list[dict[str, Any]], list[str]]:
-    normalized: list[dict[str, Any]] = []
-    logs: list[str] = []
-
-    if not isinstance(raw_commands, list):
-        return normalized, ["Поле commands в ответе модели имеет неверный формат."]
-
-    for raw_command in raw_commands:
-        if not isinstance(raw_command, dict):
-            logs.append(f"Пропущена некорректная команда: {raw_command!r}")
-            continue
-
-        device_type = str(raw_command.get("device_type", "")).strip()
-        state = str(raw_command.get("state", "")).strip().upper()
-
-        if device_type not in KNOWN_DEVICE_TYPES:
-            logs.append(f"Пропущена команда с неизвестным устройством: {raw_command!r}")
-            continue
-
-        if state not in {"ON", "OFF", "TIMER"}:
-            logs.append(f"Пропущена команда с неверным состоянием: {raw_command!r}")
-            continue
-
-        command: dict[str, Any] = {
-            "device_type": device_type,
-            "state": state,
-        }
-
-        duration = raw_command.get("duration")
-        if state == "TIMER":
-            if not isinstance(duration, (int, float)) or duration <= 0:
-                logs.append(f"Пропущена TIMER-команда без корректной duration: {raw_command!r}")
-                continue
-            command["duration"] = float(duration)
-
-        normalized.append(command)
-
-    return normalized, logs
-
-
-def publish_ai_command(command: dict[str, Any]) -> str:
-    device_type = str(command["device_type"])
-    state = str(command["state"])
-    topic = f"farm/tray_1/cmd/{device_type}"
-
-    if state == "TIMER":
-        duration = command["duration"]
-        payload = f"TIMER {duration:g}"
-        action = f"Опубликована команда: {device_type} -> TIMER {duration:g}"
-    else:
-        payload = state
-        action = f"Опубликована команда: {device_type} -> {state}"
-
-    app.state.mqtt_client.publish(topic, payload)
-    return f"{action} в топик {topic}"
-
-
 def on_connect(client, userdata, flags, reason_code, properties) -> None:
     if reason_code == 0:
         client.subscribe(SENSORS_TOPIC)
@@ -701,19 +651,8 @@ def on_message(client, userdata, msg) -> None:
         print(f"[БЭКЕНД] Данные от {device_id}: {payload}")
 
 
-def print_watchdog_ai_logs(result: dict[str, Any]) -> None:
-    logs = result.get("logs", [])
-    if isinstance(logs, list) and logs:
-        for log in logs:
-            print(f"[WATCHDOG] {log}")
-    else:
-        print("[WATCHDOG] AI вызван, но журнал действий пуст.")
-
-
 async def internal_watchdog() -> None:
-    last_ai_call_ts = 0.0
     in_alert_mode = False
-    loop = asyncio.get_running_loop()
     print("[WATCHDOG] Запущен внутри FastAPI. Проверка аномалий каждые 5 сек.")
 
     while True:
@@ -728,27 +667,10 @@ async def internal_watchdog() -> None:
                 for anomaly in anomalies:
                     print(f"[WATCHDOG] - {anomaly}")
                 await save_watchdog_anomaly_events(anomaly_events)
-
-                now = loop.time()
-                cooldown_left = AI_COOLDOWN_SECONDS - (now - last_ai_call_ts)
-                if cooldown_left > 0:
-                    print(f"[WATCHDOG] AI не вызывается: cooldown ещё {int(cooldown_left)} сек.")
-                else:
-                    print("[WATCHDOG] Вызываю ai_decide() напрямую ...")
-                    result = await ai_decide()
-                    last_ai_call_ts = loop.time()
-                    print_watchdog_ai_logs(result)
+                print("[WATCHDOG] Автоуправление отключено: AI не вызывается и MQTT-команды не отправляются.")
             elif in_alert_mode:
-                now = loop.time()
-                cooldown_left = AI_COOLDOWN_SECONDS - (now - last_ai_call_ts)
-                if cooldown_left > 0:
-                    print(f"[WATCHDOG] Норма восстановлена, ожидаю cooldown ещё {int(cooldown_left)} сек.")
-                else:
-                    print("[WATCHDOG] Ситуация нормализовалась. Запрашиваю деактивацию устройств ...")
-                    result = await ai_decide()
-                    last_ai_call_ts = loop.time()
-                    print_watchdog_ai_logs(result)
-                    in_alert_mode = False
+                print("[WATCHDOG] Ситуация нормализовалась. Устройства не переключаются автоматически.")
+                in_alert_mode = False
             else:
                 print("[WATCHDOG] Аномалий не обнаружено.")
         except asyncio.CancelledError:
@@ -760,7 +682,7 @@ async def internal_watchdog() -> None:
 
 
 async def hourly_aggregation_worker() -> None:
-    print("[AGGREGATION] Р—Р°РїСѓС‰РµРЅР° С„РѕРЅРѕРІР°СЏ РїРѕС‡Р°СЃРѕРІР°СЏ Р°РіСЂРµРіР°С†РёСЏ.")
+    print("[AGGREGATION] Запущена почасовая агрегация")
 
     while True:
         try:
@@ -768,13 +690,13 @@ async def hourly_aggregation_worker() -> None:
             deleted_count = await asyncio.to_thread(delete_old_raw_data, RAW_RETENTION_HOURS)
             print(
                 "[AGGREGATION] "
-                f"РђРіСЂРµРіРёСЂРѕРІР°РЅРѕ С‡Р°СЃРѕРІ: {aggregated_count}; "
-                f"СѓРґР°Р»РµРЅРѕ raw-Р·Р°РїРёСЃРµР№: {deleted_count}."
+                f"Почасовая агрегация выполнена: новых часов {aggregated_count}; "
+                f"удалено старых raw-записей {deleted_count}."
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"[AGGREGATION] РћС€РёР±РєР°: {exc}")
+            print(f"[AGGREGATION] Ошибка почасовой агрегации: {exc}")
 
         await asyncio.sleep(HOURLY_AGGREGATION_INTERVAL_SECONDS)
 
@@ -837,9 +759,9 @@ def read_root() -> dict[str, str]:
 @app.get("/api/telemetry")
 def get_telemetry() -> dict[str, Any]:
     snapshot = get_latest_data_snapshot()
-    air_temp = snapshot.get("air_temp")
-    humidity = snapshot.get("humidity")
-    water_temp = snapshot.get("water_temp")
+    air_temp = snapshot.get("Температура")
+    humidity = snapshot.get("Влажность")
+    water_temp = snapshot.get("Темп. воды")
 
     if air_temp is None or humidity is None or water_temp is None:
         for record in reversed(get_recent_telemetry(10)):
@@ -883,50 +805,24 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
 
 @app.post("/api/ai/decide")
 async def ai_decide() -> dict[str, Any]:
+    advisor_report = await asyncio.to_thread(build_advisor_response, "tomatoes")
+    thought = str(advisor_report.get("summary", "")).strip()
+    recommendations = advisor_report.get("recommendations", [])
+    risks = advisor_report.get("risks", [])
+
     logs: list[str] = []
-    telemetry_records = await asyncio.to_thread(get_recent_telemetry, 15)
-
-    if not telemetry_records:
-        return {"logs": ["В базе нет записей телеметрии."], "thought": "", "commands": []}
-
-    try:
-        system_prompt, user_prompt = build_decision_ai_request(telemetry_records)
-        raw_decision = await ask_ai(system_prompt, user_prompt)
-        decision = json.loads(raw_decision)
-    except Exception as exc:
-        return {
-            "logs": [f"Не удалось получить корректное решение от AI: {exc}"],
-            "thought": "",
-            "commands": [],
-        }
-
-    if not isinstance(decision, dict):
-        return {
-            "logs": ["Модель вернула ответ не в формате JSON-объекта."],
-            "thought": "",
-            "commands": [],
-        }
-
-    thought = str(decision.get("thought", "")).strip()
-    normalized_commands, normalization_logs = normalize_commands(decision.get("commands", []))
-    logs.extend(normalization_logs)
-
     if thought:
-        logs.insert(0, f"Мысль Нейроагронома: {thought}")
-    else:
-        thought = "Модель не дала пояснения."
-        logs.insert(0, f"Мысль Нейроагронома: {thought}")
+        logs.append(f"Советник: {thought}")
+    if isinstance(risks, list):
+        for risk in risks:
+            logs.append(f"Риск: {risk}")
+    if isinstance(recommendations, list):
+        for recommendation in recommendations:
+            logs.append(f"Рекомендация: {recommendation}")
+    logs.append("Автоуправление отключено: AI не отправляет MQTT-команды.")
 
-    await asyncio.to_thread(save_ai_log, thought, normalized_commands)
-
-    if not normalized_commands:
-        logs.append("Действия не требуются.")
-        return {"logs": logs, "thought": thought, "commands": normalized_commands}
-
-    for command in normalized_commands:
-        logs.append(publish_ai_command(command))
-
-    return {"logs": logs, "thought": thought, "commands": normalized_commands}
+    await asyncio.to_thread(save_ai_log, thought, [])
+    return {"logs": logs, "thought": thought, "commands": []}
 
 
 @app.get("/api/advisor")
@@ -941,16 +837,41 @@ def get_logs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any
 
 @app.post("/api/chat")
 @app.post("/api/ai/chat")
-async def chat_with_ai(request: ChatRequest) -> dict[str, str]:
+async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
     user_prompt = request.messages[-1]["content"]
     history = request.messages[:-1]
+    analysis_steps = [
+        "Получен запрос пользователя",
+        "Анализирую смысл сообщения",
+        "Определяю, какие данные нужны для ответа",
+    ]
+    enriched_prompt = build_chat_prompt(user_prompt, history)
+    analysis_steps.append("Добавляю актуальные показатели фермы в контекст")
 
     try:
-        reply = await ask_ai(CHAT_SYSTEM_PROMPT, user_prompt, history)
+        reply = await ask_ai(CHAT_SYSTEM_PROMPT, enriched_prompt, None, analysis_steps)
     except Exception as exc:
-        return {"reply": f"Не удалось получить ответ от AI: {exc}"}
+        analysis_steps.append("Формирую итоговый ответ")
+        return {
+            "reply": f"Не удалось получить ответ от AI: {exc}",
+            "analysis_steps": analysis_steps,
+            "status_text": "Нейрогном не смог сформировать ответ",
+        }
 
     if not reply:
         reply = "Недостаточно данных для ответа."
 
-    return {"reply": reply}
+    analysis_steps.append("Формирую итоговый ответ")
+    await asyncio.to_thread(
+        save_ai_log,
+        reply,
+        {
+            "type": "chat",
+            "analysis_steps": analysis_steps,
+        },
+    )
+    return {
+        "reply": reply,
+        "analysis_steps": analysis_steps,
+        "status_text": "Нейрогном сформировал ответ",
+    }

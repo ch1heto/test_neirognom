@@ -3,6 +3,7 @@ from typing import Any
 
 from db import get_current_metrics as db_get_current_metrics
 from db import get_hourly_history
+from db import get_recent_anomaly_events
 
 CROPS_DIR = "crops_data"
 CLIMATE_TOPIC = "farm/tray_1/sensors/climate"
@@ -19,7 +20,7 @@ def get_current_metrics() -> dict[str, Any]:
 
 def get_history(metric_name, hours=24) -> dict[str, str] | list[dict[str, Any]]:
     """Возвращает усредненную историю за указанное количество часов."""
-    if metric_name not in {"temperature", "humidity", "water_temp"}:
+    if metric_name not in {"temperature", "humidity", "water_temp", "ph", "ec"}:
         return {"error": f"Неизвестная метрика: {metric_name}"}
 
     try:
@@ -45,13 +46,21 @@ def get_crop_rules(crop_name):
         return {"error": str(e)}
 
 
+def get_recent_anomalies(hours=24) -> dict[str, str] | list[dict[str, Any]]:
+    """Возвращает последние события аномалий за указанный период."""
+    try:
+        return get_recent_anomaly_events(int(hours))
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Схема инструментов для OpenAI API
 TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
             "name": "get_current_metrics",
-            "description": "Получает самые свежие, текущие показания датчиков фермы (температура, влажность, температура воды). Вызывай, когда спрашивают 'как дела сейчас'."
+            "description": "Получает самые свежие, текущие показания датчиков фермы (температура, влажность, температура воды, pH, EC). Вызывай, когда спрашивают 'как дела сейчас'."
         }
     },
     {
@@ -64,7 +73,7 @@ TOOLS_SCHEMA = [
                 "properties": {
                     "metric_name": {
                         "type": "string",
-                        "enum": ["temperature", "humidity", "water_temp"],
+                        "enum": ["temperature", "humidity", "water_temp", "ph", "ec"],
                         "description": "Название метрики для анализа."
                     },
                     "hours": {
@@ -90,6 +99,23 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["crop_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_anomalies",
+            "description": "Получает последние события аномалий фермы за указанный период. Вызывай, когда нужно проверить перегрев, низкую влажность или другие недавние проблемы.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {
+                        "type": "integer",
+                        "description": "За сколько последних часов выгрузить события. По умолчанию 24."
+                    }
+                },
+                "required": ["hours"]
             }
         }
     }

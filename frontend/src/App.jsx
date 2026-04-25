@@ -27,6 +27,15 @@ const API_BASE_URL =
 const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 
+const CHAT_THINKING_STEPS = [
+  'Получен запрос пользователя',
+  'Анализирую смысл сообщения',
+  'Определяю нужный контекст',
+  'Проверяю доступные данные фермы',
+  'Сверяю показатели с нормами',
+  'Формирую ответ Нейрогнома',
+]
+
 function makeId() {
   if (window.crypto && typeof window.crypto.randomUUID === 'function') {
     return window.crypto.randomUUID()
@@ -89,6 +98,20 @@ async function requestJson(path, options = {}) {
   return response.json()
 }
 
+function parseLogMeta(entry) {
+  try {
+    if (!entry?.commands_json) return null
+
+    if (typeof entry.commands_json === 'string') {
+      return JSON.parse(entry.commands_json)
+    }
+
+    return entry.commands_json
+  } catch {
+    return null
+  }
+}
+
 export default function App() {
   const [mode, setMode] = useState('monitoring')
   const [metrics, setMetrics] = useState({ waterTemp: 0, airHumidity: 0, airTemp: 0 })
@@ -101,6 +124,7 @@ export default function App() {
   const [thoughts, setThoughts] = useState([])
   const [messages, setMessages] = useState([])
   const [chatInput, setChatInput] = useState('')
+  const [isChatThinking, setIsChatThinking] = useState(false)
   const [currentTime, setCurrentTime] = useState(formatTime())
   const [currentDate, setCurrentDate] = useState(formatDate())
   const [activeLedStage, setActiveLedStage] = useState(5)
@@ -173,11 +197,16 @@ export default function App() {
         if (!isMounted || !Array.isArray(data)) return
 
         setThoughts((prev) => {
-          const serverLogs = data.map((entry) => ({
-            id: `log-${entry.id ?? makeId()}`,
-            text: entry.thought || 'Нет записанной мысли.',
-            time: formatTimestampLabel(entry.timestamp),
-          }))
+          const serverLogs = data
+            .filter((entry) => {
+              const meta = parseLogMeta(entry)
+              return meta?.type !== 'chat'
+            })
+            .map((entry) => ({
+              id: `log-${entry.id ?? makeId()}`,
+              text: entry.thought || 'Нет записанной мысли.',
+              time: formatTimestampLabel(entry.timestamp),
+            }))
 
           const serverIds = new Set(serverLogs.map((log) => log.id))
 
@@ -316,7 +345,7 @@ export default function App() {
 
   const handleSendMessage = async () => {
     const text = chatInput.trim()
-    if (!text) return
+    if (!text || isChatThinking) return
 
     const userMessage = {
       id: makeId(),
@@ -327,6 +356,7 @@ export default function App() {
 
     setMessages((prev) => [...prev, userMessage])
     setChatInput('')
+    setIsChatThinking(true)
 
     try {
       const data = await requestJson('/api/chat', {
@@ -339,7 +369,11 @@ export default function App() {
       pushAssistantMessage(data.reply || 'Недостаточно данных для ответа.')
     } catch (error) {
       console.error('Failed to send chat message', error)
+
+      pushThought('Не удалось получить ответ от backend.')
       pushAssistantMessage('Не удалось подключиться к ассистенту. Проверьте backend.')
+    } finally {
+      setIsChatThinking(false)
     }
   }
 
@@ -490,6 +524,8 @@ export default function App() {
               input={chatInput}
               onInput={setChatInput}
               onSend={handleSendMessage}
+              isThinking={isChatThinking}
+              thinkingSteps={CHAT_THINKING_STEPS}
               className="flex-1"
             />
           </aside>

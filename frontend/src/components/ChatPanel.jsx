@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from 'react'
 import GlassCard from './GlassCard'
 import gnomeAvatar from '../assets/gnome.gif'
 import { SendIcon } from './Icons'
@@ -27,7 +28,57 @@ function Bubble({ message }) {
   )
 }
 
-export default function ChatPanel({ messages, input, onInput, onSend, className = "" }) {
+function ThinkingStatus({ steps = [] }) {
+  const safeSteps = useMemo(
+    () => (steps.length > 0 ? steps : ['Нейрогном думает']),
+    [steps],
+  )
+
+  const [stepIndex, setStepIndex] = useState(0)
+  const [dotCount, setDotCount] = useState(1)
+
+  useEffect(() => {
+    setStepIndex(0)
+    setDotCount(1)
+  }, [safeSteps])
+
+  useEffect(() => {
+    const dotTimer = setInterval(() => {
+      setDotCount((prev) => (prev >= 3 ? 1 : prev + 1))
+    }, 420)
+
+    const stepTimer = setInterval(() => {
+      setStepIndex((prev) => (prev + 1) % safeSteps.length)
+    }, 1700)
+
+    return () => {
+      clearInterval(dotTimer)
+      clearInterval(stepTimer)
+    }
+  }, [safeSteps])
+
+  return (
+    <div className="flex justify-start pl-1">
+      <div className="inline-flex max-w-[92%] items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3 py-1.5 text-xs text-white/48">
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-violet-300/70" />
+        <span>
+          {safeSteps[stepIndex]}
+          {'.'.repeat(dotCount)}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+export default function ChatPanel({
+  messages,
+  input,
+  onInput,
+  onSend,
+  isThinking = false,
+  thinkingSteps = [],
+  className = "",
+}) {
   return (
     <GlassCard className={`flex h-full min-h-0 flex-col rounded-[28px] ${className}`}>
       <div className="flex items-center gap-3 shrink-0">
@@ -57,6 +108,8 @@ export default function ChatPanel({ messages, input, onInput, onSend, className 
         {messages.map((message) => (
           <Bubble key={message.id} message={message} />
         ))}
+
+        {isThinking && <ThinkingStatus steps={thinkingSteps} />}
       </div>
 
       <form
@@ -70,13 +123,15 @@ export default function ChatPanel({ messages, input, onInput, onSend, className 
           <input
             value={input}
             onChange={(event) => onInput(event.target.value)}
-            placeholder="Напишите сообщение…"
-            className="w-full bg-transparent text-sm text-white placeholder:text-white/35 focus:outline-none"
+            disabled={isThinking}
+            placeholder={isThinking ? 'Нейрогном формирует ответ…' : 'Напишите сообщение…'}
+            className="w-full bg-transparent text-sm text-white placeholder:text-white/35 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
           />
         </div>
         <button
           type="submit"
-          className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[18px] border border-violet-200/18 bg-gradient-to-br from-violet-500/75 to-fuchsia-500/70 text-white transition hover:scale-[1.03]"
+          disabled={isThinking}
+          className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[18px] border border-violet-200/18 bg-gradient-to-br from-violet-500/75 to-fuchsia-500/70 text-white transition hover:scale-[1.03] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
           style={{ boxShadow: '0 12px 26px rgba(173, 78, 255, 0.25)' }}
         >
           <SendIcon className="h-5 w-5" />

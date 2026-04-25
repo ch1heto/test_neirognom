@@ -22,8 +22,8 @@ def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError(
-            "DATABASE_URL is not set. Create the PostgreSQL database first, "
-            "then set DATABASE_URL, for example: "
+            "Не задана переменная окружения DATABASE_URL. "
+            "Создайте базу PostgreSQL neirognom и добавьте DATABASE_URL в .env, например: "
             "postgresql://postgres:password@localhost:5432/neirognom"
         )
     return database_url
@@ -337,7 +337,7 @@ def save_telemetry(topic: str, payload: str, recorded_at: datetime | None = None
         number_or_none(parsed_payload.get("humidity")),
         number_or_none(parsed_payload.get("water_temp")),
         number_or_none(parsed_payload.get("ph", parsed_payload.get("pH"))),
-        number_or_none(parsed_payload.get("ec")),
+        number_or_none(parsed_payload.get("ec", parsed_payload.get("EC"))),
     ]
     if recorded_at is not None:
         params.append(recorded_at)
@@ -356,7 +356,7 @@ def save_telemetry(topic: str, payload: str, recorded_at: datetime | None = None
             )
 
 
-def save_ai_log(thought: str, commands: list[dict[str, Any]]) -> None:
+def save_ai_log(thought: str, commands: Any) -> None:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -451,6 +451,8 @@ def get_current_metrics() -> dict[str, Any]:
         "temperature": None,
         "humidity": None,
         "water_temp": None,
+        "ph": None,
+        "ec": None,
     }
 
     with get_connection() as connection:
@@ -484,6 +486,32 @@ def get_current_metrics() -> dict[str, Any]:
             if water_row:
                 result["water_temp"] = water_row["water_temp"]
 
+            cursor.execute(
+                """
+                SELECT ph
+                FROM telemetry_raw
+                WHERE ph IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            ph_row = cursor.fetchone()
+            if ph_row:
+                result["ph"] = ph_row["ph"]
+
+            cursor.execute(
+                """
+                SELECT ec
+                FROM telemetry_raw
+                WHERE ec IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            ec_row = cursor.fetchone()
+            if ec_row:
+                result["ec"] = ec_row["ec"]
+
     return result
 
 
@@ -492,6 +520,8 @@ def get_hourly_history(metric_name: str, hours: int = 24) -> list[dict[str, Any]
         "temperature": "air_temp_avg",
         "humidity": "humidity_avg",
         "water_temp": "water_temp_avg",
+        "ph": "ph_avg",
+        "ec": "ec_avg",
     }
     if metric_name not in metric_config:
         raise ValueError(f"Unknown metric: {metric_name}")
