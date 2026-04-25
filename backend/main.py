@@ -69,23 +69,93 @@ CHAT_SYSTEM_PROMPT = (
     "Запрещено использовать любые странные символы, программный код, теги или markdown-разметку. Пиши чистым, обычным текстом."
 )
 
+CROP_ALIASES: dict[str, tuple[str, ...]] = {
+    "basil": ("basil", "базилик"),
+    "arugula": ("arugula", "руккола", "рукола"),
+    "lettuce": ("lettuce", "латук", "салат"),
+    "spinach": ("spinach", "шпинат"),
+    "cilantro": ("cilantro", "кинза", "кориандр"),
+    "parsley": ("parsley", "петрушка"),
+    "mint": ("mint", "мята"),
+    "dill": ("dill", "укроп"),
+    "pak_choi": ("pak_choi", "pak choi", "pak-choi", "пак-чой", "пак чой"),
+    "chard": ("chard", "мангольд"),
+    "microgreen_radish": (
+        "microgreen_radish",
+        "microgreen radish",
+        "микрозелень редиса",
+        "редисная микрозелень",
+    ),
+    "microgreen_pea": (
+        "microgreen_pea",
+        "microgreen pea",
+        "микрозелень гороха",
+        "гороховая микрозелень",
+        "горох",
+    ),
+}
+
+
+def detect_crops_in_message(message: str) -> list[str]:
+    normalized_message = message.lower().replace("ё", "е")
+    detected: list[str] = []
+
+    for slug, aliases in CROP_ALIASES.items():
+        for alias in aliases:
+            normalized_alias = alias.lower().replace("ё", "е")
+            pattern = rf"(?<![\w]){re.escape(normalized_alias)}(?![\w])"
+            if re.search(pattern, normalized_message, re.IGNORECASE):
+                detected.append(slug)
+                break
+
+    return detected
+
+
+def is_root_radish_question(message: str) -> bool:
+    normalized_message = message.lower().replace("ё", "е")
+    asks_about_radish = re.search(r"(?<![\w])редис(?![\w])", normalized_message, re.IGNORECASE)
+    asks_about_microgreen = re.search(
+        r"микрозелень\s+редиса|редисная\s+микрозелень",
+        normalized_message,
+        re.IGNORECASE,
+    )
+    return bool(asks_about_radish and not asks_about_microgreen)
+
+
+def build_unsupported_crop_context(message: str) -> str:
+    if not is_root_radish_question(message):
+        return ""
+
+    return (
+        "Ограничение базы культур: корнеплодный редис не является базовой культурой "
+        "маленькой сити-фермы в текущей crops_data. Не выдавай его нормы как нормы "
+        "microgreen_radish. Объясни пользователю, что вместо корнеплодного редиса "
+        "в этой установке поддерживается микрозелень редиса, и при необходимости "
+        "можно дать рекомендации именно по микрозелени редиса."
+    )
+
+
+def build_crop_rules_context(crops: list[str]) -> str:
+    sections: list[str] = []
+
+    for crop in crops[:3]:
+        rules = get_crop_rules(crop)
+        if isinstance(rules, str) and rules.strip():
+            sections.append(f"Культура: {crop}\n{rules.strip()}")
+
+    if not sections:
+        return ""
+
+    return (
+        "База знаний культур из crops_data. Используй этот блок как главный источник "
+        "по нормам pH, EC, температуре, циклам, алертам и рекомендациям.\n\n"
+        + "\n\n---\n\n".join(sections)
+    )
+
 
 def ensure_crop_files() -> None:
     crops_data_dir = BASE_DIR / "crops_data"
     crops_data_dir.mkdir(exist_ok=True)
-    tomatoes_file = crops_data_dir / "tomatoes.md"
-    if not tomatoes_file.exists():
-        tomatoes_file.write_text(
-            """# Томаты (Черри) - АгроТехКарта
-- Оптимальная температура: 22-26°C
-- Оптимальная влажность: 60-75%
-- Оптимальная температура воды: 18-22°C
-- Требуемый pH: 5.5-6.5
-- Требуемый EC: 2.0-2.5
-Внимание: при падении температуры ниже 18°C рост замедляется.
-""",
-            encoding="utf-8",
-        )
 
 def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
     anomalies: list[str] = []
@@ -247,12 +317,27 @@ def parse_crop_ranges(crop_rules: Any) -> dict[str, tuple[float, float]]:
     if not isinstance(crop_rules, str):
         return {}
 
-    ranges = re.findall(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", crop_rules)
-    metric_order = ["air_temp", "humidity", "water_temp", "ph", "ec"]
+    norms_match = re.search(
+        r"(?ims)^##\s+Нормы\s*$\s*(.*?)(?=^##\s+|\Z)",
+        crop_rules,
+    )
+    if not norms_match:
+        return {}
+
+    norms_block = norms_match.group(1)
+    metric_names = ["air_temp", "humidity", "water_temp", "ph", "ec"]
     parsed: dict[str, tuple[float, float]] = {}
-    for metric_name, match in zip(metric_order, ranges):
-        low, high = match
+
+    for metric_name in metric_names:
+        match = re.search(
+            rf"(?im)^\s*{re.escape(metric_name)}\s*:\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)\b",
+            norms_block,
+        )
+        if not match:
+            continue
+        low, high = match.groups()
         parsed[metric_name] = (float(low), float(high))
+
     return parsed
 
 
@@ -805,7 +890,7 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
 
 @app.post("/api/ai/decide")
 async def ai_decide() -> dict[str, Any]:
-    advisor_report = await asyncio.to_thread(build_advisor_response, "tomatoes")
+    advisor_report = await asyncio.to_thread(build_advisor_response, "lettuce")
     thought = str(advisor_report.get("summary", "")).strip()
     recommendations = advisor_report.get("recommendations", [])
     risks = advisor_report.get("risks", [])
@@ -826,7 +911,7 @@ async def ai_decide() -> dict[str, Any]:
 
 
 @app.get("/api/advisor")
-def get_advisor(crop: str = Query(default="tomatoes")) -> dict[str, Any]:
+def get_advisor(crop: str = Query(default="lettuce")) -> dict[str, Any]:
     return build_advisor_response(crop)
 
 
@@ -847,6 +932,16 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
     ]
     enriched_prompt = build_chat_prompt(user_prompt, history)
     analysis_steps.append("Добавляю актуальные показатели фермы в контекст")
+    detected_crops = detect_crops_in_message(user_prompt)
+    crop_rules_context = build_crop_rules_context(detected_crops)
+    unsupported_crop_context = build_unsupported_crop_context(user_prompt)
+    if detected_crops:
+        analysis_steps.append("Нашёл упоминания культур в запросе")
+    if crop_rules_context:
+        analysis_steps.append("Загружаю базу знаний культур из crops_data")
+        enriched_prompt = f"{crop_rules_context}\n\n{enriched_prompt}"
+    if unsupported_crop_context:
+        enriched_prompt = f"{unsupported_crop_context}\n\n{enriched_prompt}"
 
     try:
         reply = await ask_ai(CHAT_SYSTEM_PROMPT, enriched_prompt, None, analysis_steps)
