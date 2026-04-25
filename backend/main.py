@@ -2,9 +2,8 @@
 import asyncio
 import json
 import os
-import sqlite3
+import re
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,12 +14,25 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+from db import (
+    aggregate_completed_hours,
+    delete_old_raw_data,
+    get_last_climate_records,
+    get_recent_anomaly_events,
+    get_recent_ai_logs,
+    get_recent_hourly_summary,
+    get_recent_telemetry,
+    init_db,
+    save_ai_log,
+    save_anomaly_event,
+    save_telemetry,
+    update_device_status,
+)
 from tools import TOOLS_SCHEMA, get_current_metrics, get_history, get_crop_rules
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
 
-DB_PATH = BASE_DIR / "farm.db"
 BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 SENSORS_TOPIC = "farm/+/sensors/#"
@@ -38,6 +50,10 @@ KNOWN_SENSOR_TOPICS = {
 }
 KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
 AI_COOLDOWN_SECONDS = 5
+HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
+RAW_RETENTION_HOURS = 24
+ANOMALY_EVENT_COOLDOWN_MINUTES = 5
+ADVISOR_HISTORY_HOURS = 24
 CHAT_SYSTEM_PROMPT = (
     "Ты — Нейрогном, дружелюбный, умный и лаконичный помощник сити-фермы. "
     "В каждом запросе тебе невидимо передаются текущие показатели датчиков (Температура воздуха, Влажность, Температура воды).\n\n"
@@ -55,46 +71,7 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 
-def get_db_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    return connection
-
-
-def init_db() -> None:
-    with get_db_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY,
-                status TEXT,
-                last_seen DATETIME
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS telemetry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic TEXT,
-                payload TEXT,
-                timestamp DATETIME
-            )
-            """
-        )
-        connection.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON telemetry(timestamp);")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME,
-                thought TEXT,
-                commands_json TEXT
-            )
-            """
-        )
-        connection.commit()
-
+def ensure_crop_files() -> None:
     crops_data_dir = BASE_DIR / "crops_data"
     crops_data_dir.mkdir(exist_ok=True)
     tomatoes_file = crops_data_dir / "tomatoes.md"
@@ -110,107 +87,6 @@ def init_db() -> None:
 """,
             encoding="utf-8",
         )
-
-def current_timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def parse_json_payload(payload: str) -> dict[str, Any] | None:
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-
-    if isinstance(parsed, dict):
-        return parsed
-
-    return None
-
-
-def update_device_status(device_id: str) -> None:
-    last_seen = current_timestamp()
-    with get_db_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO devices (id, status, last_seen)
-            VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                last_seen = excluded.last_seen
-            """,
-            (device_id, "online", last_seen),
-        )
-        connection.commit()
-
-
-def save_telemetry(topic: str, payload: str) -> None:
-    with get_db_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO telemetry (topic, payload, timestamp)
-            VALUES (?, ?, ?)
-            """,
-            (topic, payload, current_timestamp()),
-        )
-        connection.commit()
-
-
-def save_ai_log(thought: str, commands: list[dict[str, Any]]) -> None:
-    with get_db_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO ai_logs (timestamp, thought, commands_json)
-            VALUES (?, ?, ?)
-            """,
-            (current_timestamp(), thought, json.dumps(commands, ensure_ascii=False)),
-        )
-        connection.commit()
-
-
-def get_recent_telemetry(limit: int = 15) -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT id, topic, payload, timestamp
-            FROM telemetry
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
-    records: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        record = dict(row)
-        record["parsed_payload"] = parse_json_payload(str(record["payload"]))
-        records.append(record)
-    return records
-
-
-def get_last_climate_records(limit: int = 3) -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT id, topic, payload, timestamp
-            FROM telemetry
-            WHERE topic = 'farm/tray_1/sensors/climate'
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
-    records: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        record = dict(row)
-        parsed_payload = parse_json_payload(str(record["payload"]))
-        if isinstance(parsed_payload, dict):
-            record["parsed_payload"] = parsed_payload
-            records.append(record)
-    return records
-
 
 def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
     anomalies: list[str] = []
@@ -250,20 +126,303 @@ def detect_anomalies(records: list[dict[str, Any]]) -> list[str]:
     return anomalies
 
 
-def get_recent_ai_logs(limit: int = 50) -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT id, timestamp, thought, commands_json
-            FROM ai_logs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+def get_record_tray_id(record: dict[str, Any]) -> str:
+    tray_id = record.get("tray_id")
+    if isinstance(tray_id, str) and tray_id:
+        return tray_id
 
-    return [dict(row) for row in rows]
+    topic = str(record.get("topic", ""))
+    parts = topic.split("/")
+    if len(parts) > 1 and parts[1]:
+        return parts[1]
+
+    return "unknown"
+
+
+def build_anomaly_events(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not records:
+        return []
+
+    latest_record = records[-1]
+    latest_payload = latest_record.get("parsed_payload", {})
+    if not isinstance(latest_payload, dict):
+        latest_payload = {}
+
+    events: list[dict[str, Any]] = []
+    tray_id = get_record_tray_id(latest_record)
+    air_temp = latest_payload.get("air_temp")
+    humidity = latest_payload.get("humidity")
+
+    if isinstance(air_temp, (int, float)) and air_temp > 28:
+        events.append(
+            {
+                "tray_id": tray_id,
+                "sensor_type": "climate",
+                "event_type": "air_overheat",
+                "metric_name": "air_temp",
+                "severity": "warning",
+                "value": float(air_temp),
+                "message": f"Перегрев воздуха: air_temp={air_temp}",
+                "payload": latest_payload,
+            }
+        )
+
+    if isinstance(air_temp, (int, float)) and air_temp < 18:
+        events.append(
+            {
+                "tray_id": tray_id,
+                "sensor_type": "climate",
+                "event_type": "air_overcooling",
+                "metric_name": "air_temp",
+                "severity": "warning",
+                "value": float(air_temp),
+                "message": f"Переохлаждение воздуха: air_temp={air_temp}",
+                "payload": latest_payload,
+            }
+        )
+
+    if isinstance(humidity, (int, float)) and humidity < 50:
+        events.append(
+            {
+                "tray_id": tray_id,
+                "sensor_type": "climate",
+                "event_type": "low_humidity",
+                "metric_name": "humidity",
+                "severity": "warning",
+                "value": float(humidity),
+                "message": f"Низкая влажность: humidity={humidity}",
+                "payload": latest_payload,
+            }
+        )
+
+    if len(records) >= 3:
+        first_payload = records[0].get("parsed_payload", {})
+        last_payload = records[-1].get("parsed_payload", {})
+        if isinstance(first_payload, dict) and isinstance(last_payload, dict):
+            first_temp = first_payload.get("air_temp")
+            last_temp = last_payload.get("air_temp")
+            if isinstance(first_temp, (int, float)) and isinstance(last_temp, (int, float)):
+                if last_temp - first_temp > 2:
+                    events.append(
+                        {
+                            "tray_id": tray_id,
+                            "sensor_type": "climate",
+                            "event_type": "rapid_air_temp_rise",
+                            "metric_name": "air_temp",
+                            "severity": "warning",
+                            "value": float(last_temp),
+                            "message": (
+                                "Быстрый рост температуры воздуха: "
+                                f"{first_temp} -> {last_temp} за последние 3 замера"
+                            ),
+                            "payload": {
+                                "first_air_temp": first_temp,
+                                "last_air_temp": last_temp,
+                                "latest_payload": latest_payload,
+                            },
+                        }
+                    )
+
+    return events
+
+
+async def save_watchdog_anomaly_events(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        saved = await asyncio.to_thread(
+            save_anomaly_event,
+            tray_id=event["tray_id"],
+            sensor_type=event["sensor_type"],
+            event_type=event["event_type"],
+            metric_name=event["metric_name"],
+            severity=event["severity"],
+            value=event["value"],
+            message=event["message"],
+            payload=event["payload"],
+            cooldown_minutes=ANOMALY_EVENT_COOLDOWN_MINUTES,
+        )
+        if saved:
+            print(f"[WATCHDOG] Anomaly event saved: {event['event_type']} {event['metric_name']}")
+
+
+def parse_crop_ranges(crop_rules: Any) -> dict[str, tuple[float, float]]:
+    if not isinstance(crop_rules, str):
+        return {}
+
+    ranges = re.findall(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", crop_rules)
+    metric_order = ["air_temp", "humidity", "water_temp", "ph", "ec"]
+    parsed: dict[str, tuple[float, float]] = {}
+    for metric_name, match in zip(metric_order, ranges):
+        low, high = match
+        parsed[metric_name] = (float(low), float(high))
+    return parsed
+
+
+def latest_metric_snapshot(records: list[dict[str, Any]]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "tray_id": None,
+        "air_temp": None,
+        "humidity": None,
+        "water_temp": None,
+        "ph": None,
+        "ec": None,
+    }
+
+    for record in reversed(records):
+        if snapshot["tray_id"] is None:
+            snapshot["tray_id"] = get_record_tray_id(record)
+
+        payload = record.get("parsed_payload")
+        if not isinstance(payload, dict):
+            continue
+
+        payload_values = {
+            "air_temp": payload.get("air_temp"),
+            "humidity": payload.get("humidity"),
+            "water_temp": payload.get("water_temp"),
+            "ph": payload.get("ph", payload.get("pH")),
+            "ec": payload.get("ec", payload.get("EC")),
+        }
+        for metric_name, value in payload_values.items():
+            if snapshot[metric_name] is None and isinstance(value, (int, float)):
+                snapshot[metric_name] = value
+
+    if snapshot["tray_id"] is None:
+        snapshot["tray_id"] = "unknown"
+
+    return snapshot
+
+
+def describe_trend(values: list[float], metric_title: str, threshold: float) -> str | None:
+    if len(values) < 2:
+        return None
+
+    delta = values[-1] - values[0]
+    if abs(delta) < threshold:
+        return f"{metric_title} по почасовой истории в целом стабильна."
+
+    direction = "растёт" if delta > 0 else "снижается"
+    return f"{metric_title} по почасовой истории {direction}: изменение {delta:+.1f} за период."
+
+
+def build_hourly_trend_notes(hourly_rows: list[dict[str, Any]]) -> list[str]:
+    metric_config = [
+        ("air_temp_avg", "Температура воздуха", 0.7),
+        ("humidity_avg", "Влажность", 3.0),
+        ("water_temp_avg", "Температура воды", 0.7),
+    ]
+    notes: list[str] = []
+
+    for column_name, title, threshold in metric_config:
+        values = [
+            float(row[column_name])
+            for row in hourly_rows
+            if isinstance(row.get(column_name), (int, float))
+        ]
+        note = describe_trend(values, title, threshold)
+        if note:
+            notes.append(note)
+
+    return notes
+
+
+def build_advisor_response(crop: str) -> dict[str, Any]:
+    telemetry_records = get_recent_telemetry(30)
+    current = latest_metric_snapshot(telemetry_records)
+    hourly_rows = get_recent_hourly_summary(ADVISOR_HISTORY_HOURS)
+    anomaly_events = get_recent_anomaly_events(ADVISOR_HISTORY_HOURS)
+    crop_rules = get_crop_rules(crop)
+    crop_ranges = parse_crop_ranges(crop_rules)
+
+    risks: list[str] = []
+    recommendations: list[str] = []
+    trend_notes = build_hourly_trend_notes(hourly_rows)
+
+    if not telemetry_records:
+        return {
+            "summary": "Данных телеметрии пока недостаточно для агрономической оценки.",
+            "risks": ["Нет свежих показаний из telemetry_raw."],
+            "recommendations": ["Запустите симулятор или проверьте поступление MQTT-данных."],
+            "data": {
+                "crop": crop,
+                "current": current,
+                "history_hours": ADVISOR_HISTORY_HOURS,
+                "hourly_points": len(hourly_rows),
+                "anomaly_events": len(anomaly_events),
+            },
+        }
+
+    metric_titles = {
+        "air_temp": "температура воздуха",
+        "humidity": "влажность",
+        "water_temp": "температура воды",
+        "ph": "pH",
+        "ec": "EC",
+    }
+
+    for metric_name, title in metric_titles.items():
+        value = current.get(metric_name)
+        metric_range = crop_ranges.get(metric_name)
+        if value is None:
+            if metric_name in {"ph", "ec"}:
+                risks.append(f"Данных по {title} пока недостаточно.")
+            continue
+        if metric_range is None:
+            continue
+
+        low, high = metric_range
+        if value < low:
+            risks.append(f"{title.capitalize()} ниже ориентира культуры: {value} при норме {low:g}-{high:g}.")
+        elif value > high:
+            risks.append(f"{title.capitalize()} выше ориентира культуры: {value} при норме {low:g}-{high:g}.")
+
+    if anomaly_events:
+        grouped_events: dict[str, int] = {}
+        for event in anomaly_events:
+            event_type = str(event.get("event_type", "unknown"))
+            grouped_events[event_type] = grouped_events.get(event_type, 0) + 1
+        event_text = ", ".join(f"{event_type}: {count}" for event_type, count in grouped_events.items())
+        risks.append(f"За последние 24 часа зафиксированы события аномалий: {event_text}.")
+
+    if len(hourly_rows) < 2:
+        recommendations.append("Почасовой истории пока мало, поэтому оценка трендов ограничена.")
+    else:
+        recommendations.extend(trend_notes)
+
+    if current.get("air_temp") is not None and current["air_temp"] > 28:
+        recommendations.append("Проверьте вентиляцию и не увеличивайте интенсивность освещения до стабилизации температуры.")
+    if current.get("humidity") is not None and current["humidity"] < 50:
+        recommendations.append("Проверьте влажность субстрата и режим увлажнения, но не включайте оборудование без ручной проверки.")
+    if current.get("ph") is None or current.get("ec") is None:
+        recommendations.append("Данных по pH и EC пока недостаточно, поэтому рекомендации по питательному раствору ограничены.")
+
+    if not risks:
+        risks.append("Существенных рисков по доступным данным не обнаружено.")
+    if not recommendations:
+        recommendations.append("Продолжайте наблюдение и дождитесь накопления почасовой истории для более точных выводов.")
+
+    if risks == ["Существенных рисков по доступным данным не обнаружено."] and not anomaly_events:
+        summary = "Состояние фермы стабильное по доступным текущим показателям."
+    else:
+        summary = "Есть факторы, требующие внимания агронома."
+
+    if anomaly_events:
+        summary += f" За последние 24 часа найдено событий аномалий: {len(anomaly_events)}."
+    if len(hourly_rows) < 2:
+        summary += " Почасовой истории пока недостаточно для уверенного анализа трендов."
+
+    return {
+        "summary": summary,
+        "risks": risks,
+        "recommendations": recommendations,
+        "data": {
+            "crop": crop,
+            "current": current,
+            "history_hours": ADVISOR_HISTORY_HOURS,
+            "hourly_points": len(hourly_rows),
+            "anomaly_events": len(anomaly_events),
+            "crop_rules_loaded": isinstance(crop_rules, str),
+        },
+    }
 
 
 def strip_markdown_backticks(raw_text: str) -> str:
@@ -561,12 +720,14 @@ async def internal_watchdog() -> None:
         try:
             records = await asyncio.to_thread(get_last_climate_records, 3)
             anomalies = detect_anomalies(records)
+            anomaly_events = build_anomaly_events(records)
 
             if anomalies:
                 in_alert_mode = True
                 print("[WATCHDOG] Обнаружены аномалии:")
                 for anomaly in anomalies:
                     print(f"[WATCHDOG] - {anomaly}")
+                await save_watchdog_anomaly_events(anomaly_events)
 
                 now = loop.time()
                 cooldown_left = AI_COOLDOWN_SECONDS - (now - last_ai_call_ts)
@@ -598,9 +759,30 @@ async def internal_watchdog() -> None:
         await asyncio.sleep(5)
 
 
+async def hourly_aggregation_worker() -> None:
+    print("[AGGREGATION] Р—Р°РїСѓС‰РµРЅР° С„РѕРЅРѕРІР°СЏ РїРѕС‡Р°СЃРѕРІР°СЏ Р°РіСЂРµРіР°С†РёСЏ.")
+
+    while True:
+        try:
+            aggregated_count = await asyncio.to_thread(aggregate_completed_hours)
+            deleted_count = await asyncio.to_thread(delete_old_raw_data, RAW_RETENTION_HOURS)
+            print(
+                "[AGGREGATION] "
+                f"РђРіСЂРµРіРёСЂРѕРІР°РЅРѕ С‡Р°СЃРѕРІ: {aggregated_count}; "
+                f"СѓРґР°Р»РµРЅРѕ raw-Р·Р°РїРёСЃРµР№: {deleted_count}."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[AGGREGATION] РћС€РёР±РєР°: {exc}")
+
+        await asyncio.sleep(HOURLY_AGGREGATION_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    ensure_crop_files()
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="backend_service")
     mqtt_client.on_connect = on_connect
@@ -610,11 +792,15 @@ async def lifespan(app: FastAPI):
 
     app.state.mqtt_client = mqtt_client
     watchdog_task = asyncio.create_task(internal_watchdog())
+    aggregation_task = asyncio.create_task(hourly_aggregation_worker())
 
     try:
         yield
     finally:
+        aggregation_task.cancel()
         watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await aggregation_task
         with suppress(asyncio.CancelledError):
             await watchdog_task
         mqtt_client.loop_stop()
@@ -741,6 +927,11 @@ async def ai_decide() -> dict[str, Any]:
         logs.append(publish_ai_command(command))
 
     return {"logs": logs, "thought": thought, "commands": normalized_commands}
+
+
+@app.get("/api/advisor")
+def get_advisor(crop: str = Query(default="tomatoes")) -> dict[str, Any]:
+    return build_advisor_response(crop)
 
 
 @app.get("/api/logs")

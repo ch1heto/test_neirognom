@@ -18,7 +18,7 @@ start "React Frontend" cmd /k "cd /d frontend && npm run dev -- --host 0.0.0.0 -
 echo ==========================================
 echo Started 3 terminals:
 echo - ESP32 simulator
-echo - FastAPI backend with MQTT, SQLite, and internal watchdog
+echo - FastAPI backend with MQTT, PostgreSQL, and internal watchdog
 echo - React frontend
 echo.
 echo Open http://localhost:5174/

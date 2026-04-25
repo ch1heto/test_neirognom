@@ -1,89 +1,30 @@
-import sqlite3
 import os
-import json
+from typing import Any
 
-DB_PATH = os.getenv("DB_PATH", "farm.db")
+from db import get_current_metrics as db_get_current_metrics
+from db import get_hourly_history
+
 CROPS_DIR = "crops_data"
 CLIMATE_TOPIC = "farm/tray_1/sensors/climate"
 WATER_TOPIC = "farm/tray_1/sensors/water"
 
 
-def get_current_metrics():
+def get_current_metrics() -> dict[str, Any]:
     """Возвращает последние показания датчиков."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            result = {
-                "temperature": None,
-                "humidity": None,
-                "water_temp": None,
-            }
-
-            cursor.execute(
-                """
-                SELECT payload
-                FROM telemetry
-                WHERE topic = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CLIMATE_TOPIC,),
-            )
-            climate_row = cursor.fetchone()
-            if climate_row:
-                climate_payload = json.loads(climate_row[0])
-                result["temperature"] = climate_payload.get("air_temp")
-                result["humidity"] = climate_payload.get("humidity")
-
-            cursor.execute(
-                """
-                SELECT payload
-                FROM telemetry
-                WHERE topic = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (WATER_TOPIC,),
-            )
-            water_row = cursor.fetchone()
-            if water_row:
-                water_payload = json.loads(water_row[0])
-                result["water_temp"] = water_payload.get("water_temp")
-
-            return result
+        return db_get_current_metrics()
     except Exception as e:
         return {"error": str(e)}
 
 
-def get_history(metric_name, hours=24):
+def get_history(metric_name, hours=24) -> dict[str, str] | list[dict[str, Any]]:
     """Возвращает усредненную историю за указанное количество часов."""
-    metric_config = {
-        "temperature": (CLIMATE_TOPIC, "air_temp"),
-        "humidity": (CLIMATE_TOPIC, "humidity"),
-        "water_temp": (WATER_TOPIC, "water_temp"),
-    }
-    if metric_name not in metric_config:
+    if metric_name not in {"temperature", "humidity", "water_temp"}:
         return {"error": f"Неизвестная метрика: {metric_name}"}
 
     try:
         hours = int(hours)
-        topic, payload_key = metric_config[metric_name]
-
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            # Группируем по часам, чтобы не переполнить контекст ИИ
-            query = """
-                SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
-                       ROUND(AVG(json_extract(payload, ?)), 2) as avg_val
-                FROM telemetry
-                WHERE topic = ?
-                  AND timestamp >= datetime('now', ?)
-                GROUP BY hour
-                ORDER BY hour ASC
-            """
-            cursor.execute(query, (f"$.{payload_key}", topic, f"-{hours} hours"))
-            rows = cursor.fetchall()
-            return [{"hour": row[0], "avg_value": row[1]} for row in rows]
+        return get_hourly_history(metric_name, hours)
     except Exception as e:
         return {"error": str(e)}
 
