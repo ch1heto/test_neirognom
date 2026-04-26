@@ -181,8 +181,6 @@ def ensure_jsonb_column(cursor, table_name: str, column_name: str) -> None:
 
 
 TRAY_FK_CONSTRAINTS = (
-    ("telemetry_raw", "fk_telemetry_raw_tray_id_trays", "tray_id", "trays", "id"),
-    ("telemetry_hourly", "fk_telemetry_hourly_tray_id_trays", "tray_id", "trays", "id"),
     ("anomaly_events", "fk_anomaly_events_tray_id_trays", "tray_id", "trays", "id"),
 )
 
@@ -281,7 +279,7 @@ def backfill_trays_from_existing_refs(cursor) -> None:
     ensure_trays_schema(cursor)
     ensure_tray(cursor, DEFAULT_TRAY_ID)
 
-    for table_name in ("telemetry_raw", "telemetry_hourly", "anomaly_events", "devices"):
+    for table_name in ("anomaly_events", "devices"):
         if not table_exists(cursor, table_name) or not column_exists(cursor, table_name, "tray_id"):
             continue
         cursor.execute(
@@ -295,7 +293,7 @@ def backfill_trays_from_existing_refs(cursor) -> None:
             ).format(sql.Identifier(table_name))
         )
 
-    for table_name in ("telemetry_raw", "telemetry_hourly", "anomaly_events", "growing_cycles", "devices"):
+    for table_name in ("anomaly_events", "growing_cycles", "devices"):
         if not table_exists(cursor, table_name) or not column_exists(cursor, table_name, "tray_id"):
             continue
         cursor.execute(
@@ -539,6 +537,19 @@ def ensure_agrotech_schema(cursor) -> None:
         """
     )
     cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agrotech_card_sections (
+            id BIGSERIAL PRIMARY KEY,
+            revision_id BIGINT NOT NULL,
+            section_title TEXT NOT NULL,
+            section_order INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(revision_id, section_order)
+        )
+        """
+    )
+    cursor.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agrotech_cards_crop_id ON agrotech_cards(crop_id)"
     )
     cursor.execute(
@@ -556,6 +567,18 @@ def ensure_agrotech_schema(cursor) -> None:
     )
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_agrotech_audit_log_card_id ON agrotech_audit_log(card_id, created_at DESC)"
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agrotech_card_sections_revision_order
+        ON agrotech_card_sections(revision_id, section_order)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agrotech_card_sections_revision_title
+        ON agrotech_card_sections(revision_id, section_title)
+        """
     )
     add_foreign_key_if_missing(
         cursor,
@@ -593,6 +616,14 @@ def ensure_agrotech_schema(cursor) -> None:
         cursor,
         "agrotech_audit_log",
         "fk_agrotech_audit_log_revision_id_revisions",
+        "revision_id",
+        "agrotech_card_revisions",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "agrotech_card_sections",
+        "fk_agrotech_card_sections_revision_id_revisions",
         "revision_id",
         "agrotech_card_revisions",
         "id",
@@ -837,6 +868,80 @@ def get_revision_norms(cursor, revision_id: int | None) -> dict[str, Any]:
                 norms[row["code"]] = row["raw_value"]
 
     return norms
+
+
+def parse_markdown_sections(content: str) -> list[dict[str, Any]]:
+    source_content = str(content or "").strip()
+    if not source_content:
+        return [
+            {
+                "section_title": "Основное описание",
+                "section_order": 1,
+                "content": "",
+            }
+        ]
+
+    matches = list(re.finditer(r"(?m)^##\s+(.+?)\s*$", source_content))
+    if not matches:
+        return [
+            {
+                "section_title": "Основное описание",
+                "section_order": 1,
+                "content": source_content,
+            }
+        ]
+
+    sections: list[dict[str, Any]] = []
+    for index, match in enumerate(matches, start=1):
+        section_start = match.end()
+        section_end = matches[index].start() if index < len(matches) else len(source_content)
+        section_title = match.group(1).strip() or "Раздел"
+        section_content = source_content[section_start:section_end].strip()
+        sections.append(
+            {
+                "section_title": section_title,
+                "section_order": index,
+                "content": section_content,
+            }
+        )
+
+    return sections
+
+
+def save_card_sections(cursor, revision_id: int, content: str) -> None:
+    if not revision_id:
+        return
+
+    for section in parse_markdown_sections(content):
+        cursor.execute(
+            """
+            INSERT INTO agrotech_card_sections (
+                revision_id, section_title, section_order, content
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (revision_id, section_order) DO UPDATE SET
+                section_title = EXCLUDED.section_title,
+                content = EXCLUDED.content
+            """,
+            (
+                revision_id,
+                section["section_title"],
+                section["section_order"],
+                section["content"],
+            ),
+        )
+
+
+def backfill_card_sections(cursor) -> None:
+    cursor.execute(
+        """
+        SELECT id, content
+        FROM agrotech_card_revisions
+        ORDER BY id ASC
+        """
+    )
+    for row in cursor.fetchall():
+        save_card_sections(cursor, row["id"], row["content"])
 
 
 def ensure_device_relationship_columns(cursor) -> None:
@@ -1195,6 +1300,7 @@ def _create_card_revision(
     )
     revision = cursor.fetchone()
     save_revision_norms(cursor, revision["id"], params_json or {})
+    save_card_sections(cursor, revision["id"], content)
     cursor.execute(
         """
         INSERT INTO agrotech_audit_log (
@@ -1373,6 +1479,83 @@ def get_active_card_revision(crop_slug: str) -> dict[str, Any] | None:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             return _get_active_card_revision(cursor, crop_slug)
+
+
+def normalize_crop_lookup(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("ё", "е")
+    return " ".join(normalized.replace("_", " ").replace("-", " ").split())
+
+
+def get_crop_agrotech_card_from_db(crop_name_or_slug: Any) -> dict[str, Any] | None:
+    lookup = str(crop_name_or_slug or "").strip()
+    if not lookup:
+        return None
+
+    normalized_lookup = normalize_crop_lookup(lookup)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    crops.id AS crop_id,
+                    crops.slug AS crop_slug,
+                    crops.name_ru AS crop_name_ru,
+                    crops.crop_type,
+                    agrotech_cards.id AS card_id,
+                    agrotech_card_revisions.id AS revision_id,
+                    agrotech_card_revisions.version_major,
+                    agrotech_card_revisions.version_minor,
+                    agrotech_card_revisions.version_label
+                FROM crops
+                JOIN agrotech_cards ON agrotech_cards.crop_id = crops.id
+                JOIN agrotech_card_revisions
+                  ON agrotech_card_revisions.card_id = agrotech_cards.id
+                 AND agrotech_card_revisions.is_active
+                WHERE lower(crops.slug) = lower(%s)
+                   OR lower(crops.name_ru) = lower(%s)
+                   OR replace(replace(lower(crops.slug), '_', ' '), '-', ' ') = %s
+                   OR replace(replace(lower(COALESCE(crops.name_ru, '')), '_', ' '), '-', ' ') = %s
+                ORDER BY crops.slug
+                LIMIT 1
+                """,
+                (lookup, lookup, normalized_lookup, normalized_lookup),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            norms = get_revision_norms(cursor, row["revision_id"])
+
+            cursor.execute(
+                """
+                SELECT section_title, content
+                FROM agrotech_card_sections
+                WHERE revision_id = %s
+                ORDER BY section_order ASC
+                """,
+                (row["revision_id"],),
+            )
+            sections = cursor.fetchall()
+
+    version_label = row["version_label"] or f"v{row['version_major']}.{row['version_minor']}"
+    return {
+        "crop_slug": row["crop_slug"],
+        "crop_name_ru": row["crop_name_ru"],
+        "crop_type": row["crop_type"],
+        "card_id": row["card_id"],
+        "revision_id": row["revision_id"],
+        "version_major": row["version_major"],
+        "version_minor": row["version_minor"],
+        "version_label": version_label,
+        "norms": norms,
+        "sections": [
+            {
+                "section_title": section["section_title"],
+                "content": section["content"],
+            }
+            for section in sections
+        ],
+    }
 
 
 def ensure_growing_cycles_schema(cursor) -> None:
@@ -1869,20 +2052,6 @@ def ensure_ai_logs_schema(cursor) -> None:
 
 
 def ensure_legacy_schema_comments(cursor) -> None:
-    if table_exists(cursor, "telemetry_raw"):
-        cursor.execute(
-            """
-            COMMENT ON TABLE telemetry_raw IS
-            'Legacy/raw fallback. Primary telemetry model is telemetry_readings + telemetry_values.'
-            """
-        )
-    if table_exists(cursor, "telemetry_hourly"):
-        cursor.execute(
-            """
-            COMMENT ON TABLE telemetry_hourly IS
-            'Legacy hourly fallback. Primary hourly model is telemetry_hourly_values.'
-            """
-        )
     if column_exists(cursor, "agrotech_card_revisions", "params_json"):
         cursor.execute(
             """
@@ -1918,6 +2087,7 @@ def get_database_model_summary() -> dict[str, Any]:
             "crops",
             "agrotech_cards",
             "agrotech_card_revisions",
+            "agrotech_card_sections",
             "agrotech_revision_norms",
             "agrotech_audit_log",
         ],
@@ -1932,8 +2102,6 @@ def get_database_model_summary() -> dict[str, Any]:
             "advisor_report_recommendations",
         ],
         "legacy_compatibility": [
-            "telemetry_raw",
-            "telemetry_hourly",
             "params_json",
             "commands_json",
             "devices.status",
@@ -2286,7 +2454,6 @@ def get_active_cycle_ai_context(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any
                     agrotech_cards.id AS card_id,
                     agrotech_card_revisions.id AS revision_id,
                     agrotech_card_revisions.version_label,
-                    agrotech_card_revisions.params_json,
                     agrotech_card_revisions.content
                 FROM growing_cycles
                 JOIN crops ON crops.id = growing_cycles.crop_id
@@ -2305,8 +2472,6 @@ def get_active_cycle_ai_context(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any
             params_json = {}
             if row is not None:
                 params_json = get_revision_norms(cursor, row["revision_id"])
-                if not params_json:
-                    params_json = params_json_to_dict(row["params_json"])
 
     if row is None:
         return None
@@ -2335,8 +2500,7 @@ def get_active_cycle_norm_ranges(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, tu
             cursor.execute(
                 """
                 SELECT
-                    growing_cycles.card_revision_id,
-                    agrotech_card_revisions.params_json
+                    growing_cycles.card_revision_id
                 FROM growing_cycles
                 LEFT JOIN agrotech_card_revisions
                   ON agrotech_card_revisions.id = growing_cycles.card_revision_id
@@ -2352,8 +2516,6 @@ def get_active_cycle_norm_ranges(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, tu
                 return {}
 
             norms = get_revision_norms(cursor, row["card_revision_id"])
-            if not norms:
-                norms = params_json_to_dict(row["params_json"])
 
     ranges: dict[str, tuple[float, float]] = {}
     for metric_code in ("air_temp", "humidity", "water_temp", "ph", "ec"):
@@ -2484,116 +2646,6 @@ def init_db() -> None:
             ensure_tray(cursor, DEFAULT_TRAY_ID)
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS telemetry_raw (
-                    id BIGSERIAL PRIMARY KEY,
-                    topic TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    tray_id TEXT,
-                    sensor_type TEXT,
-                    air_temp DOUBLE PRECISION,
-                    humidity DOUBLE PRECISION,
-                    water_temp DOUBLE PRECISION,
-                    ph DOUBLE PRECISION,
-                    ec DOUBLE PRECISION,
-                    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cursor.execute(
-                "ALTER TABLE telemetry_raw ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ"
-            )
-            if column_exists(cursor, "telemetry_raw", "created_at"):
-                cursor.execute(
-                    "UPDATE telemetry_raw SET recorded_at = created_at WHERE recorded_at IS NULL"
-                )
-            cursor.execute(
-                "UPDATE telemetry_raw SET recorded_at = now() WHERE recorded_at IS NULL"
-            )
-            cursor.execute(
-                "ALTER TABLE telemetry_raw ALTER COLUMN recorded_at SET DEFAULT now()"
-            )
-            cursor.execute(
-                "ALTER TABLE telemetry_raw ALTER COLUMN recorded_at SET NOT NULL"
-            )
-            ensure_jsonb_column(cursor, "telemetry_raw", "payload")
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_telemetry_raw_recorded_at ON telemetry_raw(recorded_at)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_telemetry_raw_topic_id ON telemetry_raw(topic, id DESC)"
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telemetry_hourly (
-                    id BIGSERIAL PRIMARY KEY,
-                    tray_id TEXT,
-                    sensor_type TEXT,
-                    hour_start TIMESTAMPTZ NOT NULL,
-                    air_temp DOUBLE PRECISION,
-                    humidity DOUBLE PRECISION,
-                    water_temp DOUBLE PRECISION,
-                    ph DOUBLE PRECISION,
-                    ec DOUBLE PRECISION,
-                    air_temp_avg DOUBLE PRECISION,
-                    air_temp_min DOUBLE PRECISION,
-                    air_temp_max DOUBLE PRECISION,
-                    air_temp_count INTEGER NOT NULL DEFAULT 0,
-                    humidity_avg DOUBLE PRECISION,
-                    humidity_min DOUBLE PRECISION,
-                    humidity_max DOUBLE PRECISION,
-                    humidity_count INTEGER NOT NULL DEFAULT 0,
-                    water_temp_avg DOUBLE PRECISION,
-                    water_temp_min DOUBLE PRECISION,
-                    water_temp_max DOUBLE PRECISION,
-                    water_temp_count INTEGER NOT NULL DEFAULT 0,
-                    ph_avg DOUBLE PRECISION,
-                    ph_min DOUBLE PRECISION,
-                    ph_max DOUBLE PRECISION,
-                    ph_count INTEGER NOT NULL DEFAULT 0,
-                    ec_avg DOUBLE PRECISION,
-                    ec_min DOUBLE PRECISION,
-                    ec_max DOUBLE PRECISION,
-                    ec_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            for metric_name in ("air_temp", "humidity", "water_temp", "ph", "ec"):
-                cursor.execute(
-                    f"ALTER TABLE telemetry_hourly ADD COLUMN IF NOT EXISTS {metric_name}_avg DOUBLE PRECISION"
-                )
-                cursor.execute(
-                    f"ALTER TABLE telemetry_hourly ADD COLUMN IF NOT EXISTS {metric_name}_min DOUBLE PRECISION"
-                )
-                cursor.execute(
-                    f"ALTER TABLE telemetry_hourly ADD COLUMN IF NOT EXISTS {metric_name}_max DOUBLE PRECISION"
-                )
-                cursor.execute(
-                    f"ALTER TABLE telemetry_hourly ADD COLUMN IF NOT EXISTS {metric_name}_count INTEGER NOT NULL DEFAULT 0"
-                )
-            cursor.execute(
-                "ALTER TABLE telemetry_hourly ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-            )
-            cursor.execute(
-                "UPDATE telemetry_hourly SET sensor_type = 'mixed' WHERE sensor_type IS NULL"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_telemetry_hourly_hour_start ON telemetry_hourly(hour_start)"
-            )
-            cursor.execute(
-                """
-                DROP INDEX IF EXISTS idx_telemetry_hourly_tray_hour
-                """
-            )
-            cursor.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_hourly_tray_sensor_hour
-                ON telemetry_hourly(tray_id, sensor_type, hour_start)
-                """
-            )
-            cursor.execute(
-                """
                 CREATE TABLE IF NOT EXISTS anomaly_events (
                     id BIGSERIAL PRIMARY KEY,
                     tray_id TEXT,
@@ -2641,8 +2693,7 @@ def init_db() -> None:
             ensure_telemetry_hourly_values_schema(cursor)
             _import_crop_cards_from_md(cursor)
             backfill_revision_norms(cursor)
-            backfill_telemetry_normalized(cursor)
-            backfill_telemetry_hourly_values(cursor)
+            backfill_card_sections(cursor)
             ensure_growing_cycles_schema(cursor)
             ensure_anomaly_event_refs_schema(cursor)
             backfill_anomaly_event_refs(cursor)
@@ -2937,38 +2988,7 @@ def save_telemetry_normalized(
 
 
 def backfill_telemetry_normalized(cursor, limit: int | None = None) -> int:
-    ensure_telemetry_normalized_schema(cursor)
-    params: list[Any] = []
-    limit_sql = ""
-    if limit is not None:
-        limit_sql = "LIMIT %s"
-        params.append(limit)
-
-    cursor.execute(
-        f"""
-        SELECT id, topic, payload, tray_id, recorded_at
-        FROM telemetry_raw
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM telemetry_readings
-            WHERE telemetry_readings.topic = telemetry_raw.topic
-              AND telemetry_readings.recorded_at = telemetry_raw.recorded_at
-        )
-        ORDER BY id ASC
-        {limit_sql}
-        """,
-        params,
-    )
-    rows = cursor.fetchall()
-    for row in rows:
-        save_telemetry_normalized(
-            cursor,
-            row["topic"],
-            row["payload"],
-            tray_id=row["tray_id"],
-            recorded_at=row["recorded_at"],
-        )
-    return len(rows)
+    return 0
 
 
 def ensure_telemetry_hourly_values_schema(cursor) -> None:
@@ -3116,67 +3136,23 @@ def save_hourly_values_from_row(cursor, row: dict[str, Any]) -> None:
 
 
 def backfill_telemetry_hourly_values(cursor) -> int:
-    ensure_telemetry_hourly_values_schema(cursor)
-    cursor.execute(
-        """
-        SELECT
-            tray_id, sensor_type, hour_start,
-            air_temp_avg, air_temp_min, air_temp_max, air_temp_count,
-            humidity_avg, humidity_min, humidity_max, humidity_count,
-            water_temp_avg, water_temp_min, water_temp_max, water_temp_count,
-            ph_avg, ph_min, ph_max, ph_count,
-            ec_avg, ec_min, ec_max, ec_count
-        FROM telemetry_hourly
-        ORDER BY hour_start ASC, id ASC
-        """
-    )
-    rows = cursor.fetchall()
-    for row in rows:
-        save_hourly_values_from_row(cursor, row)
-    return len(rows)
+    return 0
 
 
 def save_telemetry(topic: str, payload: str, recorded_at: datetime | None = None) -> None:
     parsed_value = parse_json_value(payload)
-    parsed_payload = parsed_value if isinstance(parsed_value, dict) else {}
-    tray_id, sensor_type = parse_topic(topic)
+    tray_id, _ = parse_topic(topic)
     tray_id = normalize_device_id(tray_id)
-    timestamp_sql = "%s" if recorded_at is not None else "now()"
-    params: list[Any] = [
-        topic,
-        Jsonb(parsed_value),
-        tray_id,
-        sensor_type,
-        number_or_none(parsed_payload.get("air_temp")),
-        number_or_none(parsed_payload.get("humidity")),
-        number_or_none(parsed_payload.get("water_temp")),
-        number_or_none(parsed_payload.get("ph", parsed_payload.get("pH"))),
-        number_or_none(parsed_payload.get("ec", parsed_payload.get("EC"))),
-    ]
-    if recorded_at is not None:
-        params.append(recorded_at)
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
             ensure_tray(cursor, tray_id or DEFAULT_TRAY_ID)
-            cursor.execute(
-                f"""
-                INSERT INTO telemetry_raw (
-                    topic, payload, tray_id, sensor_type,
-                    air_temp, humidity, water_temp, ph, ec, recorded_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, {timestamp_sql})
-                RETURNING recorded_at
-                """,
-                params,
-            )
-            raw_row = cursor.fetchone()
             save_telemetry_normalized(
                 cursor,
                 topic,
                 parsed_value,
                 tray_id=tray_id,
-                recorded_at=raw_row["recorded_at"] if raw_row else recorded_at,
+                recorded_at=recorded_at,
             )
 
 
@@ -3257,27 +3233,13 @@ def get_recent_telemetry(limit: int = 15) -> list[dict[str, Any]]:
                 (limit,),
             )
             rows = cursor.fetchall()
-            if rows:
-                return [
-                    row_to_normalized_telemetry_record(
-                        row,
-                        build_payload_from_telemetry_values(cursor, row["id"]),
-                    )
-                    for row in reversed(rows)
-                ]
-
-            cursor.execute(
-                """
-                SELECT id, topic, payload, recorded_at
-                FROM telemetry_raw
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cursor.fetchall()
-
-    return [row_to_telemetry_record(row) for row in reversed(rows)]
+            return [
+                row_to_normalized_telemetry_record(
+                    row,
+                    build_payload_from_telemetry_values(cursor, row["id"]),
+                )
+                for row in reversed(rows)
+            ]
 
 
 def get_last_climate_records(limit: int = 3) -> list[dict[str, Any]]:
@@ -3299,35 +3261,15 @@ def get_last_climate_records(limit: int = 3) -> list[dict[str, Any]]:
                 (CLIMATE_TOPIC, "%/climate", limit),
             )
             rows = cursor.fetchall()
-            if rows:
-                records: list[dict[str, Any]] = []
-                for row in reversed(rows):
-                    record = row_to_normalized_telemetry_record(
-                        row,
-                        build_payload_from_telemetry_values(cursor, row["id"]),
-                    )
-                    if isinstance(record.get("parsed_payload"), dict):
-                        records.append(record)
-                return records
-
-            cursor.execute(
-                """
-                SELECT id, topic, payload, recorded_at
-                FROM telemetry_raw
-                WHERE topic = %s
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (CLIMATE_TOPIC, limit),
-            )
-            rows = cursor.fetchall()
-
-    records: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        record = row_to_telemetry_record(row)
-        if isinstance(record.get("parsed_payload"), dict):
-            records.append(record)
-    return records
+            records: list[dict[str, Any]] = []
+            for row in reversed(rows):
+                record = row_to_normalized_telemetry_record(
+                    row,
+                    build_payload_from_telemetry_values(cursor, row["id"]),
+                )
+                if isinstance(record.get("parsed_payload"), dict):
+                    records.append(record)
+            return records
 
 
 def get_recent_ai_logs(limit: int = 50) -> list[dict[str, Any]]:
@@ -3392,64 +3334,6 @@ def get_current_metrics() -> dict[str, Any]:
                 row = cursor.fetchone()
                 if row:
                     result[result_key] = row["value"]
-
-            if any(value is not None for value in result.values()):
-                return result
-
-            cursor.execute(
-                """
-                SELECT air_temp, humidity
-                FROM telemetry_raw
-                WHERE topic = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (CLIMATE_TOPIC,),
-            )
-            climate_row = cursor.fetchone()
-            if climate_row:
-                result["temperature"] = climate_row["air_temp"]
-                result["humidity"] = climate_row["humidity"]
-
-            cursor.execute(
-                """
-                SELECT water_temp
-                FROM telemetry_raw
-                WHERE topic = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (WATER_TOPIC,),
-            )
-            water_row = cursor.fetchone()
-            if water_row:
-                result["water_temp"] = water_row["water_temp"]
-
-            cursor.execute(
-                """
-                SELECT ph
-                FROM telemetry_raw
-                WHERE ph IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            ph_row = cursor.fetchone()
-            if ph_row:
-                result["ph"] = ph_row["ph"]
-
-            cursor.execute(
-                """
-                SELECT ec
-                FROM telemetry_raw
-                WHERE ec IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            )
-            ec_row = cursor.fetchone()
-            if ec_row:
-                result["ec"] = ec_row["ec"]
 
     return result
 
@@ -3517,16 +3401,16 @@ def build_hourly_summary_rows_from_values(hours: int = 24) -> list[dict[str, Any
 
 def get_hourly_history(metric_name: str, hours: int = 24) -> list[dict[str, Any]]:
     metric_config = {
-        "temperature": ("air_temp", "air_temp_avg"),
-        "humidity": ("humidity", "humidity_avg"),
-        "water_temp": ("water_temp", "water_temp_avg"),
-        "ph": ("ph", "ph_avg"),
-        "ec": ("ec", "ec_avg"),
+        "temperature": "air_temp",
+        "humidity": "humidity",
+        "water_temp": "water_temp",
+        "ph": "ph",
+        "ec": "ec",
     }
     if metric_name not in metric_config:
         raise ValueError(f"Unknown metric: {metric_name}")
 
-    metric_code, column_name = metric_config[metric_name]
+    metric_code = metric_config[metric_name]
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -3546,26 +3430,6 @@ def get_hourly_history(metric_name: str, hours: int = 24) -> list[dict[str, Any]
                 (hours, metric_code),
             )
             rows = cursor.fetchall()
-            if rows:
-                return [
-                    {
-                        "hour": format_timestamp(row["hour_start"])[:13] + ":00",
-                        "avg_value": float(row["avg_value"]) if row["avg_value"] is not None else None,
-                    }
-                    for row in rows
-                ]
-
-            cursor.execute(
-                f"""
-                SELECT hour_start, ROUND({column_name}::numeric, 2) AS avg_value
-                FROM telemetry_hourly
-                WHERE hour_start >= now() - (%s * interval '1 hour')
-                  AND {column_name} IS NOT NULL
-                ORDER BY hour_start ASC
-                """,
-                (hours,),
-            )
-            rows = cursor.fetchall()
 
     return [
         {
@@ -3577,62 +3441,10 @@ def get_hourly_history(metric_name: str, hours: int = 24) -> list[dict[str, Any]
 
 
 def save_telemetry_hourly_compatibility_value(cursor, row: dict[str, Any]) -> None:
-    metric_code = row["metric_code"]
-    if metric_code not in {"air_temp", "humidity", "water_temp", "ph", "ec"}:
-        return
-
-    avg_column = f"{metric_code}_avg"
-    min_column = f"{metric_code}_min"
-    max_column = f"{metric_code}_max"
-    count_column = f"{metric_code}_count"
-    cursor.execute(
-        sql.SQL(
-            """
-            INSERT INTO telemetry_hourly (
-                tray_id, sensor_type, hour_start,
-                {}, {}, {}, {}, {},
-                updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (tray_id, sensor_type, hour_start) DO UPDATE SET
-                {} = EXCLUDED.{},
-                {} = EXCLUDED.{},
-                {} = EXCLUDED.{},
-                {} = EXCLUDED.{},
-                {} = EXCLUDED.{},
-                updated_at = now()
-            """
-        ).format(
-            sql.Identifier(metric_code),
-            sql.Identifier(avg_column),
-            sql.Identifier(min_column),
-            sql.Identifier(max_column),
-            sql.Identifier(count_column),
-            sql.Identifier(metric_code),
-            sql.Identifier(metric_code),
-            sql.Identifier(avg_column),
-            sql.Identifier(avg_column),
-            sql.Identifier(min_column),
-            sql.Identifier(min_column),
-            sql.Identifier(max_column),
-            sql.Identifier(max_column),
-            sql.Identifier(count_column),
-            sql.Identifier(count_column),
-        ),
-        (
-            row["tray_id"],
-            row["sensor_type"],
-            row["hour_start"],
-            row["avg_value"],
-            row["avg_value"],
-            row["min_value"],
-            row["max_value"],
-            row["count_value"],
-        ),
-    )
+    return None
 
 
-def get_new_hourly_value_rows_from_normalized(cursor) -> list[dict[str, Any]] | None:
+def get_new_hourly_value_rows_from_normalized(cursor) -> list[dict[str, Any]]:
     cursor.execute(
         """
         SELECT 1
@@ -3642,7 +3454,7 @@ def get_new_hourly_value_rows_from_normalized(cursor) -> list[dict[str, Any]] | 
         """
     )
     if cursor.fetchone() is None:
-        return None
+        return []
 
     cursor.execute(
         """
@@ -3692,71 +3504,13 @@ def get_new_hourly_value_rows_from_normalized(cursor) -> list[dict[str, Any]] | 
 
 
 def get_new_hourly_value_rows_from_legacy_raw(cursor) -> list[dict[str, Any]]:
-    cursor.execute(
-        """
-        WITH raw_values AS (
-            SELECT
-                COALESCE(telemetry_raw.tray_id, 'unknown') AS tray_id,
-                CASE
-                    WHEN telemetry_raw.sensor_type IN ('climate', 'water', 'mixed') THEN telemetry_raw.sensor_type
-                    ELSE 'mixed'
-                END AS sensor_type,
-                date_trunc('hour', telemetry_raw.recorded_at) AS hour_start,
-                metric_values.metric_code,
-                metric_values.metric_value
-            FROM telemetry_raw
-            CROSS JOIN LATERAL (
-                VALUES
-                    ('air_temp', telemetry_raw.air_temp),
-                    ('humidity', telemetry_raw.humidity),
-                    ('water_temp', telemetry_raw.water_temp),
-                    ('ph', telemetry_raw.ph),
-                    ('ec', telemetry_raw.ec)
-            ) AS metric_values(metric_code, metric_value)
-            WHERE telemetry_raw.recorded_at < date_trunc('hour', now())
-              AND metric_values.metric_value IS NOT NULL
-        )
-        SELECT
-            raw_values.tray_id,
-            raw_values.sensor_type,
-            raw_values.hour_start,
-            raw_values.metric_code,
-            AVG(raw_values.metric_value) AS avg_value,
-            MIN(raw_values.metric_value) AS min_value,
-            MAX(raw_values.metric_value) AS max_value,
-            COUNT(raw_values.metric_value)::integer AS count_value
-        FROM raw_values
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM telemetry_hourly_values
-            JOIN catalog_items AS existing_metrics
-              ON existing_metrics.id = telemetry_hourly_values.metric_id
-             AND existing_metrics.category = 'metric'
-            LEFT JOIN catalog_items AS existing_sensor_types
-              ON existing_sensor_types.id = telemetry_hourly_values.sensor_type_id
-             AND existing_sensor_types.category = 'sensor_type'
-            WHERE telemetry_hourly_values.tray_id = raw_values.tray_id
-              AND COALESCE(existing_sensor_types.code, 'mixed') = raw_values.sensor_type
-              AND existing_metrics.code = raw_values.metric_code
-              AND telemetry_hourly_values.hour_start = raw_values.hour_start
-        )
-        GROUP BY
-            raw_values.tray_id,
-            raw_values.sensor_type,
-            raw_values.hour_start,
-            raw_values.metric_code
-        ORDER BY hour_start ASC, tray_id ASC, sensor_type ASC, metric_code ASC
-        """
-    )
-    return cursor.fetchall()
+    return []
 
 
 def aggregate_completed_hours() -> int:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             rows = get_new_hourly_value_rows_from_normalized(cursor)
-            if rows is None:
-                rows = get_new_hourly_value_rows_from_legacy_raw(cursor)
 
             for row in rows:
                 save_hourly_value(
@@ -3770,29 +3524,12 @@ def aggregate_completed_hours() -> int:
                     row["max_value"],
                     row["count_value"],
                 )
-                save_telemetry_hourly_compatibility_value(cursor, row)
 
             return len(rows)
 
 
 def delete_old_raw_data(retention_hours: int = 24) -> int:
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM telemetry_raw
-                WHERE recorded_at < now() - (%s * interval '1 hour')
-                  AND EXISTS (
-                      SELECT 1
-                      FROM telemetry_hourly_values
-                      WHERE telemetry_hourly_values.tray_id = COALESCE(telemetry_raw.tray_id, 'unknown')
-                        AND telemetry_hourly_values.hour_start = date_trunc('hour', telemetry_raw.recorded_at)
-                  )
-                RETURNING id
-                """,
-                (retention_hours,),
-            )
-            return len(cursor.fetchall())
+    return 0
 
 
 def save_anomaly_event(
@@ -3895,44 +3632,14 @@ def get_recent_anomaly_events(hours: int = 24) -> list[dict[str, Any]]:
 
 def get_recent_hourly_summary(hours: int = 24) -> list[dict[str, Any]]:
     normalized_rows = build_hourly_summary_rows_from_values(hours)
-    if normalized_rows:
-        return [
-            {
-                **row,
-                "hour_start": format_timestamp(row["hour_start"]),
-            }
-            for row in normalized_rows
-        ]
-
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    tray_id, sensor_type, hour_start,
-                    air_temp_avg, air_temp_min, air_temp_max, air_temp_count,
-                    humidity_avg, humidity_min, humidity_max, humidity_count,
-                    water_temp_avg, water_temp_min, water_temp_max, water_temp_count,
-                    ph_avg, ph_min, ph_max, ph_count,
-                    ec_avg, ec_min, ec_max, ec_count
-                FROM telemetry_hourly
-                WHERE hour_start >= now() - (%s * interval '1 hour')
-                ORDER BY hour_start ASC
-                """,
-                (hours,),
-            )
-            rows = cursor.fetchall()
-
     return [
         {
             **row,
             "hour_start": format_timestamp(row["hour_start"]),
         }
-        for row in rows
+        for row in normalized_rows
     ]
 
 
 def clear_telemetry_raw() -> None:
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM telemetry_raw")
+    return None

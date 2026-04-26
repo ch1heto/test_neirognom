@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from db import get_current_metrics as db_get_current_metrics
+from db import get_crop_agrotech_card_from_db
 from db import get_hourly_history
 from db import get_recent_anomaly_events
 
@@ -101,6 +102,20 @@ def get_crop_rules(crop_name):
         return {"error": str(e)}
 
 
+def get_crop_agrotech_card(crop_name):
+    """Возвращает активную АгроТехКарту культуры из PostgreSQL."""
+    safe_name = normalize_crop_name(crop_name)
+    try:
+        card = get_crop_agrotech_card_from_db(safe_name)
+        if card is None:
+            card = get_crop_agrotech_card_from_db(crop_name)
+        if card is None:
+            return {"error": f"АгроТехКарта для культуры '{crop_name}' не найдена в БД"}
+        return card
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_recent_anomalies(hours=24) -> dict[str, str] | list[dict[str, Any]]:
     """Возвращает последние события аномалий за указанный период."""
     try:
@@ -143,14 +158,14 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "get_crop_rules",
-            "description": "Получает справочную информацию (АгроТехКарту) с идеальными показателями для конкретной культуры.",
+            "name": "get_crop_agrotech_card",
+            "description": "Получает активную АгроТехКарту культуры из PostgreSQL: нормы, версию карты и разделы описания.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "crop_name": {
                         "type": "string",
-                        "description": "Название культуры на английском (например: tomatoes, basil)."
+                        "description": "Название культуры или slug, например: базилик, салат, basil."
                     }
                 },
                 "required": ["crop_name"]

@@ -32,6 +32,7 @@ from db import (
     get_cycle_advisor_reports,
     get_current_growing_cycle,
     get_cycle_result,
+    get_crop_agrotech_card_from_db,
     get_database_model_summary,
     get_last_climate_records,
     get_recent_anomaly_events,
@@ -47,7 +48,7 @@ from db import (
     start_growing_cycle,
     update_device_status,
 )
-from tools import TOOLS_SCHEMA, get_current_metrics, get_history, get_crop_rules, get_recent_anomalies
+from tools import TOOLS_SCHEMA, get_current_metrics, get_history, get_crop_agrotech_card, get_recent_anomalies
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
@@ -98,7 +99,8 @@ CHAT_SYSTEM_PROMPT = (
     "отвечай по-человечески, тепло и без занудства.\n"
     "7. Тревога: Если ты видишь в скрытых данных, что параметры вышли за рамки, мягко предупреди об опасности и дай совет.\n"
     "8. Ограничения языка: Отвечай на русском языке. Обозначения pH и EC разрешены. "
-    "Английские slug-названия культур можно использовать, если это нужно для точности. "
+    "Если backend передал crop_name_ru, используй только русское название культуры. "
+    "crop_slug используй только внутренне; не пиши пользователю arugula, lettuce, basil и другие slug, если есть русское имя. "
     "Запрещено использовать программный код, теги или markdown-разметку. Пиши чистым, обычным текстом."
 )
 
@@ -196,15 +198,36 @@ def build_crop_rules_context(crops: list[str]) -> str:
     sections: list[str] = []
 
     for crop in crops[:3]:
-        rules = get_crop_rules(crop)
-        if isinstance(rules, str) and rules.strip():
-            sections.append(f"Культура: {crop}\n{rules.strip()}")
+        card = get_crop_agrotech_card_from_db(crop)
+        if not card:
+            continue
+
+        crop_title = card.get("crop_name_ru") or card.get("crop_slug") or crop
+        norms = card.get("norms") if isinstance(card.get("norms"), dict) else {}
+        card_sections = card.get("sections") if isinstance(card.get("sections"), list) else []
+        section_text = "\n\n".join(
+            f"{section.get('section_title')}\n{section.get('content')}"
+            for section in card_sections
+            if section.get("content")
+        )
+        sections.append(
+            "\n".join(
+                part
+                for part in (
+                    f"Культура: {crop_title}",
+                    f"Версия АгроТехКарты: {card.get('version_label')}",
+                    f"Нормы из БД: {json.dumps(norms, ensure_ascii=False)}" if norms else "Нормы в БД не найдены.",
+                    section_text,
+                )
+                if part
+            )
+        )
 
     if not sections:
         return ""
 
     return (
-        "База знаний культур из crops_data. Используй этот блок как главный источник "
+        "База знаний культур из PostgreSQL. Используй этот блок как главный источник "
         "по нормам pH, EC, температуре, циклам, алертам и рекомендациям.\n\n"
         + "\n\n---\n\n".join(sections)
     )
@@ -398,6 +421,23 @@ def parse_crop_ranges(crop_rules: Any) -> dict[str, tuple[float, float]]:
     return parsed
 
 
+def norm_ranges_from_db(norms: Any) -> dict[str, tuple[float, float]]:
+    if not isinstance(norms, dict):
+        return {}
+
+    parsed: dict[str, tuple[float, float]] = {}
+    for metric_name in ("air_temp", "humidity", "water_temp", "ph", "ec"):
+        value = norms.get(metric_name)
+        if not isinstance(value, dict):
+            continue
+        low = value.get("min")
+        high = value.get("max")
+        if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+            continue
+        parsed[metric_name] = (float(low), float(high))
+    return parsed
+
+
 def latest_metric_snapshot(records: list[dict[str, Any]]) -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "tray_id": None,
@@ -473,21 +513,25 @@ def build_advisor_response(crop: str) -> dict[str, Any]:
     current = latest_metric_snapshot(telemetry_records)
     hourly_rows = get_recent_hourly_summary(ADVISOR_HISTORY_HOURS)
     anomaly_events = get_recent_anomaly_events(ADVISOR_HISTORY_HOURS)
-    crop_rules = None
+    crop_card = None
     crop_ranges = get_active_cycle_norm_ranges("tray_1")
-    crop_ranges_source = "database_active_cycle" if crop_ranges else "markdown_fallback"
+    crop_ranges_source = "database_active_cycle" if crop_ranges else "database_crop_card"
     if not crop_ranges:
-        crop_rules = get_crop_rules(crop)
-        crop_ranges = parse_crop_ranges(crop_rules)
+        crop_card = get_crop_agrotech_card_from_db(crop)
+        crop_ranges = norm_ranges_from_db(crop_card.get("norms") if crop_card else None)
+    if not crop_ranges:
+        crop_ranges_source = "database_missing"
 
     risks: list[str] = []
     recommendations: list[str] = []
     trend_notes = build_hourly_trend_notes(hourly_rows)
+    if not crop_ranges:
+        risks.append(f"Нормы для культуры '{crop}' не найдены в БД.")
 
     if not telemetry_records:
         return {
             "summary": "Данных телеметрии пока недостаточно для агрономической оценки.",
-            "risks": ["Нет свежих показаний из telemetry_raw."],
+            "risks": ["Нет свежих показаний телеметрии."],
             "recommendations": ["Запустите симулятор или проверьте поступление MQTT-данных."],
             "data": {
                 "crop": crop,
@@ -574,7 +618,7 @@ def build_advisor_response(crop: str) -> dict[str, Any]:
             "history_hours": ADVISOR_HISTORY_HOURS,
             "hourly_points": len(hourly_rows),
             "anomaly_events": len(anomaly_events),
-            "crop_rules_loaded": bool(crop_ranges) or isinstance(crop_rules, str),
+            "crop_rules_loaded": bool(crop_ranges),
             "crop_ranges_source": crop_ranges_source,
         },
     }
@@ -685,9 +729,9 @@ async def ask_ai(
                 elif func_name == "get_history":
                     add_analysis_step(analysis_steps, "Получаю почасовую историю показателей")
                     result = get_history(args.get("metric_name"), args.get("hours", 24))
-                elif func_name == "get_crop_rules":
-                    add_analysis_step(analysis_steps, "Проверяю правила выбранной культуры")
-                    result = get_crop_rules(args.get("crop_name"))
+                elif func_name == "get_crop_agrotech_card":
+                    add_analysis_step(analysis_steps, "Проверяю АгроТехКарту выбранной культуры из БД")
+                    result = get_crop_agrotech_card(args.get("crop_name"))
                 elif func_name == "get_recent_anomalies":
                     add_analysis_step(analysis_steps, "Проверяю последние события anomaly_events")
                     result = get_recent_anomalies(args.get("hours", 24))
@@ -784,9 +828,10 @@ def format_active_cycle_for_prompt(tray_id: str = "tray_1") -> str:
             "Не оценивай нормы выращивания без данных ревизии."
         )
 
+    crop_name = active_cycle.get("crop_name_ru") or active_cycle.get("crop_slug") or "без названия"
     lines = [
         "Активный цикл:",
-        f"культура: {active_cycle.get('crop_name_ru') or 'без названия'} ({active_cycle.get('crop_slug')})",
+        f"культура: {crop_name}",
         (
             "версия АгроТехКарты: "
             f"{active_cycle.get('version_label') or 'не указана'}, revision_id={active_cycle.get('revision_id')}"
@@ -1189,7 +1234,7 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
         if detected_crops:
             analysis_steps.append("Нашёл упоминания культур в запросе")
         if crop_rules_context:
-            analysis_steps.append("Загружаю базу знаний культур из crops_data")
+            analysis_steps.append("Загружаю АгроТехКарты культур из БД")
             enriched_prompt = f"{crop_rules_context}\n\n{enriched_prompt}"
         if unsupported_crop_context:
             analysis_steps.append("Проверяю ограничения по неподходящим культурам")
