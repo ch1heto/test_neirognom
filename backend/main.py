@@ -1033,31 +1033,50 @@ def get_telemetry() -> dict[str, Any]:
 
 @app.post("/api/device/control")
 def control_device(request: DeviceControlRequest) -> dict[str, str]:
-    topic = f"farm/{request.target_id}/cmd/{request.device_type}"
-    payload = request.state
+    tray_id = request.target_id.strip() or "tray_1"
+    device_type = request.device_type.strip().lower()
+    state = request.state.strip().upper()
+    topic = f"farm/{tray_id}/cmd/{device_type}"
+    payload = state
 
-    if request.state == "TIMER" and request.duration is not None:
+    if state == "TIMER" and request.duration is not None:
         payload = f"TIMER {request.duration:g}"
 
     app.state.mqtt_client.publish(topic, payload)
-    save_device_event(
-        f"{request.target_id}_{request.device_type}",
-        tray_id=request.target_id,
-        command=request.state,
-        value=payload,
-        source="manual",
-        payload={
-            "topic": topic,
-            "device_type": request.device_type,
-            "state": request.state,
-            "duration": request.duration,
-        },
-    )
+
+    if state == "ON":
+        event_command = "manual_on"
+        event_value = "on"
+    elif state == "OFF":
+        event_command = "manual_off"
+        event_value = "off"
+    else:
+        event_command = "manual_toggle"
+        event_value = state.lower()
+
+    device_id = f"{tray_id}_{device_type}"
+    try:
+        save_device_event(
+            device_id=device_id,
+            tray_id=tray_id,
+            command=event_command,
+            value=event_value,
+            source="manual",
+            payload={
+                "target_id": request.target_id,
+                "tray_id": tray_id,
+                "device_type": device_type,
+                "state": state,
+            },
+        )
+    except Exception as exc:
+        print(f"[DEVICE_EVENTS] Не удалось сохранить событие {device_id}: {exc}")
+
     return {
         "status": "sent",
-        "target_id": request.target_id,
-        "device_type": request.device_type,
-        "state": request.state,
+        "target_id": tray_id,
+        "device_type": device_type,
+        "state": state,
         "payload": payload,
     }
 
