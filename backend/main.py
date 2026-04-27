@@ -1000,8 +1000,10 @@ def get_telemetry() -> dict[str, Any]:
     air_temp = snapshot.get("Температура")
     humidity = snapshot.get("Влажность")
     water_temp = snapshot.get("Темп. воды")
+    ph = snapshot.get("pH")
+    ec = snapshot.get("EC")
 
-    if air_temp is None or humidity is None or water_temp is None:
+    if air_temp is None or humidity is None or water_temp is None or ph is None or ec is None:
         for record in reversed(get_recent_telemetry(10)):
             payload = record.get("parsed_payload")
             if not isinstance(payload, dict):
@@ -1015,11 +1017,17 @@ def get_telemetry() -> dict[str, Any]:
                     humidity = payload.get("humidity")
             elif topic.endswith("/water") and water_temp is None:
                 water_temp = payload.get("water_temp")
+            if ph is None:
+                ph = payload.get("ph", payload.get("pH"))
+            if ec is None:
+                ec = payload.get("ec", payload.get("EC"))
 
     return {
         "air_temp": air_temp,
         "humidity": humidity,
         "water_temp": water_temp,
+        "ph": ph,
+        "ec": ec,
     }
 
 

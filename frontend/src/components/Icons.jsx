@@ -36,6 +36,29 @@ export function HumidityIcon({ className = 'h-5 w-5' }) {
   )
 }
 
+export function PhIcon({ className = 'h-5 w-5' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={`${base} ${className}`} strokeWidth="1.8">
+      <path d="M6 18V6h4.1a3.6 3.6 0 1 1 0 7.2H6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M15 18V6" strokeLinecap="round" />
+      <path d="M15 12h4.8" strokeLinecap="round" />
+      <path d="M20 18V9.8" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+export function EcIcon({ className = 'h-5 w-5' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={`${base} ${className}`} strokeWidth="1.8">
+      <path d="M7.5 5.5h8.8" strokeLinecap="round" />
+      <path d="M7.5 12h6.8" strokeLinecap="round" />
+      <path d="M7.5 18.5h8.8" strokeLinecap="round" />
+      <path d="M18.5 8.3c1.2.9 2 2.2 2 3.7s-.8 2.8-2 3.7" strokeLinecap="round" />
+      <path d="M5.5 8.3c-1.2.9-2 2.2-2 3.7s.8 2.8 2 3.7" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 export function FanIcon({ className = 'h-5 w-5' }) {
   return (
     <svg viewBox="0 0 24 24" className={`${base} ${className}`} strokeWidth="1.8">

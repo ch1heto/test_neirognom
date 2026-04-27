@@ -57,14 +57,20 @@ while True:
         air_temp = 35.5
         humidity = 30.0
         water_temp = round(random.uniform(20.0, 20.8), 1)
+        ph = round(random.uniform(5.7, 6.2), 2)
+        ec = round(random.uniform(1.35, 1.75), 2)
     elif current_mode == "COLD":
         air_temp = 12.0
         humidity = round(random.uniform(48.0, 52.0), 1)
         water_temp = round(random.uniform(19.0, 20.0), 1)
+        ph = round(random.uniform(6.1, 6.6), 2)
+        ec = round(random.uniform(1.10, 1.40), 2)
     else:
         air_temp = round(random.uniform(22.0, 24.0), 1)
         humidity = round(random.uniform(52.0, 60.0), 1)
         water_temp = round(random.uniform(19.6, 20.4), 1)
+        ph = round(random.uniform(5.9, 6.4), 2)
+        ec = round(random.uniform(1.25, 1.55), 2)
 
     climate_payload = json.dumps(
         {
@@ -75,6 +81,8 @@ while True:
     water_payload = json.dumps(
         {
             "water_temp": water_temp,
+            "ph": ph,
+            "ec": ec,
         }
     )
 

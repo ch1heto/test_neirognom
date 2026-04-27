@@ -7,14 +7,17 @@ import LedTimeline from './components/LedTimeline'
 import MetricCard from './components/MetricCard'
 import ThoughtStream from './components/ThoughtStream'
 import {
+  initialMetrics,
   ledStages,
   sparklineSeries,
 } from './data/mock'
 import {
   DropletIcon,
+  EcIcon,
   FanIcon,
   HumidityIcon,
   LightIcon,
+  PhIcon,
   PlayIcon,
   PumpIcon,
   SlidersIcon,
@@ -108,6 +111,18 @@ function toNumberOrFallback(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function toNumberOrNull(value) {
+  if (value === null || value === undefined) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function formatMetricValue(value, digits) {
+  if (value === null || value === undefined) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed.toFixed(digits) : null
+}
+
 function buildChatHistory(messages, userMessage) {
   return [...messages, userMessage].map((message) => ({
     role: message.from === 'assistant' ? 'assistant' : 'user',
@@ -185,7 +200,7 @@ function getErrorMessage(error, fallback) {
 
 export default function App() {
   const [mode, setMode] = useState('monitoring')
-  const [metrics, setMetrics] = useState({ waterTemp: 0, airHumidity: 0, airTemp: 0 })
+  const [metrics, setMetrics] = useState(initialMetrics)
   const [devices, setDevices] = useState({
     fans: { title: 'Вентиляция', subtitle: 'Обдув', level: 0, enabled: false },
     lights: { title: 'Освещение', subtitle: 'Фитолампы', level: 0, enabled: false },
@@ -249,6 +264,8 @@ export default function App() {
           waterTemp: toNumberOrFallback(data.water_temp, prev.waterTemp),
           airHumidity: toNumberOrFallback(data.humidity, prev.airHumidity),
           airTemp: toNumberOrFallback(data.air_temp, prev.airTemp),
+          ph: toNumberOrNull(data.ph),
+          ec: toNumberOrNull(data.ec),
         }))
       } catch (error) {
         console.error('Failed to load telemetry', error)
@@ -383,7 +400,7 @@ export default function App() {
     () => [
       {
         title: 'Температура воды',
-        value: metrics.waterTemp,
+        value: formatMetricValue(metrics.waterTemp, 1),
         unit: '°C',
         norm: '18 – 22 °C',
         color: '#2CB4FF',
@@ -392,7 +409,7 @@ export default function App() {
       },
       {
         title: 'Влажность воздуха',
-        value: metrics.airHumidity,
+        value: formatMetricValue(metrics.airHumidity, 1),
         unit: '%',
         norm: '52 – 60 %',
         color: '#71F16A',
@@ -401,12 +418,30 @@ export default function App() {
       },
       {
         title: 'Температура воздуха',
-        value: metrics.airTemp,
+        value: formatMetricValue(metrics.airTemp, 1),
         unit: '°C',
         norm: '20 – 25 °C',
         color: '#C668FF',
         values: sparklineSeries.airTemp,
         icon: <ThermometerIcon className="h-6 w-6" />,
+      },
+      {
+        title: 'pH',
+        value: formatMetricValue(metrics.ph, 1),
+        unit: '',
+        norm: '5.8 – 6.5',
+        color: '#7DD3FC',
+        values: sparklineSeries.ph,
+        icon: <PhIcon className="h-6 w-6" />,
+      },
+      {
+        title: 'EC',
+        value: formatMetricValue(metrics.ec, 2),
+        unit: 'mS/cm',
+        norm: '1.2 – 1.6 mS/cm',
+        color: '#F7C948',
+        values: sparklineSeries.ec,
+        icon: <EcIcon className="h-6 w-6" />,
       },
     ],
     [metrics],
@@ -756,12 +791,18 @@ export default function App() {
   }
 
   const renderMonitoring = () => (
-    <div className="flex min-w-0 max-w-full flex-col gap-4 min-[1700px]:h-full min-[1700px]:min-h-0">
-      <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {metricsList.map((item) => (
-          <MetricCard key={item.title} {...item} />
-        ))}
-      </div>
+    <div className="flex min-w-0 max-w-full flex-col gap-3 min-[1700px]:h-full min-[1700px]:min-h-0">
+      <section className="min-w-0 max-w-full">
+        <div className="custom-scrollbar max-w-full overflow-x-auto overflow-y-hidden">
+          <div className="grid min-w-[1120px] grid-cols-5 gap-3 min-[1700px]:min-w-0">
+            {metricsList.map((item) => (
+              <div key={item.title} className="min-w-0">
+                <MetricCard {...item} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
 
       <div className="grid min-w-0 grid-cols-1 gap-4 min-[1700px]:min-h-0 min-[1700px]:flex-1 min-[1700px]:grid-cols-[minmax(0,1fr)_330px] min-[1900px]:grid-cols-[minmax(0,1fr)_360px]">
         {renderCycleControl()}

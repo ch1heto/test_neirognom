@@ -1,15 +1,19 @@
 import GlassCard from './GlassCard'
 
 function createSmoothPath(values) {
-  const max = Math.max(...values)
-  const min = Math.min(...values)
+  const safeValues = Array.isArray(values) && values.length > 1 ? values : [0, 0]
+  const max = Math.max(...safeValues)
+  const min = Math.min(...safeValues)
+  const range = max - min
+
   const getPoint = (value, index) => {
-    const x = (index / (values.length - 1)) * 400
-    const y = 100 - ((value - min) / Math.max(max - min, 1)) * 56 - 20
+    const x = (index / (safeValues.length - 1)) * 400
+    const normalized = range > 0 ? (value - min) / range : 0.5
+    const y = 78 - normalized * 52
     return { x, y }
   }
 
-  const points = values.map(getPoint)
+  const points = safeValues.map(getPoint)
   let path = `M ${points[0].x} ${points[0].y}`
 
   for (let index = 0; index < points.length - 1; index += 1) {
@@ -22,14 +26,18 @@ function createSmoothPath(values) {
   return { path, points }
 }
 
-function Sparkline({ values, color, title }) {
+function Sparkline({ values, color, title, muted = false, compact = false }) {
   const { path, points } = createSmoothPath(values)
   const lastPoint = points.at(-1)
   const gradientId = `fill-${title.replace(/\s+/g, '-').toLowerCase()}`
   const glowId = `glow-${title.replace(/\s+/g, '-').toLowerCase()}`
 
   return (
-    <svg viewBox="0 0 400 100" className="h-28 w-full overflow-visible [@media_(min-width:1280px)_and_(max-width:1799px)]:h-22" preserveAspectRatio="none">
+    <svg
+      viewBox="0 0 400 100"
+      className={`h-[44px] w-full overflow-visible ${muted ? 'opacity-55' : ''}`}
+      preserveAspectRatio="none"
+    >
       <defs>
         <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.38" />
@@ -81,12 +89,14 @@ export default function MetricCard({
   color,
   values,
 }) {
+  const hasValue = value !== null && value !== undefined
+
   return (
-    <GlassCard soft className="overflow-hidden rounded-[28px] px-6 py-5 [@media_(min-width:1280px)_and_(max-width:1799px)]:px-5 [@media_(min-width:1280px)_and_(max-width:1799px)]:py-4">
-      <div className="flex flex-col gap-6 md:flex-row md:items-center [@media_(min-width:1280px)_and_(max-width:1799px)]:gap-4">
-        <div className="flex shrink-0 items-center gap-5 md:w-64 [@media_(min-width:1280px)_and_(max-width:1799px)]:w-56 [@media_(min-width:1280px)_and_(max-width:1799px)]:gap-4">
+    <GlassCard soft className="h-[152px] overflow-hidden rounded-[24px] px-4 py-3">
+      <div className="flex h-full min-w-0 flex-col justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-3">
           <div
-            className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-white/10"
+            className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[18px] border border-white/10"
             style={{
               backgroundColor: `${color}15`,
               color,
@@ -95,20 +105,32 @@ export default function MetricCard({
           >
             {icon}
           </div>
+
           <div className="min-w-0">
-            <div className="text-sm font-medium uppercase tracking-wider text-white/40">{title}</div>
-            <div className="mt-1 flex items-baseline gap-1.5">
-              <span className="text-4xl font-bold tracking-tight text-white">{value}</span>
-              <span className="text-lg text-white/50">{unit}</span>
+            <div className="text-[12px] font-medium uppercase tracking-wider text-white/40">
+              {title}
             </div>
-            <div className="mt-1 text-[13px] font-medium" style={{ color: `${color}cc` }}>
+
+            <div className="mt-1 flex min-w-0 items-baseline gap-1.5">
+              <span className={`${hasValue ? 'text-[30px]' : 'text-[16px]'} truncate font-bold leading-none tracking-tight text-white`}>
+                {hasValue ? value : 'нет данных'}
+              </span>
+
+              {hasValue && unit ? (
+                <span className="text-[14px] text-white/50">
+                  {unit}
+                </span>
+              ) : null}
+            </div>
+
+            <div className="mt-1 text-[12px] font-medium" style={{ color: `${color}cc` }}>
               {norm}
             </div>
           </div>
         </div>
 
-        <div className="flex-1 min-w-0">
-          <Sparkline values={values} color={color} title={title} />
+        <div className="min-w-0">
+          <Sparkline values={values} color={color} title={title} muted={!hasValue} />
         </div>
       </div>
     </GlassCard>
