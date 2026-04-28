@@ -67,6 +67,16 @@ BASE_CATALOG_ITEMS = (
     ("anomaly_type", "stale_sensor_data", "Данные датчиков устарели", None),
     ("anomaly_type", "stale_climate_data", "Данные климатических датчиков устарели", None),
     ("anomaly_type", "stale_water_data", "Данные водных датчиков устарели", None),
+    ("anomaly_type", "predicted_ph_low", "Прогноз снижения pH ниже нормы", None),
+    ("anomaly_type", "predicted_ph_high", "Прогноз роста pH выше нормы", None),
+    ("anomaly_type", "predicted_ec_low", "Прогноз снижения EC ниже нормы", None),
+    ("anomaly_type", "predicted_ec_high", "Прогноз роста EC выше нормы", None),
+    ("anomaly_type", "predicted_water_temp_low", "Прогноз снижения температуры воды ниже нормы", None),
+    ("anomaly_type", "predicted_water_temp_high", "Прогноз роста температуры воды выше нормы", None),
+    ("anomaly_type", "predicted_air_temp_low", "Прогноз снижения температуры воздуха ниже нормы", None),
+    ("anomaly_type", "predicted_air_temp_high", "Прогноз роста температуры воздуха выше нормы", None),
+    ("anomaly_type", "predicted_humidity_low", "Прогноз снижения влажности ниже нормы", None),
+    ("anomaly_type", "predicted_humidity_high", "Прогноз роста влажности выше нормы", None),
 )
 BASE_CATALOG_ITEM_BY_CODE = {item[1]: item for item in BASE_CATALOG_ITEMS}
 NON_CROP_CARD_FILES = {"crops_index.md", "project_recommendations.md"}

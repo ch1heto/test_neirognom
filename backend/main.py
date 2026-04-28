@@ -78,6 +78,11 @@ HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
 RAW_RETENTION_HOURS = 24
 ANOMALY_EVENT_COOLDOWN_MINUTES = 5
 SENSOR_STALE_SECONDS = 60
+PREDICTIVE_WATCHDOG_INTERVAL_SECONDS = 600
+PREDICTIVE_HISTORY_HOURS = 8
+PREDICTIVE_HORIZON_HOURS = 4
+PREDICTIVE_EVENT_COOLDOWN_MINUTES = 60
+PREDICTIVE_MIN_POINTS = 3
 WATCHDOG_DEFAULT_TRAY_ID = "tray_1"
 WATCHDOG_DEFAULT_NORM_RANGES = {
     "air_temp": (18.0, 28.0),
@@ -113,6 +118,38 @@ WATCHDOG_METRIC_CONFIG = {
         "high_event_type": "ec_high",
     },
 }
+PREDICTIVE_METRIC_CONFIG = {
+    "air_temp": {
+        "sensor_type": "climate",
+        "slope_threshold": 0.5,
+        "low_event_type": "predicted_air_temp_low",
+        "high_event_type": "predicted_air_temp_high",
+    },
+    "humidity": {
+        "sensor_type": "climate",
+        "slope_threshold": 2.0,
+        "low_event_type": "predicted_humidity_low",
+        "high_event_type": "predicted_humidity_high",
+    },
+    "water_temp": {
+        "sensor_type": "water",
+        "slope_threshold": 0.3,
+        "low_event_type": "predicted_water_temp_low",
+        "high_event_type": "predicted_water_temp_high",
+    },
+    "ph": {
+        "sensor_type": "water",
+        "slope_threshold": 0.05,
+        "low_event_type": "predicted_ph_low",
+        "high_event_type": "predicted_ph_high",
+    },
+    "ec": {
+        "sensor_type": "water",
+        "slope_threshold": 0.05,
+        "low_event_type": "predicted_ec_low",
+        "high_event_type": "predicted_ec_high",
+    },
+}
 SYSTEM_FEED_ANOMALY_TEXTS = {
     "ph_low": "pH ниже нормы",
     "low_ph": "pH ниже нормы",
@@ -131,6 +168,16 @@ SYSTEM_FEED_ANOMALY_TEXTS = {
     "stale_climate_data": "Данные климатических датчиков давно не обновлялись",
     "stale_water_data": "Данные водных датчиков давно не обновлялись",
     "rapid_air_temp_rise": "Быстрый рост температуры воздуха",
+    "predicted_ph_low": "pH снижается и может выйти ниже нормы",
+    "predicted_ph_high": "pH растёт и может выйти выше нормы",
+    "predicted_ec_low": "EC снижается и может выйти ниже нормы",
+    "predicted_ec_high": "EC растёт и может выйти выше нормы",
+    "predicted_water_temp_low": "Температура воды снижается и может выйти ниже нормы",
+    "predicted_water_temp_high": "Температура воды растёт и может выйти выше нормы",
+    "predicted_air_temp_low": "Температура воздуха снижается и может выйти ниже нормы",
+    "predicted_air_temp_high": "Температура воздуха растёт и может выйти выше нормы",
+    "predicted_humidity_low": "Влажность снижается и может выйти ниже нормы",
+    "predicted_humidity_high": "Влажность растёт и может выйти выше нормы",
 }
 SYSTEM_FEED_DEVICE_TEXTS = {
     ("pump", "manual_on"): "Насос включён",
@@ -820,6 +867,166 @@ def format_system_feed_item(row: dict[str, Any]) -> dict[str, Any]:
         "time": system_feed_time(created_at),
         "created_at": created_at,
     }
+
+
+def numeric_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def collect_hourly_metric_values(
+    hourly_rows: list[dict[str, Any]],
+    metric_name: str,
+) -> list[tuple[datetime | None, float]]:
+    value_key = f"{metric_name}_avg"
+    count_key = f"{metric_name}_count"
+    values: list[tuple[datetime | None, float]] = []
+
+    for row in hourly_rows:
+        value = numeric_value(row.get(value_key))
+        if value is None:
+            continue
+        count_value = row.get(count_key)
+        if isinstance(count_value, int) and count_value <= 0:
+            continue
+        values.append((parse_event_timestamp(row.get("hour_start")), value))
+
+    return sorted(values, key=lambda item: item[0] or datetime.min)
+
+
+def calculate_slope_per_hour(values: list[tuple[datetime | None, float]]) -> float | None:
+    if len(values) < PREDICTIVE_MIN_POINTS:
+        return None
+
+    first_time, first_value = values[0]
+    last_time, last_value = values[-1]
+    hours_span = float(len(values) - 1)
+    if first_time is not None and last_time is not None:
+        measured_hours = (last_time - first_time).total_seconds() / 3600
+        if measured_hours > 0:
+            hours_span = measured_hours
+
+    if hours_span <= 0:
+        return None
+    return (last_value - first_value) / hours_span
+
+
+def is_stable_trend(recent_values: list[float], direction: Literal["low", "high"], threshold: float) -> bool:
+    if len(recent_values) < PREDICTIVE_MIN_POINTS:
+        return False
+
+    sign = 1 if direction == "high" else -1
+    noise_floor = threshold / 2
+    meaningful_deltas = [
+        sign * (current_value - previous_value)
+        for previous_value, current_value in zip(recent_values, recent_values[1:])
+        if abs(current_value - previous_value) >= noise_floor
+    ]
+    if len(meaningful_deltas) < 2:
+        return False
+
+    positive_steps = [delta for delta in meaningful_deltas if delta > 0]
+    negative_steps = [delta for delta in meaningful_deltas if delta < 0]
+    positive_total = sum(positive_steps)
+    negative_total = abs(sum(negative_steps))
+
+    return (
+        len(positive_steps) >= max(2, len(meaningful_deltas) - 1)
+        and positive_total > negative_total * 2
+    )
+
+
+def build_predictive_anomaly_events(
+    hourly_rows: list[dict[str, Any]],
+    norm_ranges: dict[str, tuple[float, float]],
+    tray_id: str = WATCHDOG_DEFAULT_TRAY_ID,
+) -> list[dict[str, Any]]:
+    if not norm_ranges:
+        return []
+
+    events: list[dict[str, Any]] = []
+    for metric_name, config in PREDICTIVE_METRIC_CONFIG.items():
+        metric_range = norm_ranges.get(metric_name)
+        if metric_range is None:
+            continue
+
+        min_norm, max_norm = metric_range
+        values_with_time = collect_hourly_metric_values(hourly_rows, metric_name)
+        if len(values_with_time) < PREDICTIVE_MIN_POINTS:
+            continue
+
+        recent_values = [value for _, value in values_with_time]
+        current_value = recent_values[-1]
+        if current_value < min_norm or current_value > max_norm:
+            continue
+
+        slope_per_hour = calculate_slope_per_hour(values_with_time)
+        threshold = float(config["slope_threshold"])
+        if slope_per_hour is None or abs(slope_per_hour) < threshold:
+            continue
+
+        direction: Literal["low", "high"] = "high" if slope_per_hour > 0 else "low"
+        if not is_stable_trend(recent_values, direction, threshold):
+            continue
+
+        if direction == "high":
+            predicted_boundary = max_norm
+            predicted_hours = (max_norm - current_value) / slope_per_hour
+            event_type = str(config["high_event_type"])
+        else:
+            predicted_boundary = min_norm
+            predicted_hours = (current_value - min_norm) / abs(slope_per_hour)
+            event_type = str(config["low_event_type"])
+
+        if predicted_hours <= 0 or predicted_hours > PREDICTIVE_HORIZON_HOURS:
+            continue
+
+        message = SYSTEM_FEED_ANOMALY_TEXTS[event_type]
+        events.append(
+            {
+                "tray_id": tray_id,
+                "sensor_type": str(config["sensor_type"]),
+                "event_type": event_type,
+                "metric_name": metric_name,
+                "severity": "warning",
+                "value": current_value,
+                "message": message,
+                "payload": {
+                    "metric_name": metric_name,
+                    "current_value": current_value,
+                    "min_norm": min_norm,
+                    "max_norm": max_norm,
+                    "slope_per_hour": slope_per_hour,
+                    "predicted_boundary": predicted_boundary,
+                    "predicted_hours_to_boundary": predicted_hours,
+                    "recent_values": recent_values,
+                    "source": "predictive_trend",
+                },
+            }
+        )
+
+    return events
+
+
+async def save_predictive_anomaly_events(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        saved = await asyncio.to_thread(
+            save_anomaly_event,
+            tray_id=event["tray_id"],
+            sensor_type=event["sensor_type"],
+            event_type=event["event_type"],
+            metric_name=event["metric_name"],
+            severity=event["severity"],
+            value=event["value"],
+            message=event["message"],
+            payload=event["payload"],
+            cooldown_minutes=PREDICTIVE_EVENT_COOLDOWN_MINUTES,
+        )
+        if saved:
+            print(f"[PREDICTIVE] Anomaly event saved: {event['event_type']} {event['metric_name']}")
 
 
 def norm_ranges_from_db(norms: Any) -> dict[str, tuple[float, float]]:
@@ -1946,6 +2153,40 @@ async def hourly_aggregation_worker() -> None:
         await asyncio.sleep(HOURLY_AGGREGATION_INTERVAL_SECONDS)
 
 
+async def predictive_watchdog_worker() -> None:
+    print("[PREDICTIVE] Запущен предиктивный анализ трендов")
+
+    while True:
+        try:
+            norm_ranges = await asyncio.to_thread(
+                get_active_cycle_norm_ranges,
+                WATCHDOG_DEFAULT_TRAY_ID,
+            )
+            if norm_ranges:
+                hourly_rows = await asyncio.to_thread(
+                    get_recent_hourly_summary,
+                    PREDICTIVE_HISTORY_HOURS,
+                )
+                events = build_predictive_anomaly_events(
+                    hourly_rows,
+                    norm_ranges,
+                    WATCHDOG_DEFAULT_TRAY_ID,
+                )
+                if events:
+                    await save_predictive_anomaly_events(events)
+                    print(f"[PREDICTIVE] Найдены предиктивные алерты: {len(events)}")
+                else:
+                    print("[PREDICTIVE] Рисковых трендов не обнаружено.")
+            else:
+                print("[PREDICTIVE] Активный цикл или нормы не найдены, прогноз пропущен.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[PREDICTIVE] Ошибка предиктивного анализа: {exc}")
+
+        await asyncio.sleep(PREDICTIVE_WATCHDOG_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -1958,12 +2199,16 @@ async def lifespan(app: FastAPI):
     app.state.mqtt_client = mqtt_client
     watchdog_task = asyncio.create_task(internal_watchdog())
     aggregation_task = asyncio.create_task(hourly_aggregation_worker())
+    predictive_task = asyncio.create_task(predictive_watchdog_worker())
 
     try:
         yield
     finally:
+        predictive_task.cancel()
         aggregation_task.cancel()
         watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await predictive_task
         with suppress(asyncio.CancelledError):
             await aggregation_task
         with suppress(asyncio.CancelledError):

@@ -802,7 +802,7 @@ export default function App() {
       <div className="grid min-w-0 grid-cols-1 gap-4 min-[1700px]:min-h-0 min-[1700px]:flex-1 min-[1700px]:grid-cols-[minmax(0,1fr)_330px] min-[1900px]:grid-cols-[minmax(0,1fr)_360px]">
         {renderCycleControl()}
 
-        <div className="min-h-[320px] min-w-0 min-[1700px]:min-h-0">
+        <div className="min-h-[320px] max-h-[420px] min-w-0 overflow-hidden min-[1700px]:h-full min-[1700px]:min-h-0 min-[1700px]:max-h-none">
           <ThoughtStream thoughts={thoughts} className="h-full" />
         </div>
       </div>
