@@ -37,6 +37,7 @@ from db import (
     get_database_model_summary,
     get_hourly_history,
     get_last_climate_records,
+    get_last_water_records,
     get_recent_anomaly_events,
     get_recent_device_events,
     get_recent_ai_logs,
@@ -75,6 +76,42 @@ KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
 HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
 RAW_RETENTION_HOURS = 24
 ANOMALY_EVENT_COOLDOWN_MINUTES = 5
+SENSOR_STALE_SECONDS = 60
+WATCHDOG_DEFAULT_TRAY_ID = "tray_1"
+WATCHDOG_DEFAULT_NORM_RANGES = {
+    "air_temp": (18.0, 28.0),
+    "humidity": (50.0, 75.0),
+    "water_temp": (18.0, 24.0),
+    "ph": (5.5, 6.8),
+    "ec": (0.8, 2.2),
+}
+WATCHDOG_METRIC_CONFIG = {
+    "air_temp": {
+        "sensor_type": "climate",
+        "low_event_type": "air_overcooling",
+        "high_event_type": "air_overheat",
+    },
+    "humidity": {
+        "sensor_type": "climate",
+        "low_event_type": "low_humidity",
+        "high_event_type": "high_humidity",
+    },
+    "water_temp": {
+        "sensor_type": "water",
+        "low_event_type": "water_overcooling",
+        "high_event_type": "water_overheat",
+    },
+    "ph": {
+        "sensor_type": "water",
+        "low_event_type": "ph_low",
+        "high_event_type": "ph_high",
+    },
+    "ec": {
+        "sensor_type": "water",
+        "low_event_type": "ec_low",
+        "high_event_type": "ec_high",
+    },
+}
 ADVISOR_HISTORY_HOURS = 24
 AI_CONTEXT_NORM_KEYS = (
     "air_temp",
@@ -142,21 +179,6 @@ CROP_ALIASES: dict[str, tuple[str, ...]] = {
     "dill": ("dill", "укроп"),
     "pak_choi": ("pak_choi", "pak choi", "pak-choi", "пак-чой", "пак чой"),
     "chard": ("chard", "мангольд"),
-    # Корнеплодный редис и полноценный горох не подменяем микрозеленью.
-    "microgreen_radish": (
-        "microgreen_radish",
-        "microgreen radish",
-        "микрозелень редиса",
-        "редисная микрозелень",
-    ),
-    "microgreen_pea": (
-        "microgreen_pea",
-        "microgreen pea",
-        "микрозелень гороха",
-        "гороховая микрозелень",
-        "гороховые побеги",
-        "побеги гороха",
-    ),
 }
 
 
@@ -171,7 +193,7 @@ CITY_FARM_COMPATIBLE_CROP_ALIASES: dict[str, tuple[str, ...]] = {
     "parsley": ("петрушка", "parsley"),
     "pak_choi": ("пак-чой", "пак чой", "pak choi", "bok choy"),
     "chard": ("мангольд", "chard", "swiss chard"),
-    "microgreens": ("микрозелень", "microgreens", "микрозелень редиса", "микрозелень гороха"),
+    "microgreens": ("микрозелень", "microgreens"),
 }
 
 
@@ -397,23 +419,13 @@ def is_crop_follow_up_message(message: str) -> bool:
 def is_root_radish_question(message: str) -> bool:
     normalized_message = message.lower().replace("ё", "е")
     asks_about_radish = re.search(r"(?<![\w])редис[а-я]*(?![\w])", normalized_message, re.IGNORECASE)
-    asks_about_microgreen = re.search(
-        r"микрозелень\s+редиса|редисная\s+микрозелень",
-        normalized_message,
-        re.IGNORECASE,
-    )
-    return bool(asks_about_radish and not asks_about_microgreen)
+    return bool(asks_about_radish)
 
 
 def is_regular_pea_question(message: str) -> bool:
     normalized_message = message.lower().replace("ё", "е")
     asks_about_pea = re.search(r"(?<![\w])горох[а-я]*(?![\w])", normalized_message, re.IGNORECASE)
-    asks_about_microgreen_or_shoots = re.search(
-        r"микрозелень\s+гороха|гороховая\s+микрозелень|гороховые\s+побеги|побеги\s+гороха|побег",
-        normalized_message,
-        re.IGNORECASE,
-    )
-    return bool(asks_about_pea and not asks_about_microgreen_or_shoots)
+    return bool(asks_about_pea)
 
 
 def build_unsupported_crop_context(message: str) -> str:
@@ -421,17 +433,13 @@ def build_unsupported_crop_context(message: str) -> str:
 
     if is_root_radish_question(message):
         notes.append(
-            "Корнеплодный редис не является базовой культурой маленькой сити-фермы "
-            "в текущей БД АгроТехКарт. Не выдавай его нормы как нормы microgreen_radish. "
-            "Объясни пользователю, что вместо корнеплодного редиса в этой установке "
-            "поддерживается микрозелень редиса."
+            "Редис и микрозелень редиса удалены из дипломной базы культур. "
+            "Не выдавай нормы редиса как нормы другой культуры и не предлагай замену на его микрозелень."
         )
     if is_regular_pea_question(message):
         notes.append(
-            "Полноценный горох не является базовой культурой маленькой сити-фермы "
-            "в текущей БД АгроТехКарт. Не выдавай его нормы как нормы microgreen_pea. "
-            "Объясни пользователю, что в этой установке можно выращивать микрозелень "
-            "или побеги гороха."
+            "Горох, микрозелень гороха и побеги гороха удалены из дипломной базы культур. "
+            "Не выдавай нормы гороха как нормы другой культуры и не предлагай замену на его микрозелень."
         )
 
     if not notes:
@@ -530,65 +538,178 @@ def get_record_tray_id(record: dict[str, Any]) -> str:
     return "unknown"
 
 
-def build_anomaly_events(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not records:
-        return []
+def record_sort_value(record: dict[str, Any]) -> Any:
+    recorded_at = record.get("recorded_at")
+    if isinstance(recorded_at, datetime):
+        return (0, recorded_at)
+    return (1, record.get("id") or 0, str(record.get("timestamp") or ""))
 
-    latest_record = records[-1]
-    latest_payload = latest_record.get("parsed_payload", {})
-    if not isinstance(latest_payload, dict):
-        latest_payload = {}
 
+def sorted_watchdog_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(records, key=record_sort_value)
+
+
+def watchdog_tray_id(*record_groups: list[dict[str, Any]]) -> str:
+    for records in record_groups:
+        for record in reversed(records):
+            tray_id = get_record_tray_id(record)
+            if tray_id != "unknown":
+                return tray_id
+    return WATCHDOG_DEFAULT_TRAY_ID
+
+
+def build_watchdog_norm_ranges(active_ranges: dict[str, tuple[float, float]] | None) -> dict[str, tuple[float, float]]:
+    ranges = dict(WATCHDOG_DEFAULT_NORM_RANGES)
+    if active_ranges:
+        ranges.update(active_ranges)
+    return ranges
+
+
+def sensor_record_age_seconds(record: dict[str, Any] | None) -> float | None:
+    if not record:
+        return None
+
+    recorded_at = record.get("recorded_at")
+    if not isinstance(recorded_at, datetime):
+        return None
+
+    now = datetime.now(recorded_at.tzinfo) if recorded_at.tzinfo else datetime.now()
+    return max(0.0, (now - recorded_at).total_seconds())
+
+
+def append_stale_sensor_event(
+    events: list[dict[str, Any]],
+    *,
+    records: list[dict[str, Any]],
+    tray_id: str,
+    sensor_type: str,
+    event_type: str,
+) -> None:
+    latest_record = records[-1] if records else None
+    age_seconds = sensor_record_age_seconds(latest_record)
+    if latest_record is not None and (age_seconds is None or age_seconds <= SENSOR_STALE_SECONDS):
+        return
+
+    recorded_at = latest_record.get("recorded_at") if latest_record else None
+    events.append(
+        {
+            "tray_id": tray_id,
+            "sensor_type": sensor_type,
+            "event_type": event_type,
+            "metric_name": None,
+            "severity": "warning",
+            "value": None,
+            "message": f"Устаревшие данные датчика {sensor_type}",
+            "payload": {
+                "age_seconds": age_seconds,
+                "stale_after_seconds": SENSOR_STALE_SECONDS,
+                "last_recorded_at": recorded_at.isoformat() if isinstance(recorded_at, datetime) else None,
+            },
+        }
+    )
+
+
+def build_metric_anomaly_event(
+    *,
+    tray_id: str,
+    metric_name: str,
+    value: float,
+    limit: float,
+    direction: Literal["low", "high"],
+    event_type: str,
+    sensor_type: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    relation = "<" if direction == "low" else ">"
+    return {
+        "tray_id": tray_id,
+        "sensor_type": sensor_type,
+        "event_type": event_type,
+        "metric_name": metric_name,
+        "severity": "warning",
+        "value": float(value),
+        "message": f"{metric_name} вне нормы: {value} {relation} {limit}",
+        "payload": payload,
+    }
+
+
+def build_anomaly_events(
+    climate_records: list[dict[str, Any]],
+    water_records: list[dict[str, Any]] | None = None,
+    norm_ranges: dict[str, tuple[float, float]] | None = None,
+) -> list[dict[str, Any]]:
+    water_records = water_records or []
+    climate_records = sorted_watchdog_records(climate_records)
+    water_records = sorted_watchdog_records(water_records)
+    all_records = sorted_watchdog_records([*climate_records, *water_records])
+    ranges = build_watchdog_norm_ranges(norm_ranges)
     events: list[dict[str, Any]] = []
-    tray_id = get_record_tray_id(latest_record)
-    air_temp = latest_payload.get("air_temp")
-    humidity = latest_payload.get("humidity")
+    tray_id = watchdog_tray_id(climate_records, water_records)
 
-    if isinstance(air_temp, (int, float)) and air_temp > 28:
-        events.append(
-            {
-                "tray_id": tray_id,
-                "sensor_type": "climate",
-                "event_type": "air_overheat",
-                "metric_name": "air_temp",
-                "severity": "warning",
-                "value": float(air_temp),
-                "message": f"Перегрев воздуха: air_temp={air_temp}",
-                "payload": latest_payload,
-            }
-        )
+    append_stale_sensor_event(
+        events,
+        records=climate_records,
+        tray_id=tray_id,
+        sensor_type="climate",
+        event_type="stale_climate_data",
+    )
+    append_stale_sensor_event(
+        events,
+        records=water_records,
+        tray_id=tray_id,
+        sensor_type="water",
+        event_type="stale_water_data",
+    )
 
-    if isinstance(air_temp, (int, float)) and air_temp < 18:
-        events.append(
-            {
-                "tray_id": tray_id,
-                "sensor_type": "climate",
-                "event_type": "air_overcooling",
-                "metric_name": "air_temp",
-                "severity": "warning",
-                "value": float(air_temp),
-                "message": f"Переохлаждение воздуха: air_temp={air_temp}",
-                "payload": latest_payload,
-            }
-        )
+    if all_records:
+        snapshot = latest_metric_snapshot(all_records)
+        payload = {
+            "latest_values": {
+                metric_name: snapshot.get(metric_name)
+                for metric_name in WATCHDOG_METRIC_CONFIG
+            },
+            "norm_ranges": {
+                metric_name: {"min": metric_range[0], "max": metric_range[1]}
+                for metric_name, metric_range in ranges.items()
+            },
+        }
 
-    if isinstance(humidity, (int, float)) and humidity < 50:
-        events.append(
-            {
-                "tray_id": tray_id,
-                "sensor_type": "climate",
-                "event_type": "low_humidity",
-                "metric_name": "humidity",
-                "severity": "warning",
-                "value": float(humidity),
-                "message": f"Низкая влажность: humidity={humidity}",
-                "payload": latest_payload,
-            }
-        )
+        for metric_name, config in WATCHDOG_METRIC_CONFIG.items():
+            value = snapshot.get(metric_name)
+            if not isinstance(value, (int, float)):
+                continue
 
-    if len(records) >= 3:
-        first_payload = records[0].get("parsed_payload", {})
-        last_payload = records[-1].get("parsed_payload", {})
+            low, high = ranges[metric_name]
+            if value < low:
+                events.append(
+                    build_metric_anomaly_event(
+                        tray_id=tray_id,
+                        metric_name=metric_name,
+                        value=float(value),
+                        limit=low,
+                        direction="low",
+                        event_type=str(config["low_event_type"]),
+                        sensor_type=str(config["sensor_type"]),
+                        payload=payload,
+                    )
+                )
+            elif value > high:
+                events.append(
+                    build_metric_anomaly_event(
+                        tray_id=tray_id,
+                        metric_name=metric_name,
+                        value=float(value),
+                        limit=high,
+                        direction="high",
+                        event_type=str(config["high_event_type"]),
+                        sensor_type=str(config["sensor_type"]),
+                        payload=payload,
+                    )
+                )
+
+    if len(climate_records) >= 3:
+        first_payload = climate_records[0].get("parsed_payload", {})
+        last_payload = climate_records[-1].get("parsed_payload", {})
         if isinstance(first_payload, dict) and isinstance(last_payload, dict):
             first_temp = first_payload.get("air_temp")
             last_temp = last_payload.get("air_temp")
@@ -609,7 +730,7 @@ def build_anomaly_events(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             "payload": {
                                 "first_air_temp": first_temp,
                                 "last_air_temp": last_temp,
-                                "latest_payload": latest_payload,
+                                "latest_payload": last_payload,
                             },
                         }
                     )
@@ -1712,9 +1833,12 @@ async def internal_watchdog() -> None:
 
     while True:
         try:
-            records = await asyncio.to_thread(get_last_climate_records, 3)
-            anomalies = detect_anomalies(records)
-            anomaly_events = build_anomaly_events(records)
+            climate_records = await asyncio.to_thread(get_last_climate_records, 3)
+            water_records = await asyncio.to_thread(get_last_water_records, 3)
+            tray_id = watchdog_tray_id(climate_records, water_records)
+            active_norm_ranges = await asyncio.to_thread(get_active_cycle_norm_ranges, tray_id)
+            anomaly_events = build_anomaly_events(climate_records, water_records, active_norm_ranges)
+            anomalies = [event["message"] for event in anomaly_events]
 
             if anomalies:
                 in_alert_mode = True

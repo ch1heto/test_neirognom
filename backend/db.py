@@ -52,12 +52,21 @@ BASE_CATALOG_ITEMS = (
     ("anomaly_type", "air_overheat", "Перегрев воздуха", None),
     ("anomaly_type", "air_overcooling", "Переохлаждение воздуха", None),
     ("anomaly_type", "low_humidity", "Низкая влажность", None),
+    ("anomaly_type", "high_humidity", "Высокая влажность", None),
     ("anomaly_type", "rapid_air_temp_rise", "Быстрый рост температуры воздуха", None),
     ("anomaly_type", "low_ph", "pH ниже нормы", None),
     ("anomaly_type", "high_ph", "pH выше нормы", None),
+    ("anomaly_type", "ph_low", "pH ниже нормы", None),
+    ("anomaly_type", "ph_high", "pH выше нормы", None),
     ("anomaly_type", "low_ec", "EC ниже нормы", None),
     ("anomaly_type", "high_ec", "EC выше нормы", None),
+    ("anomaly_type", "ec_low", "EC ниже нормы", None),
+    ("anomaly_type", "ec_high", "EC выше нормы", None),
+    ("anomaly_type", "water_overheat", "Перегрев воды", None),
+    ("anomaly_type", "water_overcooling", "Переохлаждение воды", None),
     ("anomaly_type", "stale_sensor_data", "Данные датчиков устарели", None),
+    ("anomaly_type", "stale_climate_data", "Данные климатических датчиков устарели", None),
+    ("anomaly_type", "stale_water_data", "Данные водных датчиков устарели", None),
 )
 BASE_CATALOG_ITEM_BY_CODE = {item[1]: item for item in BASE_CATALOG_ITEMS}
 NON_CROP_CARD_FILES = {"crops_index.md", "project_recommendations.md"}
@@ -3418,6 +3427,38 @@ def get_last_climate_records(limit: int = 3) -> list[dict[str, Any]]:
                     row,
                     build_payload_from_telemetry_values(cursor, row["id"]),
                 )
+                record["recorded_at"] = row["recorded_at"]
+                if isinstance(record.get("parsed_payload"), dict):
+                    records.append(record)
+            return records
+
+
+def get_last_water_records(limit: int = 3) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT telemetry_readings.id, telemetry_readings.topic, telemetry_readings.recorded_at
+                FROM telemetry_readings
+                LEFT JOIN catalog_items
+                  ON catalog_items.id = telemetry_readings.sensor_type_id
+                 AND catalog_items.category = 'sensor_type'
+                WHERE catalog_items.code = 'water'
+                   OR telemetry_readings.topic = %s
+                   OR telemetry_readings.topic LIKE %s
+                ORDER BY telemetry_readings.id DESC
+                LIMIT %s
+                """,
+                (WATER_TOPIC, "%/water", limit),
+            )
+            rows = cursor.fetchall()
+            records: list[dict[str, Any]] = []
+            for row in reversed(rows):
+                record = row_to_normalized_telemetry_record(
+                    row,
+                    build_payload_from_telemetry_values(cursor, row["id"]),
+                )
+                record["recorded_at"] = row["recorded_at"]
                 if isinstance(record.get("parsed_payload"), dict):
                     records.append(record)
             return records
@@ -3702,7 +3743,7 @@ def delete_old_raw_data(retention_hours: int = 24) -> int:
 def save_anomaly_event(
     *,
     tray_id: str | None,
-    metric_name: str,
+    metric_name: str | None,
     severity: str,
     value: float | None,
     message: str,

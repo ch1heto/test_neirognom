@@ -736,15 +736,20 @@ export default function App() {
               </div>
 
               <div className="mt-5 grid min-w-0 flex-1 items-center gap-5 md:grid-cols-[112px_minmax(0,1fr)]">
-                <div className={`mx-auto flex aspect-square w-[112px] items-center justify-center rounded-[28px] border border-emerald-300/18 bg-gradient-to-br ${previewVisual.gradient} text-[58px] shadow-[0_0_34px_rgba(52,211,153,0.10)]`}>
+                <div className={`mx-auto flex aspect-square w-[112px] items-center justify-center overflow-hidden rounded-[28px] border border-emerald-300/18 bg-gradient-to-br ${previewVisual.gradient} shadow-[0_0_34px_rgba(52,211,153,0.10)]`}>
                   {previewVisual.image ? (
                     <img
                       src={previewVisual.image}
-                      alt={activeCropName}
-                      className="h-24 w-24 object-contain drop-shadow-[0_0_28px_rgba(52,211,153,0.22)]"
+                      alt=""
+                      aria-hidden="true"
+                      className="h-[92px] w-[92px] object-contain drop-shadow-[0_0_28px_rgba(52,211,153,0.22)]"
+                      loading="lazy"
+                      draggable="false"
                     />
                   ) : (
-                    previewVisual.emoji
+                    <span className="text-[58px] leading-none">
+                      {previewVisual.emoji || '?'}
+                    </span>
                   )}
                 </div>
 
