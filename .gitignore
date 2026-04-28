@@ -11,6 +11,10 @@ frontend/dist/
 # Env
 .env
 *.env
+!deploy/env.prod.example
+
+# Deploy secrets
+deploy/mosquitto/passwd
 
 # Database
 *.db

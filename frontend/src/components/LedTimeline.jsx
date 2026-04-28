@@ -5,20 +5,25 @@ export default function LedTimeline({
   stages,
   activeIndex,
   isPlaying,
+  isStarting = false,
+  progress = 0,
+  statusText,
   onPlay,
   compact = false,
 }) {
+  const normalizedProgress = Math.min(100, Math.max(0, progress * 100))
   const playButton = (
     <button
       type="button"
       onClick={onPlay}
-      className="group flex w-full shrink-0 items-center justify-center gap-3 whitespace-nowrap rounded-[20px] border border-violet-200/18 bg-gradient-to-r from-violet-500/75 to-fuchsia-500/65 px-4 py-3 text-sm font-medium text-white transition hover:scale-[1.01] hover:brightness-110 md:px-7 lg:w-[270px]"
+      disabled={isStarting}
+      className="group flex w-full shrink-0 items-center justify-center gap-3 whitespace-nowrap rounded-[20px] border border-violet-200/18 bg-gradient-to-r from-violet-500/75 to-fuchsia-500/65 px-4 py-3 text-sm font-medium text-white transition hover:scale-[1.01] hover:brightness-110 disabled:cursor-wait disabled:opacity-70 md:px-7 lg:w-[270px]"
       style={{ boxShadow: '0 18px 36px rgba(173, 78, 255, 0.24)' }}
     >
       <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/14">
         <PlayIcon className="h-4 w-4" />
       </span>
-      {isPlaying ? 'Сценарий работает…' : 'Запустить сценарий'}
+      {isStarting ? 'Отправляю команду…' : isPlaying ? 'Световой день идёт' : 'Запустить световой день'}
     </button>
   )
 
@@ -31,7 +36,7 @@ export default function LedTimeline({
           </div>
 
           <p className="mt-1.5 text-sm text-white/64">
-            Сценарий последовательно включает LED1 → LED10 и имитирует световой день в реальном макете.
+            {statusText ? `Стадия: ${statusText}` : 'Стадия: ожидание'}
           </p>
         </div>
 
@@ -84,6 +89,13 @@ export default function LedTimeline({
             )
           })}
         </div>
+      </div>
+
+      <div className="mt-4 h-[5px] overflow-hidden rounded-full bg-white/8">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-yellow-300 to-fuchsia-400 transition-[width] duration-150"
+          style={{ width: `${normalizedProgress}%` }}
+        />
       </div>
 
       {!compact && (

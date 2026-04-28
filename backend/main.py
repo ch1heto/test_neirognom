@@ -3,6 +3,8 @@ import asyncio
 import json
 import os
 import re
+import threading
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
@@ -35,7 +37,10 @@ load_dotenv(BASE_DIR.parent / ".env")
 
 BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
+BROKER_USERNAME = os.getenv("BROKER_USERNAME", "").strip()
+BROKER_PASSWORD = os.getenv("BROKER_PASSWORD", "")
 SENSORS_TOPIC = "farm/+/sensors/#"
+DEVICE_STATUS_TOPIC = "farm/+/status/#"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
 client = AsyncOpenAI(
     api_key=POLZA_API_KEY,
@@ -48,7 +53,11 @@ KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
 }
-KNOWN_DEVICE_TYPES = {"pump", "light", "fan"}
+KNOWN_DEVICE_TYPES = {"pump", "light", "fan", "humidifier"}
+DEFAULT_DAY_SCENARIO_DURATION_MS = 15_000
+DEFAULT_DAY_SCENARIO_START_DELAY_MS = 1_200
+DEVICE_STATUS_BY_TARGET: dict[str, dict[str, Any]] = {}
+DEVICE_STATUS_LOCK = threading.Lock()
 HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
 RAW_RETENTION_HOURS = 24
 ANOMALY_EVENT_COOLDOWN_MINUTES = 5
@@ -741,9 +750,94 @@ def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None)
     return "\n\n".join(prompt_parts)
 
 
+def normalize_device_status(raw_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw_status = raw_status or {}
+    day_start_at_ms = raw_status.get("day_start_at_ms", raw_status.get("day_started_at_ms"))
+    day_duration_ms = raw_status.get("day_duration_ms", DEFAULT_DAY_SCENARIO_DURATION_MS)
+    day_scenario_running = bool(raw_status.get("day_scenario_running", False))
+    day_scenario_pending = bool(raw_status.get("day_scenario_pending", False))
+    light = bool(raw_status.get("light", False))
+
+    if (
+        (day_scenario_running or day_scenario_pending)
+        and isinstance(day_start_at_ms, (int, float))
+        and day_start_at_ms > 0
+        and isinstance(day_duration_ms, (int, float))
+    ):
+        if int(time.time() * 1000) >= int(day_start_at_ms) + int(day_duration_ms):
+            day_scenario_running = False
+            day_scenario_pending = False
+            light = False
+
+    return {
+        "pump": bool(raw_status.get("pump", False)),
+        "fan": bool(raw_status.get("fan", False)),
+        "light": light,
+        "humidifier": bool(raw_status.get("humidifier", False)),
+        "day_scenario_running": day_scenario_running,
+        "day_scenario_pending": day_scenario_pending,
+        "day_stage": raw_status.get("day_stage"),
+        "day_start_at_ms": day_start_at_ms,
+        "day_duration_ms": day_duration_ms,
+        "availability": raw_status.get("availability", "unknown"),
+        "updated_at_ms": raw_status.get("updated_at_ms"),
+    }
+
+
+def get_device_status_snapshot(target_id: str) -> dict[str, Any]:
+    with DEVICE_STATUS_LOCK:
+        status = normalize_device_status(DEVICE_STATUS_BY_TARGET.get(target_id))
+
+    status["target_id"] = target_id
+    status["server_now_ms"] = int(time.time() * 1000)
+    return status
+
+
+def merge_device_status(target_id: str, status_patch: dict[str, Any]) -> None:
+    with DEVICE_STATUS_LOCK:
+        current = DEVICE_STATUS_BY_TARGET.get(target_id, {})
+        current.update(status_patch)
+        current["updated_at_ms"] = int(time.time() * 1000)
+        DEVICE_STATUS_BY_TARGET[target_id] = current
+
+
+def parse_mqtt_json_payload(payload: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def handle_device_status_message(topic: str, payload: str) -> None:
+    parts = topic.split("/")
+    if len(parts) < 4 or parts[0] != "farm" or parts[2] != "status":
+        return
+
+    target_id = parts[1]
+    status_type = parts[3]
+
+    if status_type == "availability":
+        merge_device_status(target_id, {"availability": payload.strip()})
+        return
+
+    if status_type != "devices":
+        return
+
+    parsed_payload = parse_mqtt_json_payload(payload)
+    if parsed_payload is None:
+        return
+
+    normalized_payload = normalize_device_status(parsed_payload)
+    if "availability" not in parsed_payload:
+        normalized_payload.pop("availability", None)
+    merge_device_status(target_id, normalized_payload)
+
+
 def on_connect(client, userdata, flags, reason_code, properties) -> None:
     if reason_code == 0:
         client.subscribe(SENSORS_TOPIC)
+        client.subscribe(DEVICE_STATUS_TOPIC)
     else:
         print(f"[БЭКЕНД] Ошибка подключения к MQTT: {reason_code}")
 
@@ -754,6 +848,9 @@ def on_message(client, userdata, msg) -> None:
 
     if "sensors" in msg.topic and msg.topic in KNOWN_SENSOR_TOPICS:
         save_telemetry(msg.topic, payload)
+
+    if len(parts) >= 4 and parts[2] == "status":
+        handle_device_status_message(msg.topic, payload)
 
     if len(parts) >= 3:
         device_id = parts[1]
@@ -819,6 +916,8 @@ async def lifespan(app: FastAPI):
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="backend_service")
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
+    if BROKER_USERNAME:
+        mqtt_client.username_pw_set(BROKER_USERNAME, BROKER_PASSWORD or None)
     mqtt_client.connect(BROKER_HOST, BROKER_PORT, 60)
     mqtt_client.loop_start()
 
@@ -852,9 +951,15 @@ app.add_middleware(
 
 class DeviceControlRequest(BaseModel):
     target_id: str
-    device_type: Literal["pump", "light", "fan"]
+    device_type: Literal["pump", "light", "fan", "humidifier"]
     state: Literal["ON", "OFF", "TIMER"]
     duration: float | None = None
+
+
+class LightDayScenarioRequest(BaseModel):
+    target_id: str = "tray_1"
+    duration_ms: int = DEFAULT_DAY_SCENARIO_DURATION_MS
+    start_delay_ms: int = DEFAULT_DAY_SCENARIO_START_DELAY_MS
 
 
 class ChatRequest(BaseModel):
@@ -904,12 +1009,74 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
         payload = f"TIMER {request.duration:g}"
 
     app.state.mqtt_client.publish(topic, payload)
+    if request.state in {"ON", "OFF"}:
+        merge_device_status(
+            request.target_id,
+            {
+                request.device_type: request.state == "ON",
+                **(
+                    {
+                        "day_scenario_running": False,
+                        "day_scenario_pending": False,
+                        "day_start_at_ms": None,
+                    }
+                    if request.device_type == "light" and request.state == "OFF"
+                    else {}
+                ),
+            },
+        )
     return {
         "status": "sent",
         "target_id": request.target_id,
         "device_type": request.device_type,
         "state": request.state,
         "payload": payload,
+    }
+
+
+@app.get("/api/device/status")
+def get_device_status(target_id: str = Query(default="tray_1")) -> dict[str, Any]:
+    return get_device_status_snapshot(target_id)
+
+
+@app.post("/api/light/day")
+def start_light_day_scenario(request: LightDayScenarioRequest) -> dict[str, Any]:
+    duration_ms = max(1_000, min(int(request.duration_ms), 24 * 60 * 60 * 1000))
+    start_delay_ms = max(0, min(int(request.start_delay_ms), 60_000))
+    server_now_ms = int(time.time() * 1000)
+    start_at_ms = server_now_ms + start_delay_ms
+    topic = f"farm/{request.target_id}/cmd/light"
+    payload_data = {
+        "command": "DAY_SCENARIO",
+        "start_at_ms": start_at_ms,
+        "start_in_ms": start_delay_ms,
+        "duration_ms": duration_ms,
+        "stage_count": 10,
+    }
+    payload = json.dumps(payload_data, ensure_ascii=False, separators=(",", ":"))
+
+    app.state.mqtt_client.publish(topic, payload)
+    merge_device_status(
+        request.target_id,
+        {
+            "light": True,
+            "day_scenario_running": True,
+            "day_scenario_pending": True,
+            "day_stage": 0,
+            "day_start_at_ms": start_at_ms,
+            "day_duration_ms": duration_ms,
+        },
+    )
+
+    return {
+        "status": "sent",
+        "target_id": request.target_id,
+        "topic": topic,
+        "payload": payload_data,
+        "server_now_ms": server_now_ms,
+        "start_at_ms": start_at_ms,
+        "start_delay_ms": start_delay_ms,
+        "duration_ms": duration_ms,
     }
 
 

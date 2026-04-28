@@ -22,11 +22,15 @@ import {
 } from './components/Icons'
 
 const API_BASE_URL =
-  window.location.hostname === 'localhost'
-    ? 'http://localhost:8000'
-    : `${window.location.protocol}//${window.location.hostname}:8000`
+  import.meta.env.VITE_API_BASE_URL?.trim() ??
+  (window.location.hostname === 'localhost' ? 'http://localhost:8000' : '')
 const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
+const DEVICE_STATUS_POLL_INTERVAL_MS = 2000
+const DAY_SCENARIO_DURATION_MS = 15000
+const DAY_SCENARIO_START_DELAY_MS = 1200
+const LED_ANIMATION_FRAME_MS = 120
+const LED_IDLE_STAGE_INDEX = ledStages.length - 1
 
 const CHAT_THINKING_STEPS = [
   'Получен запрос пользователя',
@@ -76,6 +80,27 @@ function toNumberOrFallback(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function getLedStageIndex(nowMs, startAtMs, durationMs) {
+  if (!Number.isFinite(startAtMs) || !Number.isFinite(durationMs) || durationMs <= 0) {
+    return LED_IDLE_STAGE_INDEX
+  }
+
+  const elapsed = nowMs - startAtMs
+  if (elapsed <= 0) return 0
+  if (elapsed >= durationMs) return LED_IDLE_STAGE_INDEX
+
+  return Math.min(LED_IDLE_STAGE_INDEX, Math.floor((elapsed / durationMs) * LED_IDLE_STAGE_INDEX))
+}
+
+function getLedProgress(nowMs, startAtMs, durationMs) {
+  if (!Number.isFinite(startAtMs) || !Number.isFinite(durationMs) || durationMs <= 0) {
+    return 0
+  }
+
+  const progress = (nowMs - startAtMs) / durationMs
+  return Math.min(1, Math.max(0, progress))
+}
+
 function buildChatHistory(messages, userMessage) {
   return [...messages, userMessage].map((message) => ({
     role: message.from === 'assistant' ? 'assistant' : 'user',
@@ -120,6 +145,7 @@ export default function App() {
     fans: { title: 'Вентиляция', subtitle: 'Обдув', level: 0, enabled: false },
     lights: { title: 'Освещение', subtitle: 'Фитолампы', level: 0, enabled: false },
     pumps: { title: 'Полив', subtitle: 'Насосы', level: 0, enabled: false },
+    humidifiers: { title: 'Увлажнитель', subtitle: 'Влажность воздуха', level: 0, enabled: false },
     led: { title: 'LED', scenario: 'Ожидание' }
   })
   const [thoughts, setThoughts] = useState([])
@@ -128,8 +154,15 @@ export default function App() {
   const [isChatThinking, setIsChatThinking] = useState(false)
   const [currentTime, setCurrentTime] = useState(formatTime())
   const [currentDate, setCurrentDate] = useState(formatDate())
-  const [activeLedStage, setActiveLedStage] = useState(5)
+  const [activeLedStage, setActiveLedStage] = useState(LED_IDLE_STAGE_INDEX)
   const [isLedPlaying, setIsLedPlaying] = useState(false)
+  const [isStartingDayScenario, setIsStartingDayScenario] = useState(false)
+  const [serverClockOffsetMs, setServerClockOffsetMs] = useState(0)
+  const [ledScenario, setLedScenario] = useState({
+    startAtMs: null,
+    durationMs: DAY_SCENARIO_DURATION_MS,
+    progress: 0,
+  })
 
   const pushThought = (text) => {
     const item = {
@@ -232,30 +265,105 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    let isMounted = true
+
+    const loadDeviceStatus = async () => {
+      try {
+        const data = await requestJson('/api/device/status?target_id=tray_1')
+        if (!isMounted) return
+
+        const nextOffsetMs = Number.isFinite(Number(data.server_now_ms))
+          ? Number(data.server_now_ms) - Date.now()
+          : 0
+        setServerClockOffsetMs(nextOffsetMs)
+
+        setDevices((prev) => ({
+          ...prev,
+          fans: { ...prev.fans, enabled: Boolean(data.fan) },
+          lights: { ...prev.lights, enabled: Boolean(data.light) },
+          pumps: { ...prev.pumps, enabled: Boolean(data.pump) },
+          humidifiers: { ...prev.humidifiers, enabled: Boolean(data.humidifier) },
+        }))
+
+        const startAtMs = Number(data.day_start_at_ms)
+        const durationMs = Number(data.day_duration_ms) || DAY_SCENARIO_DURATION_MS
+
+        if (data.day_scenario_running && Number.isFinite(startAtMs) && startAtMs > 0) {
+          const nowMs = Date.now() + nextOffsetMs
+          const stageIndex = getLedStageIndex(nowMs, startAtMs, durationMs)
+          const progress = getLedProgress(nowMs, startAtMs, durationMs)
+
+          setIsLedPlaying(true)
+          setActiveLedStage(stageIndex)
+          setLedScenario({
+            startAtMs,
+            durationMs,
+            progress,
+          })
+          setDevices((prev) => ({
+            ...prev,
+            led: {
+              ...prev.led,
+              scenario: nowMs < startAtMs ? 'Ожидание старта' : ledStages[stageIndex].label,
+            },
+          }))
+        } else if (!data.day_scenario_running && !isStartingDayScenario) {
+          setIsLedPlaying(false)
+          setLedScenario((prev) => ({ ...prev, progress: 0 }))
+        }
+      } catch (error) {
+        console.error('Failed to load device status', error)
+      }
+    }
+
+    loadDeviceStatus()
+    const statusPoller = setInterval(loadDeviceStatus, DEVICE_STATUS_POLL_INTERVAL_MS)
+
+    return () => {
+      isMounted = false
+      clearInterval(statusPoller)
+    }
+  }, [isStartingDayScenario])
+
+  useEffect(() => {
     if (!isLedPlaying) return undefined
 
-    const interval = setInterval(() => {
-      setActiveLedStage((prev) => {
-        const next = prev + 1 > ledStages.length - 1 ? 0 : prev + 1
+    const updateLedTimeline = () => {
+      const startAtMs = Number(ledScenario.startAtMs)
+      const durationMs = Number(ledScenario.durationMs) || DAY_SCENARIO_DURATION_MS
+      const nowMs = Date.now() + serverClockOffsetMs
+      const progress = getLedProgress(nowMs, startAtMs, durationMs)
+      const stageIndex = getLedStageIndex(nowMs, startAtMs, durationMs)
+
+      setActiveLedStage(stageIndex)
+      setLedScenario((prev) => ({ ...prev, progress }))
+      setDevices((current) => ({
+        ...current,
+        led: {
+          ...current.led,
+          scenario: nowMs < startAtMs ? 'Ожидание старта' : ledStages[stageIndex].label,
+        },
+      }))
+
+      if (nowMs >= startAtMs + durationMs) {
+        setIsLedPlaying(false)
         setDevices((current) => ({
           ...current,
           led: {
             ...current.led,
-            scenario: ledStages[next].label,
+            scenario: 'Завершён',
           },
         }))
-        pushThought(`LED сценарий перешёл на ${ledStages[next].id} — ${ledStages[next].label.toLowerCase()}.`)
-        return next
-      })
-    }, 850)
+      }
+    }
 
-    const stop = setTimeout(() => setIsLedPlaying(false), 850 * ledStages.length + 250)
+    updateLedTimeline()
+    const interval = setInterval(updateLedTimeline, LED_ANIMATION_FRAME_MS)
 
     return () => {
       clearInterval(interval)
-      clearTimeout(stop)
     }
-  }, [isLedPlaying])
+  }, [isLedPlaying, ledScenario.startAtMs, ledScenario.durationMs, serverClockOffsetMs])
 
   const metricsList = useMemo(
     () => [
@@ -295,12 +403,14 @@ export default function App() {
       fans: 'fan',
       lights: 'light',
       pumps: 'pump',
+      humidifiers: 'humidifier',
     }[key]
 
     const deviceLabel = {
       fans: 'вентиляторы',
       lights: 'освещение',
       pumps: 'насосы',
+      humidifiers: 'увлажнитель',
     }[key]
 
     setDevices((prev) => ({
@@ -320,6 +430,11 @@ export default function App() {
           state: enabled ? 'ON' : 'OFF',
         }),
       })
+      if (deviceType === 'light' && !enabled) {
+        setIsLedPlaying(false)
+        setActiveLedStage(LED_IDLE_STAGE_INDEX)
+        setLedScenario((prev) => ({ ...prev, progress: 0 }))
+      }
       pushThought(`${enabled ? 'Включаю' : 'Выключаю'} ${deviceLabel}.`)
     } catch (error) {
       console.error(`Failed to toggle ${deviceType}`, error)
@@ -331,6 +446,53 @@ export default function App() {
         },
       }))
       pushThought(`Не удалось отправить команду на ${deviceLabel}.`)
+    }
+  }
+
+  const handleStartDayScenario = async () => {
+    if (isStartingDayScenario) return
+
+    setIsStartingDayScenario(true)
+
+    try {
+      const data = await requestJson('/api/light/day', {
+        method: 'POST',
+        body: JSON.stringify({
+          target_id: 'tray_1',
+          duration_ms: DAY_SCENARIO_DURATION_MS,
+          start_delay_ms: DAY_SCENARIO_START_DELAY_MS,
+        }),
+      })
+
+      const rawOffsetMs = Number(data.server_now_ms) - Date.now()
+      const nextOffsetMs = Number.isFinite(rawOffsetMs) ? rawOffsetMs : 0
+      const startAtMs = Number(data.start_at_ms)
+      const durationMs = Number(data.duration_ms) || DAY_SCENARIO_DURATION_MS
+      const nowMs = Date.now() + nextOffsetMs
+      const stageIndex = getLedStageIndex(nowMs, startAtMs, durationMs)
+
+      setServerClockOffsetMs(nextOffsetMs)
+      setActiveLedStage(stageIndex)
+      setIsLedPlaying(true)
+      setLedScenario({
+        startAtMs,
+        durationMs,
+        progress: getLedProgress(nowMs, startAtMs, durationMs),
+      })
+      setDevices((prev) => ({
+        ...prev,
+        lights: { ...prev.lights, enabled: true },
+        led: {
+          ...prev.led,
+          scenario: nowMs < startAtMs ? 'Ожидание старта' : ledStages[stageIndex].label,
+        },
+      }))
+      pushThought('Запускаю световой день на ESP32.')
+    } catch (error) {
+      console.error('Failed to start day scenario', error)
+      pushThought('Не удалось отправить сценарий светового дня.')
+    } finally {
+      setIsStartingDayScenario(false)
     }
   }
 
@@ -468,7 +630,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="mt-7 grid gap-4 lg:grid-cols-3">
+        <div className="mt-7 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <DeviceCard
             title={devices.fans.title}
             statusText={`Состояние: ${devices.fans.enabled ? 'включено' : 'выключено'}`}
@@ -478,7 +640,7 @@ export default function App() {
             icon={<FanIcon className="h-7 w-7" />}
             accent="#75F08D"
             showProgress={false}
-            className="min-h-[150px] lg:min-h-[176px]"
+            className="min-h-[150px] xl:min-h-[176px]"
           />
           <DeviceCard
             title={devices.lights.title}
@@ -489,7 +651,7 @@ export default function App() {
             icon={<LightIcon className="h-7 w-7" />}
             accent="#FFD667"
             showProgress={false}
-            className="min-h-[150px] lg:min-h-[176px]"
+            className="min-h-[150px] xl:min-h-[176px]"
           />
           <DeviceCard
             title={devices.pumps.title}
@@ -500,7 +662,18 @@ export default function App() {
             icon={<PumpIcon className="h-7 w-7" />}
             accent="#8EC8FF"
             showProgress={false}
-            className="min-h-[150px] lg:min-h-[176px]"
+            className="min-h-[150px] xl:min-h-[176px]"
+          />
+          <DeviceCard
+            title={devices.humidifiers.title}
+            statusText={`Состояние: ${devices.humidifiers.enabled ? 'включено' : 'выключено'}`}
+            statusColor={devices.humidifiers.enabled ? '#53E78A' : undefined}
+            enabled={devices.humidifiers.enabled}
+            onToggle={handleToggle('humidifiers')}
+            icon={<HumidityIcon className="h-7 w-7" />}
+            accent="#71F16A"
+            showProgress={false}
+            className="min-h-[150px] xl:min-h-[176px]"
           />
         </div>
       </GlassCard>
@@ -509,10 +682,10 @@ export default function App() {
         stages={ledStages}
         activeIndex={activeLedStage}
         isPlaying={isLedPlaying}
-        onPlay={() => {
-          setActiveLedStage(0)
-          setIsLedPlaying(true)
-        }}
+        isStarting={isStartingDayScenario}
+        progress={ledScenario.progress}
+        statusText={devices.led.scenario}
+        onPlay={handleStartDayScenario}
         compact
       />
     </div>

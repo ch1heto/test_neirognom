@@ -27,6 +27,7 @@ export const initialDevices = {
   fans: { enabled: true, level: 65, title: 'Вентиляторы', subtitle: 'Скорость' },
   lights: { enabled: true, level: 80, title: 'Освещение', subtitle: 'Яркость' },
   pumps: { enabled: true, level: 70, title: 'Насосы', subtitle: 'Производит.' },
+  humidifiers: { enabled: false, level: 0, title: 'Увлажнитель', subtitle: 'Влажность' },
   led: { title: 'LED лента', scenario: 'День' },
 }
 

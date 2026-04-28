@@ -1,0 +1,15 @@
+user backend
+topic read farm/+/sensors/#
+topic read farm/+/status/#
+topic write farm/+/cmd/#
+
+user esp32
+topic read farm/tray_1/cmd/#
+topic write farm/tray_1/sensors/#
+topic write farm/tray_1/status/#
+
+user simulator
+topic read farm/tray_1/cmd/#
+topic readwrite farm/sim/control
+topic write farm/tray_1/sensors/#
+topic write farm/tray_1/status/#
