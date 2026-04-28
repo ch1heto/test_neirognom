@@ -23,6 +23,16 @@ import {
   SlidersIcon,
   ThermometerIcon,
 } from './components/Icons'
+import arugulaImage from './assets/crops/arugula.webp'
+import basilImage from './assets/crops/basil.webp'
+import cilantroImage from './assets/crops/cilantro.webp'
+import dillImage from './assets/crops/dill.webp'
+import lettuceImage from './assets/crops/lettuce.webp'
+import mangoldImage from './assets/crops/mangold.webp'
+import mintImage from './assets/crops/mint.webp'
+import pakChoiImage from './assets/crops/pak_choi.webp'
+import parsleyImage from './assets/crops/parsley.webp'
+import spinachImage from './assets/crops/spinach.webp'
 
 const API_BASE_URL =
   window.location.hostname === 'localhost'
@@ -39,8 +49,6 @@ const FALLBACK_CROPS = [
   { slug: 'spinach', name_ru: 'Шпинат', crop_type: 'leafy', version_label: 'v1.0' },
   { slug: 'cilantro', name_ru: 'Кинза', crop_type: 'herb', version_label: 'v1.0' },
   { slug: 'mangold', name_ru: 'Мангольд', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'microgreen_radish', name_ru: 'Микрозелень редиса', crop_type: 'microgreen', version_label: 'v1.0' },
-  { slug: 'microgreen_pea', name_ru: 'Микрозелень гороха', crop_type: 'microgreen', version_label: 'v1.0' },
   { slug: 'dill', name_ru: 'Укроп', crop_type: 'herb', version_label: 'v1.0' },
   { slug: 'mint', name_ru: 'Мята', crop_type: 'herb', version_label: 'v1.0' },
   { slug: 'pak_choi', name_ru: 'Пак-чой', crop_type: 'leafy', version_label: 'v1.0' },
@@ -48,19 +56,17 @@ const FALLBACK_CROPS = [
 ]
 
 const CROP_VISUALS = {
-  basil: { label: 'Базилик', emoji: '🌿', gradient: 'from-emerald-300/24 via-green-500/14 to-emerald-950/20' },
-  lettuce: { label: 'Салат', emoji: '🥬', gradient: 'from-lime-300/22 via-green-500/12 to-slate-900/20' },
-  arugula: { label: 'Руккола', emoji: '☘️', gradient: 'from-green-300/18 via-emerald-500/12 to-slate-900/20' },
-  spinach: { label: 'Шпинат', emoji: '🍃', gradient: 'from-green-300/20 via-emerald-500/12 to-slate-950/20' },
-  cilantro: { label: 'Кинза', emoji: '🌱', gradient: 'from-emerald-200/20 via-lime-500/12 to-slate-950/20' },
-  chard: { label: 'Мангольд', emoji: '🌾', gradient: 'from-rose-300/16 via-emerald-400/12 to-slate-950/20' },
-  mangold: { label: 'Мангольд', emoji: '🌾', gradient: 'from-rose-300/16 via-emerald-400/12 to-slate-950/20' },
-  microgreen_radish: { label: 'Микрозелень редиса', emoji: '🌱', gradient: 'from-fuchsia-300/18 via-emerald-400/12 to-slate-900/20' },
-  microgreen_pea: { label: 'Микрозелень гороха', emoji: '🌿', gradient: 'from-lime-300/18 via-emerald-400/12 to-slate-900/20' },
-  dill: { label: 'Укроп', emoji: '🌿', gradient: 'from-green-200/18 via-lime-500/12 to-slate-950/20' },
-  mint: { label: 'Мята', emoji: '🍃', gradient: 'from-cyan-200/16 via-emerald-400/12 to-slate-950/20' },
-  pak_choi: { label: 'Пак-чой', emoji: '🥬', gradient: 'from-lime-200/18 via-green-500/12 to-slate-950/20' },
-  parsley: { label: 'Петрушка', emoji: '☘️', gradient: 'from-emerald-200/16 via-green-500/12 to-slate-950/20' },
+  basil: { label: 'Базилик', image: basilImage, gradient: 'from-emerald-300/24 via-green-500/14 to-emerald-950/20' },
+  lettuce: { label: 'Салат', image: lettuceImage, gradient: 'from-lime-300/22 via-green-500/12 to-slate-900/20' },
+  arugula: { label: 'Руккола', image: arugulaImage, gradient: 'from-green-300/18 via-emerald-500/12 to-slate-900/20' },
+  spinach: { label: 'Шпинат', image: spinachImage, gradient: 'from-green-300/20 via-emerald-500/12 to-slate-950/20' },
+  cilantro: { label: 'Кинза', image: cilantroImage, gradient: 'from-emerald-200/20 via-lime-500/12 to-slate-950/20' },
+  chard: { label: 'Мангольд', image: mangoldImage, gradient: 'from-rose-300/16 via-emerald-400/12 to-slate-950/20' },
+  mangold: { label: 'Мангольд', image: mangoldImage, gradient: 'from-rose-300/16 via-emerald-400/12 to-slate-950/20' },
+  dill: { label: 'Укроп', image: dillImage, gradient: 'from-green-200/18 via-lime-500/12 to-slate-950/20' },
+  mint: { label: 'Мята', image: mintImage, gradient: 'from-cyan-200/16 via-emerald-400/12 to-slate-950/20' },
+  pak_choi: { label: 'Пак-чой', image: pakChoiImage, gradient: 'from-lime-200/18 via-green-500/12 to-slate-950/20' },
+  parsley: { label: 'Петрушка', image: parsleyImage, gradient: 'from-emerald-200/16 via-green-500/12 to-slate-950/20' },
 }
 
 const CHAT_THINKING_STEPS = [
@@ -638,7 +644,16 @@ export default function App() {
         <div className={`absolute inset-0 bg-gradient-to-br ${visual.gradient}`} />
         <div className="relative flex h-full min-w-0 flex-col items-center justify-center gap-2">
           <div className="text-[34px] leading-none drop-shadow-[0_0_22px_rgba(52,211,153,0.28)] sm:text-[40px]">
-            {visual.emoji}
+            {visual.image ? (
+              <img
+                src={visual.image}
+                alt=""
+                aria-hidden="true"
+                className="h-12 w-12 object-contain drop-shadow-[0_0_22px_rgba(52,211,153,0.28)] sm:h-14 sm:w-14"
+              />
+            ) : (
+              visual.emoji
+            )}
           </div>
           <div className="max-w-full truncate text-center text-[13px] font-semibold leading-tight text-white sm:text-[14px]">
             {getCropLabel(crop)}
@@ -657,6 +672,7 @@ export default function App() {
     const activeCropName = currentCycle?.crop_name_ru || getCropLabel(selectedCrop)
     const activeVersion = currentCycle?.version_label || selectedCrop?.version_label || 'v1.0'
     const isActive = Boolean(currentCycle)
+    const previewVisual = getCropVisual(currentCycle?.crop_slug || selectedCrop?.slug)
 
     return (
       <GlassCard className="flex min-h-0 max-w-full flex-col rounded-[28px] min-[1700px]:h-full min-[1700px]:overflow-hidden">
@@ -720,8 +736,16 @@ export default function App() {
               </div>
 
               <div className="mt-5 grid min-w-0 flex-1 items-center gap-5 md:grid-cols-[112px_minmax(0,1fr)]">
-                <div className={`mx-auto flex aspect-square w-[112px] items-center justify-center rounded-[28px] border border-emerald-300/18 bg-gradient-to-br ${getCropVisual(currentCycle?.crop_slug || selectedCrop?.slug).gradient} text-[58px] shadow-[0_0_34px_rgba(52,211,153,0.10)]`}>
-                  {getCropVisual(currentCycle?.crop_slug || selectedCrop?.slug).emoji}
+                <div className={`mx-auto flex aspect-square w-[112px] items-center justify-center rounded-[28px] border border-emerald-300/18 bg-gradient-to-br ${previewVisual.gradient} text-[58px] shadow-[0_0_34px_rgba(52,211,153,0.10)]`}>
+                  {previewVisual.image ? (
+                    <img
+                      src={previewVisual.image}
+                      alt={activeCropName}
+                      className="h-24 w-24 object-contain drop-shadow-[0_0_28px_rgba(52,211,153,0.22)]"
+                    />
+                  ) : (
+                    previewVisual.emoji
+                  )}
                 </div>
 
                 <div className="min-w-0">
