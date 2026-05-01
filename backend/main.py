@@ -26,6 +26,7 @@ from db import (
     aggregate_completed_hours,
     delete_old_raw_data,
     finish_growing_cycle,
+    finish_growing_cycle_with_result,
     get_active_cycle_ai_context,
     get_active_cycle_norm_ranges,
     get_advisor_report,
@@ -2250,10 +2251,32 @@ class EndGrowingCycleRequest(BaseModel):
     notes: str | None = None
 
 
-class CycleResultRequest(BaseModel):
-    harvest_weight_grams: float | None = None
-    quality_score: int | None = None
+class CycleResultPayload(BaseModel):
+    harvest_status: Literal["suitable", "partial", "weak_suitable", "failed", "stopped_early"]
+    harvest_mass_grams: float | None = None
+    completion_reason: Literal["planned", "harvest_ready", "plant_problems", "test_cycle", "other"]
+    problem_severity: Literal["none", "minor", "noticeable", "bad", "unknown"] = "unknown"
+    problem_phase: Literal["early", "middle", "end", "whole_cycle", "unknown"] = "unknown"
+    plant_appearance: dict[str, bool]
+    cycle_problems: dict[str, Any]
+    manual_actions: dict[str, bool]
+    followed_ai_advice: Literal["yes", "partial", "no", "no_advice", "unknown"] = "unknown"
+    ai_advice_helpfulness: Literal["yes", "partial", "no", "worse", "unknown"] = "unknown"
     operator_comment: str | None = None
+
+
+class CycleResultRequest(CycleResultPayload):
+    pass
+
+
+class FinishCycleRequest(CycleResultPayload):
+    tray_id: str = "tray_1"
+    notes: str | None = None
+
+
+class FinishCycleResponse(BaseModel):
+    cycle: dict[str, Any]
+    result: dict[str, Any]
 
 
 @app.get("/")
@@ -2431,15 +2454,21 @@ def api_start_growing_cycle(request: StartGrowingCycleRequest) -> dict[str, Any]
         raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
 
-@app.post("/api/cycles/end")
-def api_finish_growing_cycle(request: EndGrowingCycleRequest) -> dict[str, Any]:
+@app.post("/api/cycles/end", response_model=FinishCycleResponse)
+def api_finish_growing_cycle(request: FinishCycleRequest) -> dict[str, Any]:
     try:
-        return finish_growing_cycle(
+        result_payload = request.dict(
+            exclude={"tray_id", "notes"},
+        )
+        return finish_growing_cycle_with_result(
             tray_id=request.tray_id,
+            result_payload=result_payload,
             notes=request.notes,
         )
     except NoActiveGrowingCycleError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except InvalidCycleResultError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
 
 @app.get("/api/cycles/{cycle_id}/advisor-reports")
@@ -2460,8 +2489,16 @@ def api_save_cycle_result(cycle_id: int, request: CycleResultRequest) -> dict[st
     try:
         return save_cycle_result(
             cycle_id,
-            harvest_weight_grams=request.harvest_weight_grams,
-            quality_score=request.quality_score,
+            harvest_status=request.harvest_status,
+            harvest_mass_grams=request.harvest_mass_grams,
+            completion_reason=request.completion_reason,
+            problem_severity=request.problem_severity,
+            problem_phase=request.problem_phase,
+            plant_appearance=request.plant_appearance,
+            cycle_problems=request.cycle_problems,
+            manual_actions=request.manual_actions,
+            followed_ai_advice=request.followed_ai_advice,
+            ai_advice_helpfulness=request.ai_advice_helpfulness,
             operator_comment=request.operator_comment,
         )
     except GrowingCycleNotFoundError as exc:

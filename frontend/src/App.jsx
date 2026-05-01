@@ -42,6 +42,190 @@ const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 const DEFAULT_TRAY_ID = 'tray_1'
 
+const FINISH_CYCLE_INITIAL_FORM = {
+  harvest_status: 'suitable',
+  harvest_mass_grams: '',
+  completion_reason: 'planned',
+  problem_severity: 'unknown',
+  problem_phase: 'unknown',
+  plant_appearance: {
+    healthy: true,
+    stretched: false,
+    yellow_leaves: false,
+    wilted_leaves: false,
+    small_leaves: false,
+    spots_or_damage: false,
+    mold: false,
+    poor_roots: false,
+  },
+  cycle_problems: {
+    solution: {
+      ph_out_of_range: false,
+      ec_out_of_range: false,
+      weak_growth: false,
+      leaf_edge_burn: false,
+    },
+    light: {
+      stretched_due_to_light: false,
+      pale_leaves: false,
+      leaning_to_light: false,
+      overheating: false,
+    },
+    irrigation: {
+      plants_wilted: false,
+      substrate_dried: false,
+      excess_moisture: false,
+      mold_due_to_humidity: false,
+    },
+    climate: {
+      too_hot: false,
+      too_cold: false,
+      humidity_too_low: false,
+      humidity_too_high: false,
+    },
+  },
+  manual_actions: {
+    adjusted_ph: false,
+    adjusted_ec: false,
+    changed_or_added_solution: false,
+    added_water: false,
+    moved_lamp: false,
+    rearranged_plants: false,
+    cleaned_tank: false,
+    other: false,
+  },
+  followed_ai_advice: 'unknown',
+  ai_advice_helpfulness: 'unknown',
+  operator_comment: '',
+}
+
+const HARVEST_STATUS_OPTIONS = [
+  { value: 'suitable', label: 'Урожай получен и пригоден' },
+  { value: 'partial', label: 'Получен частично' },
+  { value: 'weak_suitable', label: 'Слабый, но пригоден' },
+  { value: 'failed', label: 'Непригоден / цикл неудачный' },
+  { value: 'stopped_early', label: 'Цикл остановлен досрочно' },
+]
+
+const COMPLETION_REASON_OPTIONS = [
+  { value: 'planned', label: 'Плановое завершение' },
+  { value: 'harvest_ready', label: 'Урожай готов' },
+  { value: 'plant_problems', label: 'Проблемы с растениями' },
+  { value: 'test_cycle', label: 'Тестовый цикл' },
+  { value: 'other', label: 'Другое' },
+]
+
+const PROBLEM_SEVERITY_OPTIONS = [
+  { value: 'none', label: 'Проблем почти не было' },
+  { value: 'minor', label: 'Небольшие проблемы' },
+  { value: 'noticeable', label: 'Заметные проблемы' },
+  { value: 'bad', label: 'Цикл прошёл плохо' },
+  { value: 'unknown', label: 'Сложно сказать' },
+]
+
+const PROBLEM_PHASE_OPTIONS = [
+  { value: 'early', label: 'В начале цикла' },
+  { value: 'middle', label: 'В середине цикла' },
+  { value: 'end', label: 'В конце цикла' },
+  { value: 'whole_cycle', label: 'На протяжении всего цикла' },
+  { value: 'unknown', label: 'Сложно сказать' },
+]
+
+const AI_ADVICE_FOLLOW_OPTIONS = [
+  { value: 'yes', label: 'Да' },
+  { value: 'partial', label: 'Частично' },
+  { value: 'no', label: 'Нет' },
+  { value: 'no_advice', label: 'Советов не было' },
+  { value: 'unknown', label: 'Сложно сказать' },
+]
+
+const AI_ADVICE_HELPFULNESS_OPTIONS = [
+  { value: 'yes', label: 'Да' },
+  { value: 'partial', label: 'Частично' },
+  { value: 'no', label: 'Нет' },
+  { value: 'worse', label: 'Стало хуже' },
+  { value: 'unknown', label: 'Сложно сказать' },
+]
+
+const PLANT_APPEARANCE_FIELDS = [
+  { key: 'healthy', label: 'Растения выглядели здоровыми' },
+  { key: 'stretched', label: 'Растения вытянулись' },
+  { key: 'yellow_leaves', label: 'Листья пожелтели' },
+  { key: 'wilted_leaves', label: 'Листья были вялыми' },
+  { key: 'small_leaves', label: 'Листья были мелкими' },
+  { key: 'spots_or_damage', label: 'Были пятна / повреждения' },
+  { key: 'mold', label: 'Была плесень' },
+  { key: 'poor_roots', label: 'Корни выглядели плохо' },
+]
+
+const CYCLE_PROBLEM_GROUPS = [
+  {
+    key: 'solution',
+    title: 'Раствор',
+    fields: [
+      { key: 'ph_out_of_range', label: 'pH выходил из нормы' },
+      { key: 'ec_out_of_range', label: 'EC выходил из нормы' },
+      { key: 'weak_growth', label: 'Слабый рост' },
+      { key: 'leaf_edge_burn', label: 'Ожоги краёв листьев' },
+    ],
+  },
+  {
+    key: 'light',
+    title: 'Свет',
+    fields: [
+      { key: 'stretched_due_to_light', label: 'Растения вытягивались' },
+      { key: 'pale_leaves', label: 'Листья были бледными' },
+      { key: 'leaning_to_light', label: 'Растения тянулись к свету' },
+      { key: 'overheating', label: 'Был перегрев' },
+    ],
+  },
+  {
+    key: 'irrigation',
+    title: 'Полив / влажность',
+    fields: [
+      { key: 'plants_wilted', label: 'Растения вяли' },
+      { key: 'substrate_dried', label: 'Субстрат пересыхал' },
+      { key: 'excess_moisture', label: 'Был переизбыток влаги' },
+      { key: 'mold_due_to_humidity', label: 'Была плесень' },
+    ],
+  },
+  {
+    key: 'climate',
+    title: 'Климат',
+    fields: [
+      { key: 'too_hot', label: 'Было слишком жарко' },
+      { key: 'too_cold', label: 'Было слишком холодно' },
+      { key: 'humidity_too_low', label: 'Влажность была слишком низкой' },
+      { key: 'humidity_too_high', label: 'Влажность была слишком высокой' },
+    ],
+  },
+]
+
+const MANUAL_ACTION_FIELDS = [
+  { key: 'adjusted_ph', label: 'Корректировал pH' },
+  { key: 'adjusted_ec', label: 'Корректировал EC' },
+  { key: 'changed_or_added_solution', label: 'Менял / доливал раствор' },
+  { key: 'added_water', label: 'Доливал воду' },
+  { key: 'moved_lamp', label: 'Менял положение лампы' },
+  { key: 'rearranged_plants', label: 'Переставлял растения' },
+  { key: 'cleaned_tank', label: 'Чистил ёмкость' },
+  { key: 'other', label: 'Другое' },
+]
+
+function createInitialFinishCycleForm() {
+  return {
+    ...FINISH_CYCLE_INITIAL_FORM,
+    plant_appearance: { ...FINISH_CYCLE_INITIAL_FORM.plant_appearance },
+    cycle_problems: {
+      solution: { ...FINISH_CYCLE_INITIAL_FORM.cycle_problems.solution },
+      light: { ...FINISH_CYCLE_INITIAL_FORM.cycle_problems.light },
+      irrigation: { ...FINISH_CYCLE_INITIAL_FORM.cycle_problems.irrigation },
+      climate: { ...FINISH_CYCLE_INITIAL_FORM.cycle_problems.climate },
+    },
+    manual_actions: { ...FINISH_CYCLE_INITIAL_FORM.manual_actions },
+  }
+}
+
 const FALLBACK_CROPS = [
   { slug: 'basil', name_ru: 'Базилик', crop_type: 'herb', version_label: 'v1.0' },
   { slug: 'lettuce', name_ru: 'Салат', crop_type: 'leafy', version_label: 'v1.0' },
@@ -190,6 +374,343 @@ function getErrorMessage(error, fallback) {
   return fallback
 }
 
+function hasSelectedRequiredFinishCycleFields(form) {
+  return Boolean(
+    form.harvest_status &&
+    form.completion_reason &&
+    form.problem_severity &&
+    form.problem_phase &&
+    form.followed_ai_advice &&
+    form.ai_advice_helpfulness,
+  )
+}
+
+function hasAnyTruthyNestedValue(value) {
+  if (!value || typeof value !== 'object') return false
+
+  return Object.values(value).some((entry) => {
+    if (entry && typeof entry === 'object') {
+      return hasAnyTruthyNestedValue(entry)
+    }
+
+    return Boolean(entry)
+  })
+}
+
+function hasProblemContradiction(form) {
+  if (form.problem_severity !== 'none') return false
+
+  const hasNegativePlantAppearance = Object.entries(form.plant_appearance || {}).some(
+    ([key, value]) => key !== 'healthy' && Boolean(value),
+  )
+
+  return (
+    hasNegativePlantAppearance ||
+    hasAnyTruthyNestedValue(form.cycle_problems) ||
+    hasAnyTruthyNestedValue(form.manual_actions)
+  )
+}
+
+function FinishCycleModal({
+  currentCycle,
+  form,
+  setForm,
+  error,
+  isLoading,
+  onClose,
+  onSubmit,
+}) {
+  const isFormValid = hasSelectedRequiredFinishCycleFields(form)
+  const showProblemContradictionWarning = hasProblemContradiction(form)
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape' && !isLoading) {
+        onClose()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isLoading, onClose])
+
+  const updateField = (field, value) => {
+    setForm((prev) => ({ ...prev, [field]: value }))
+  }
+
+  const updatePlantAppearance = (field, checked) => {
+    setForm((prev) => ({
+      ...prev,
+      plant_appearance: {
+        ...prev.plant_appearance,
+        [field]: checked,
+      },
+    }))
+  }
+
+  const updateCycleProblem = (group, field, checked) => {
+    setForm((prev) => ({
+      ...prev,
+      cycle_problems: {
+        ...prev.cycle_problems,
+        [group]: {
+          ...prev.cycle_problems[group],
+          [field]: checked,
+        },
+      },
+    }))
+  }
+
+  const updateManualAction = (field, checked) => {
+    setForm((prev) => ({
+      ...prev,
+      manual_actions: {
+        ...prev.manual_actions,
+        [field]: checked,
+      },
+    }))
+  }
+
+  const renderPills = (name, options, value, onChange) => (
+    <div className="flex flex-wrap gap-2">
+      {options.map((option) => {
+        const isSelected = value === option.value
+        return (
+          <button
+            key={`${name}-${option.value}`}
+            type="button"
+            onClick={() => onChange(option.value)}
+            className={`rounded-full border px-4 py-2 text-sm font-semibold transition ${
+              isSelected
+                ? 'border-violet-200/70 bg-gradient-to-r from-violet-500 to-fuchsia-600 text-white shadow-[0_0_22px_rgba(168,85,247,0.28)]'
+                : 'border-white/10 bg-white/[0.045] text-white/70 hover:border-white/20 hover:bg-white/[0.07]'
+            }`}
+          >
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+
+  const renderCheckbox = (checked, onChange, label) => (
+    <label className="flex min-h-[44px] cursor-pointer items-center gap-3 rounded-[16px] border border-white/8 bg-white/[0.035] px-3 py-2 text-sm text-white/78 transition hover:bg-white/[0.06]">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="h-4 w-4 rounded border-white/20 bg-slate-950 text-violet-400 accent-violet-500"
+      />
+      <span>{label}</span>
+    </label>
+  )
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/62 px-3 py-4 backdrop-blur-md">
+      <div className="absolute inset-0" onClick={isLoading ? undefined : onClose} />
+      <form
+        onSubmit={onSubmit}
+        className="custom-scrollbar relative z-10 flex max-h-[92vh] w-full max-w-4xl flex-col overflow-y-auto rounded-[32px] border border-white/10 bg-slate-950/90 p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)] sm:p-6"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-[26px] font-semibold tracking-tight text-white">Завершение цикла</h2>
+            <p className="mt-1.5 text-sm text-white/62">
+              Заполните итоговый опросник перед завершением выращивания.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isLoading}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.045] text-xl text-white/70 transition hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label="Закрыть"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-3 rounded-[24px] border border-emerald-300/14 bg-emerald-400/[0.045] p-4 sm:grid-cols-2 lg:grid-cols-4">
+          {[
+            ['Культура', currentCycle?.crop_name_ru || 'Культура'],
+            ['АгроТехКарта', currentCycle?.version_label || 'v1.0'],
+            ['День цикла', currentCycle?.day_number || 1],
+            ['Лоток', currentCycle?.tray_id || DEFAULT_TRAY_ID],
+          ].map(([label, value]) => (
+            <div key={label} className="min-w-0">
+              <div className="text-xs uppercase tracking-[0.12em] text-white/38">{label}</div>
+              <div className="mt-1 truncate text-sm font-semibold text-white/88">{value}</div>
+            </div>
+          ))}
+        </div>
+
+        {error ? (
+          <div className="mt-4 rounded-[18px] border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
+            {error}
+          </div>
+        ) : null}
+
+        {showProblemContradictionWarning ? (
+          <div className="mt-4 rounded-[18px] border border-sky-300/20 bg-sky-300/10 px-4 py-3 text-sm leading-relaxed text-sky-100">
+            Вы выбрали, что проблем почти не было, но отметили отдельные признаки проблем. Это нормально, но Нейрогном будет учитывать это как небольшие противоречия при будущем анализе цикла.
+          </div>
+        ) : null}
+
+        <div className="mt-5 grid gap-5 lg:grid-cols-2">
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Итог урожая</div>
+            <div className="mt-3">
+              {renderPills('harvest_status', HARVEST_STATUS_OPTIONS, form.harvest_status, (value) => updateField('harvest_status', value))}
+            </div>
+          </section>
+
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <label className="text-base font-semibold text-white" htmlFor="harvest-mass">
+              Масса урожая, г <span className="text-white/42">(необязательно)</span>
+            </label>
+            <input
+              id="harvest-mass"
+              type="number"
+              min="0"
+              step="0.1"
+              value={form.harvest_mass_grams}
+              onChange={(event) => updateField('harvest_mass_grams', event.target.value)}
+              className="mt-3 h-12 w-full rounded-[16px] border border-white/10 bg-slate-950/70 px-4 text-white outline-none transition placeholder:text-white/30 focus:border-violet-300/70"
+              placeholder="Например: 420"
+            />
+          </section>
+        </div>
+
+        <div className="mt-5 grid gap-5 lg:grid-cols-3">
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Причина завершения</div>
+            <div className="mt-3">
+              {renderPills('completion_reason', COMPLETION_REASON_OPTIONS, form.completion_reason, (value) => updateField('completion_reason', value))}
+            </div>
+          </section>
+
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Общая серьёзность проблем</div>
+            <div className="mt-3">
+              {renderPills('problem_severity', PROBLEM_SEVERITY_OPTIONS, form.problem_severity, (value) => updateField('problem_severity', value))}
+            </div>
+          </section>
+
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Когда проблемы были заметнее</div>
+            <div className="mt-3">
+              {renderPills('problem_phase', PROBLEM_PHASE_OPTIONS, form.problem_phase, (value) => updateField('problem_phase', value))}
+            </div>
+          </section>
+        </div>
+
+        <section className="mt-5 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+          <div className="text-base font-semibold text-white">Внешний вид растений</div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            {PLANT_APPEARANCE_FIELDS.map((field) => (
+              <div key={field.key}>
+                {renderCheckbox(
+                  Boolean(form.plant_appearance[field.key]),
+                  (checked) => updatePlantAppearance(field.key, checked),
+                  field.label,
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+          <div className="text-base font-semibold text-white">Проблемы во время цикла</div>
+          <div className="mt-3 grid gap-3 lg:grid-cols-4">
+            {CYCLE_PROBLEM_GROUPS.map((group) => (
+              <div key={group.key} className="rounded-[20px] border border-white/8 bg-slate-950/40 p-3">
+                <div className="mb-2 text-sm font-semibold text-white/86">{group.title}</div>
+                <div className="grid gap-2">
+                  {group.fields.map((field) => (
+                    <div key={field.key}>
+                      {renderCheckbox(
+                        Boolean(form.cycle_problems[group.key]?.[field.key]),
+                        (checked) => updateCycleProblem(group.key, field.key, checked),
+                        field.label,
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+          <div className="text-base font-semibold text-white">Ручные действия оператора</div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            {MANUAL_ACTION_FIELDS.map((field) => (
+              <div key={field.key}>
+                {renderCheckbox(
+                  Boolean(form.manual_actions[field.key]),
+                  (checked) => updateManualAction(field.key, checked),
+                  field.label,
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <div className="mt-5 grid gap-5 lg:grid-cols-2">
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Следовали ли советам Нейрогнома?</div>
+            <div className="mt-3">
+              {renderPills('followed_ai_advice', AI_ADVICE_FOLLOW_OPTIONS, form.followed_ai_advice, (value) => updateField('followed_ai_advice', value))}
+            </div>
+          </section>
+
+          <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+            <div className="text-base font-semibold text-white">Помогли ли советы?</div>
+            <div className="mt-3">
+              {renderPills('ai_advice_helpfulness', AI_ADVICE_HELPFULNESS_OPTIONS, form.ai_advice_helpfulness, (value) => updateField('ai_advice_helpfulness', value))}
+            </div>
+          </section>
+        </div>
+
+        <section className="mt-5 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+          <label className="text-base font-semibold text-white" htmlFor="operator-comment">
+            Комментарий
+          </label>
+          <textarea
+            id="operator-comment"
+            value={form.operator_comment}
+            onChange={(event) => updateField('operator_comment', event.target.value)}
+            className="mt-3 min-h-[112px] w-full resize-none rounded-[18px] border border-white/10 bg-slate-950/70 px-4 py-3 text-white outline-none transition placeholder:text-white/30 focus:border-violet-300/70"
+            placeholder="Например: растения слегка вытянулись ближе к концу цикла, но в целом урожай пригоден."
+          />
+        </section>
+
+        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isLoading}
+            className="min-h-[52px] rounded-[18px] border border-white/10 bg-white/[0.045] px-5 py-3 font-semibold text-white/74 transition hover:bg-white/[0.075] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Отмена
+          </button>
+          <button
+            type="submit"
+            disabled={isLoading || !isFormValid}
+            className={`min-h-[52px] rounded-[18px] border px-5 py-3 font-semibold text-white transition disabled:cursor-not-allowed ${
+              isFormValid
+                ? 'border-violet-200/30 bg-gradient-to-r from-violet-500 to-fuchsia-600 shadow-[0_0_28px_rgba(168,85,247,0.28)] hover:brightness-110 disabled:opacity-55'
+                : 'border-white/8 bg-white/[0.045] text-white/38 opacity-70'
+            }`}
+          >
+            {isLoading ? 'Завершение...' : 'Подтвердить завершение'}
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
 export default function App() {
   const [mode, setMode] = useState('monitoring')
   const [metrics, setMetrics] = useState(initialMetrics)
@@ -212,6 +733,9 @@ export default function App() {
   const [currentCycle, setCurrentCycle] = useState(null)
   const [isCycleLoading, setIsCycleLoading] = useState(false)
   const [cycleError, setCycleError] = useState('')
+  const [isFinishCycleModalOpen, setIsFinishCycleModalOpen] = useState(false)
+  const [finishCycleForm, setFinishCycleForm] = useState(createInitialFinishCycleForm)
+  const [finishCycleError, setFinishCycleError] = useState('')
 
   const pushThought = () => undefined
 
@@ -527,24 +1051,66 @@ export default function App() {
     }
   }
 
-  const handleFinishCycle = async () => {
+  const handleOpenFinishCycleModal = () => {
     if (!currentCycle) return
+    setFinishCycleForm(createInitialFinishCycleForm())
+    setFinishCycleError('')
+    setCycleError('')
+    setIsFinishCycleModalOpen(true)
+  }
+
+  const handleCloseFinishCycleModal = () => {
+    if (isCycleLoading) return
+    setIsFinishCycleModalOpen(false)
+    setFinishCycleError('')
+  }
+
+  const handleSubmitFinishCycle = async (event) => {
+    event.preventDefault()
+    if (!currentCycle) return
+
+    if (!hasSelectedRequiredFinishCycleFields(finishCycleForm)) {
+      setFinishCycleError('Заполните обязательные поля итогового опросника перед завершением цикла.')
+      return
+    }
+
+    const trimmedMass = String(finishCycleForm.harvest_mass_grams || '').trim()
+    const harvestMass = trimmedMass === '' ? null : Number(trimmedMass)
+
+    if (harvestMass !== null && (!Number.isFinite(harvestMass) || harvestMass < 0)) {
+      setFinishCycleError('Укажите неотрицательную массу урожая или оставьте поле пустым.')
+      return
+    }
 
     setIsCycleLoading(true)
     setCycleError('')
+    setFinishCycleError('')
     try {
       await requestJson('/api/cycles/end', {
         method: 'POST',
         body: JSON.stringify({
-          tray_id: DEFAULT_TRAY_ID,
+          tray_id: currentCycle.tray_id || DEFAULT_TRAY_ID,
+          harvest_status: finishCycleForm.harvest_status,
+          harvest_mass_grams: harvestMass,
+          completion_reason: finishCycleForm.completion_reason,
+          problem_severity: finishCycleForm.problem_severity,
+          problem_phase: finishCycleForm.problem_phase,
+          plant_appearance: finishCycleForm.plant_appearance,
+          cycle_problems: finishCycleForm.cycle_problems,
+          manual_actions: finishCycleForm.manual_actions,
+          followed_ai_advice: finishCycleForm.followed_ai_advice,
+          ai_advice_helpfulness: finishCycleForm.ai_advice_helpfulness,
+          operator_comment: finishCycleForm.operator_comment.trim() || null,
         }),
       })
+      setIsFinishCycleModalOpen(false)
+      setFinishCycleForm(createInitialFinishCycleForm())
       setCurrentCycle(null)
       await loadCurrentCycle()
-      pushThought('Цикл выращивания завершён.')
+      pushThought('Цикл выращивания завершён. Итоговый опросник сохранён.')
     } catch (error) {
       console.error('Failed to finish growing cycle', error)
-      setCycleError(getErrorMessage(error, 'Не удалось завершить цикл. Активный цикл не найден.'))
+      setFinishCycleError(getErrorMessage(error, 'Не удалось завершить цикл. Проверьте данные опросника и активный цикл.'))
       try {
         await loadCurrentCycle()
       } catch (loadError) {
@@ -770,11 +1336,11 @@ export default function App() {
                 ) : (
                   <button
                     type="button"
-                    onClick={handleFinishCycle}
+                    onClick={handleOpenFinishCycleModal}
                     disabled={isCycleLoading}
                     className="min-h-[56px] rounded-[20px] border border-rose-200/20 bg-rose-500/16 px-5 py-3 font-semibold text-rose-100 transition hover:bg-rose-500/22 disabled:cursor-not-allowed disabled:opacity-55 sm:col-span-2"
                   >
-                    {isCycleLoading ? 'Завершение...' : 'Закончить цикл'}
+                    Закончить цикл
                   </button>
                 )}
               </div>
@@ -876,6 +1442,17 @@ export default function App() {
           </aside>
         </main>
       </div>
+      {isFinishCycleModalOpen ? (
+        <FinishCycleModal
+          currentCycle={currentCycle}
+          form={finishCycleForm}
+          setForm={setFinishCycleForm}
+          error={finishCycleError}
+          isLoading={isCycleLoading}
+          onClose={handleCloseFinishCycleModal}
+          onSubmit={handleSubmitFinishCycle}
+        />
+      ) : null}
     </div>
   )
 }

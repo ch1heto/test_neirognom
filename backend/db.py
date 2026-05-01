@@ -81,6 +81,36 @@ BASE_CATALOG_ITEMS = (
 BASE_CATALOG_ITEM_BY_CODE = {item[1]: item for item in BASE_CATALOG_ITEMS}
 NON_CROP_CARD_FILES = {"crops_index.md", "project_recommendations.md"}
 DEFAULT_TRAY_ID = "tray_1"
+VALID_HARVEST_STATUSES = {
+    "suitable",
+    "partial",
+    "weak_suitable",
+    "failed",
+    "stopped_early",
+}
+VALID_COMPLETION_REASONS = {
+    "planned",
+    "harvest_ready",
+    "plant_problems",
+    "test_cycle",
+    "other",
+}
+VALID_PROBLEM_SEVERITIES = {
+    "none",
+    "minor",
+    "noticeable",
+    "bad",
+    "unknown",
+}
+VALID_PROBLEM_PHASES = {
+    "early",
+    "middle",
+    "end",
+    "whole_cycle",
+    "unknown",
+}
+VALID_FOLLOWED_AI_ADVICE = {"yes", "partial", "no", "no_advice", "unknown"}
+VALID_AI_ADVICE_HELPFULNESS = {"yes", "partial", "no", "worse", "unknown"}
 
 
 class CropNotFoundError(ValueError):
@@ -1851,21 +1881,120 @@ def ensure_cycle_results_schema(cursor) -> None:
         CREATE TABLE IF NOT EXISTS cycle_results (
             id BIGSERIAL PRIMARY KEY,
             cycle_id BIGINT NOT NULL UNIQUE,
-            harvest_weight_grams DOUBLE PRECISION,
-            quality_score INTEGER,
+            harvest_status TEXT NOT NULL,
+            harvest_mass_grams DOUBLE PRECISION,
+            completion_reason TEXT NOT NULL,
+            problem_severity TEXT NOT NULL DEFAULT 'unknown',
+            problem_phase TEXT NOT NULL DEFAULT 'unknown',
+            plant_appearance JSONB NOT NULL DEFAULT '{}'::jsonb,
+            cycle_problems JSONB NOT NULL DEFAULT '{}'::jsonb,
+            manual_actions JSONB NOT NULL DEFAULT '{}'::jsonb,
+            followed_ai_advice TEXT NOT NULL DEFAULT 'unknown',
+            ai_advice_helpfulness TEXT NOT NULL DEFAULT 'unknown',
             operator_comment TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
     )
-    add_foreign_key_if_missing(
-        cursor,
-        "cycle_results",
-        "fk_cycle_results_cycle_id_growing_cycles",
-        "cycle_id",
-        "growing_cycles",
-        "id",
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS harvest_status TEXT"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS harvest_mass_grams DOUBLE PRECISION"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS completion_reason TEXT"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS problem_severity TEXT NOT NULL DEFAULT 'unknown'"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS problem_phase TEXT NOT NULL DEFAULT 'unknown'"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS plant_appearance JSONB NOT NULL DEFAULT '{}'::jsonb"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS cycle_problems JSONB NOT NULL DEFAULT '{}'::jsonb"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS manual_actions JSONB NOT NULL DEFAULT '{}'::jsonb"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS followed_ai_advice TEXT NOT NULL DEFAULT 'unknown'"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS ai_advice_helpfulness TEXT NOT NULL DEFAULT 'unknown'"
+    )
+    cursor.execute(
+        "ALTER TABLE cycle_results ADD COLUMN IF NOT EXISTS operator_comment TEXT"
+    )
+    ensure_jsonb_column(cursor, "cycle_results", "plant_appearance")
+    ensure_jsonb_column(cursor, "cycle_results", "cycle_problems")
+    ensure_jsonb_column(cursor, "cycle_results", "manual_actions")
+    if column_exists(cursor, "cycle_results", "harvest_weight_grams"):
+        cursor.execute(
+            """
+            UPDATE cycle_results
+            SET harvest_mass_grams = COALESCE(harvest_mass_grams, harvest_weight_grams)
+            WHERE harvest_mass_grams IS NULL
+            """
+        )
+    cursor.execute("UPDATE cycle_results SET harvest_status = 'suitable' WHERE harvest_status = 'yes'")
+    cursor.execute("UPDATE cycle_results SET harvest_status = 'failed' WHERE harvest_status IS NULL OR harvest_status = 'no'")
+    cursor.execute(
+        "UPDATE cycle_results SET completion_reason = 'other' WHERE completion_reason IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET problem_severity = 'unknown' WHERE problem_severity IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET problem_phase = 'unknown' WHERE problem_phase IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET plant_appearance = '{}'::jsonb WHERE plant_appearance IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET cycle_problems = '{}'::jsonb WHERE cycle_problems IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET manual_actions = '{}'::jsonb WHERE manual_actions IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET followed_ai_advice = 'unknown' WHERE followed_ai_advice IS NULL"
+    )
+    cursor.execute(
+        "UPDATE cycle_results SET ai_advice_helpfulness = 'unknown' WHERE ai_advice_helpfulness IS NULL"
+    )
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN harvest_status SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN completion_reason SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN problem_severity SET DEFAULT 'unknown'")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN problem_severity SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN problem_phase SET DEFAULT 'unknown'")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN problem_phase SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN plant_appearance SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN plant_appearance SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN cycle_problems SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN cycle_problems SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN manual_actions SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN manual_actions SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN followed_ai_advice SET DEFAULT 'unknown'")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN followed_ai_advice SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN ai_advice_helpfulness SET DEFAULT 'unknown'")
+    cursor.execute("ALTER TABLE cycle_results ALTER COLUMN ai_advice_helpfulness SET NOT NULL")
+    if constraint_exists(cursor, "cycle_results", "fk_cycle_results_cycle_id_growing_cycles"):
+        cursor.execute(
+            "ALTER TABLE cycle_results DROP CONSTRAINT fk_cycle_results_cycle_id_growing_cycles"
+        )
+    cursor.execute(
+        """
+        ALTER TABLE cycle_results
+        ADD CONSTRAINT fk_cycle_results_cycle_id_growing_cycles
+        FOREIGN KEY (cycle_id)
+        REFERENCES growing_cycles(id)
+        ON DELETE CASCADE
+        """
     )
 
 
@@ -1875,8 +2004,16 @@ def row_to_cycle_result(row: dict[str, Any] | None) -> dict[str, Any] | None:
     return {
         "id": row["id"],
         "cycle_id": row["cycle_id"],
-        "harvest_weight_grams": row["harvest_weight_grams"],
-        "quality_score": row["quality_score"],
+        "harvest_status": row["harvest_status"],
+        "harvest_mass_grams": row["harvest_mass_grams"],
+        "completion_reason": row["completion_reason"],
+        "problem_severity": row["problem_severity"],
+        "problem_phase": row["problem_phase"],
+        "plant_appearance": json_object_to_dict(row["plant_appearance"]),
+        "cycle_problems": json_object_to_dict(row["cycle_problems"]),
+        "manual_actions": json_object_to_dict(row["manual_actions"]),
+        "followed_ai_advice": row["followed_ai_advice"],
+        "ai_advice_helpfulness": row["ai_advice_helpfulness"],
         "operator_comment": row["operator_comment"],
         "created_at": format_timestamp(row["created_at"]),
         "updated_at": format_timestamp(row["updated_at"]),
@@ -1887,8 +2024,10 @@ def _get_cycle_result(cursor, cycle_id: int) -> dict[str, Any] | None:
     cursor.execute(
         """
         SELECT
-            id, cycle_id, harvest_weight_grams, quality_score,
-            operator_comment, created_at, updated_at
+            id, cycle_id, harvest_status, harvest_mass_grams,
+            completion_reason, problem_severity, problem_phase,
+            plant_appearance, cycle_problems, manual_actions, followed_ai_advice,
+            ai_advice_helpfulness, operator_comment, created_at, updated_at
         FROM cycle_results
         WHERE cycle_id = %s
         """,
@@ -1900,18 +2039,130 @@ def _get_cycle_result(cursor, cycle_id: int) -> dict[str, Any] | None:
 def get_cycle_result(cycle_id: int) -> dict[str, Any] | None:
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            ensure_cycle_results_schema(cursor)
             return row_to_cycle_result(_get_cycle_result(cursor, cycle_id))
+
+
+def validate_cycle_result_payload(
+    harvest_status: str,
+    harvest_mass_grams: float | None,
+    completion_reason: str,
+    problem_severity: str,
+    problem_phase: str,
+    followed_ai_advice: str,
+    ai_advice_helpfulness: str,
+) -> None:
+    if harvest_status not in VALID_HARVEST_STATUSES:
+        raise InvalidCycleResultError(
+            "harvest_status must be one of: suitable, partial, weak_suitable, failed, stopped_early"
+        )
+    if completion_reason not in VALID_COMPLETION_REASONS:
+        raise InvalidCycleResultError(
+            "completion_reason must be one of: planned, harvest_ready, plant_problems, test_cycle, other"
+        )
+    if problem_severity not in VALID_PROBLEM_SEVERITIES:
+        raise InvalidCycleResultError(
+            "problem_severity must be one of: none, minor, noticeable, bad, unknown"
+        )
+    if problem_phase not in VALID_PROBLEM_PHASES:
+        raise InvalidCycleResultError(
+            "problem_phase must be one of: early, middle, end, whole_cycle, unknown"
+        )
+    if followed_ai_advice not in VALID_FOLLOWED_AI_ADVICE:
+        raise InvalidCycleResultError(
+            "followed_ai_advice must be one of: yes, partial, no, no_advice, unknown"
+        )
+    if ai_advice_helpfulness not in VALID_AI_ADVICE_HELPFULNESS:
+        raise InvalidCycleResultError(
+            "ai_advice_helpfulness must be one of: yes, partial, no, worse, unknown"
+        )
+    if harvest_mass_grams is not None and harvest_mass_grams < 0:
+        raise InvalidCycleResultError("harvest_mass_grams must not be negative")
+
+
+def _save_cycle_result(
+    cursor,
+    cycle_id: int,
+    harvest_status: str,
+    harvest_mass_grams: float | None,
+    completion_reason: str,
+    problem_severity: str,
+    problem_phase: str,
+    plant_appearance: dict[str, Any],
+    cycle_problems: dict[str, Any],
+    manual_actions: dict[str, Any],
+    followed_ai_advice: str,
+    ai_advice_helpfulness: str,
+    operator_comment: str | None,
+) -> dict[str, Any]:
+    validate_cycle_result_payload(
+        harvest_status,
+        harvest_mass_grams,
+        completion_reason,
+        problem_severity,
+        problem_phase,
+        followed_ai_advice,
+        ai_advice_helpfulness,
+    )
+    cursor.execute(
+        """
+        INSERT INTO cycle_results (
+            cycle_id, harvest_status, harvest_mass_grams,
+            completion_reason, problem_severity, problem_phase,
+            plant_appearance, cycle_problems, manual_actions, followed_ai_advice,
+            ai_advice_helpfulness, operator_comment, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+        ON CONFLICT (cycle_id) DO UPDATE SET
+            harvest_status = EXCLUDED.harvest_status,
+            harvest_mass_grams = EXCLUDED.harvest_mass_grams,
+            completion_reason = EXCLUDED.completion_reason,
+            problem_severity = EXCLUDED.problem_severity,
+            problem_phase = EXCLUDED.problem_phase,
+            plant_appearance = EXCLUDED.plant_appearance,
+            cycle_problems = EXCLUDED.cycle_problems,
+            manual_actions = EXCLUDED.manual_actions,
+            followed_ai_advice = EXCLUDED.followed_ai_advice,
+            ai_advice_helpfulness = EXCLUDED.ai_advice_helpfulness,
+            operator_comment = EXCLUDED.operator_comment,
+            updated_at = now()
+        RETURNING id, cycle_id, harvest_status, harvest_mass_grams,
+                  completion_reason, problem_severity, problem_phase,
+                  plant_appearance, cycle_problems, manual_actions, followed_ai_advice,
+                  ai_advice_helpfulness, operator_comment, created_at, updated_at
+        """,
+        (
+            cycle_id,
+            harvest_status,
+            harvest_mass_grams,
+            completion_reason,
+            problem_severity,
+            problem_phase,
+            Jsonb(plant_appearance or {}),
+            Jsonb(cycle_problems or {}),
+            Jsonb(manual_actions or {}),
+            followed_ai_advice,
+            ai_advice_helpfulness,
+            operator_comment,
+        ),
+    )
+    return row_to_cycle_result(cursor.fetchone())
 
 
 def save_cycle_result(
     cycle_id: int,
-    harvest_weight_grams: float | None = None,
-    quality_score: int | None = None,
+    harvest_status: str,
+    harvest_mass_grams: float | None,
+    completion_reason: str,
+    problem_severity: str,
+    problem_phase: str,
+    plant_appearance: dict[str, Any],
+    cycle_problems: dict[str, Any],
+    manual_actions: dict[str, Any],
+    followed_ai_advice: str,
+    ai_advice_helpfulness: str,
     operator_comment: str | None = None,
 ) -> dict[str, Any]:
-    if quality_score is not None and not 1 <= quality_score <= 5:
-        raise InvalidCycleResultError("quality_score must be in range 1..5")
-
     with get_connection() as connection:
         with connection.cursor() as cursor:
             ensure_cycle_results_schema(cursor)
@@ -1931,24 +2182,21 @@ def save_cycle_result(
                     f"Growing cycle '{cycle_id}' is not finished"
                 )
 
-            cursor.execute(
-                """
-                INSERT INTO cycle_results (
-                    cycle_id, harvest_weight_grams, quality_score,
-                    operator_comment, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, now(), now())
-                ON CONFLICT (cycle_id) DO UPDATE SET
-                    harvest_weight_grams = EXCLUDED.harvest_weight_grams,
-                    quality_score = EXCLUDED.quality_score,
-                    operator_comment = EXCLUDED.operator_comment,
-                    updated_at = now()
-                RETURNING id, cycle_id, harvest_weight_grams, quality_score,
-                          operator_comment, created_at, updated_at
-                """,
-                (cycle_id, harvest_weight_grams, quality_score, operator_comment),
+            return _save_cycle_result(
+                cursor,
+                cycle_id,
+                harvest_status,
+                harvest_mass_grams,
+                completion_reason,
+                problem_severity,
+                problem_phase,
+                plant_appearance,
+                cycle_problems,
+                manual_actions,
+                followed_ai_advice,
+                ai_advice_helpfulness,
+                operator_comment,
             )
-            return row_to_cycle_result(cursor.fetchone())
 
 
 def get_cycle_with_result(cycle_id: int) -> dict[str, Any]:
@@ -2802,6 +3050,54 @@ def finish_growing_cycle(
             updated = cursor.fetchone()
             cycle = _select_growing_cycle_by_id(cursor, updated["id"])
             return row_to_growing_cycle(cycle)
+
+
+def finish_growing_cycle_with_result(
+    tray_id: str = DEFAULT_TRAY_ID,
+    result_payload: dict[str, Any] | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    payload = result_payload or {}
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_cycle_results_schema(cursor)
+            active_cycle = _get_current_growing_cycle(cursor, normalized_tray_id)
+            if active_cycle is None:
+                raise NoActiveGrowingCycleError(
+                    f"Tray '{normalized_tray_id}' has no active growing cycle"
+                )
+
+            cursor.execute(
+                """
+                UPDATE growing_cycles
+                SET status = 'finished',
+                    finished_at = now(),
+                    notes = COALESCE(%s, notes)
+                WHERE id = %s
+                RETURNING id
+                """,
+                (notes, active_cycle["id"]),
+            )
+            updated = cursor.fetchone()
+            result = _save_cycle_result(
+                cursor,
+                updated["id"],
+                payload.get("harvest_status"),
+                payload.get("harvest_mass_grams"),
+                payload.get("completion_reason"),
+                payload.get("problem_severity", "unknown"),
+                payload.get("problem_phase", "unknown"),
+                payload.get("plant_appearance") or {},
+                payload.get("cycle_problems") or {},
+                payload.get("manual_actions") or {},
+                payload.get("followed_ai_advice", "unknown"),
+                payload.get("ai_advice_helpfulness", "unknown"),
+                payload.get("operator_comment"),
+            )
+            cycle = row_to_growing_cycle(_select_growing_cycle_by_id(cursor, updated["id"]))
+            return {"cycle": cycle, "result": result}
 
 
 def init_db() -> None:
