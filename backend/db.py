@@ -145,6 +145,14 @@ class AdvisorReportNotFoundError(ValueError):
     pass
 
 
+class AgrotechRevisionProposalNotFoundError(ValueError):
+    pass
+
+
+class AgrotechRevisionProposalApplyError(ValueError):
+    pass
+
+
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
@@ -2887,6 +2895,9 @@ def ensure_agrotech_revision_proposals_schema(cursor) -> None:
             auto_apply_eligible BOOLEAN NOT NULL DEFAULT false,
             safety_notes JSONB NOT NULL DEFAULT '[]'::jsonb,
             raw_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+            applied_revision_id BIGINT,
+            applied_at TIMESTAMPTZ,
+            apply_error TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
@@ -2908,6 +2919,9 @@ def ensure_agrotech_revision_proposals_schema(cursor) -> None:
         ("auto_apply_eligible", "BOOLEAN"),
         ("safety_notes", "JSONB"),
         ("raw_response", "JSONB"),
+        ("applied_revision_id", "BIGINT"),
+        ("applied_at", "TIMESTAMPTZ"),
+        ("apply_error", "TEXT"),
         ("created_at", "TIMESTAMPTZ"),
         ("updated_at", "TIMESTAMPTZ"),
     ):
@@ -2965,6 +2979,7 @@ def ensure_agrotech_revision_proposals_schema(cursor) -> None:
         ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_card_id_cards", "card_id", "agrotech_cards"),
         ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_crop_id_crops", "crop_id", "crops"),
         ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_source_revision_id_revisions", "source_revision_id", "agrotech_card_revisions"),
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_applied_revision_id_revisions", "applied_revision_id", "agrotech_card_revisions"),
     ):
         add_foreign_key_if_missing(
             cursor,
@@ -2996,6 +3011,9 @@ def row_to_agrotech_revision_proposal(row: dict[str, Any] | None) -> dict[str, A
         "auto_apply_eligible": row["auto_apply_eligible"],
         "safety_notes": row["safety_notes"] or [],
         "raw_response": row["raw_response"] or {},
+        "applied_revision_id": row["applied_revision_id"],
+        "applied_at": format_timestamp(row["applied_at"]) if row["applied_at"] else None,
+        "apply_error": row["apply_error"],
         "created_at": format_timestamp(row["created_at"]),
         "updated_at": format_timestamp(row["updated_at"]),
     }
@@ -3055,6 +3073,8 @@ def save_agrotech_revision_proposal(
     auto_apply_eligible: bool = False,
     safety_notes: list[Any] | None = None,
     raw_response: dict[str, Any] | list[Any] | None = None,
+    applied_revision_id: int | None = None,
+    apply_error: str | None = None,
 ) -> dict[str, Any]:
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -3065,9 +3085,10 @@ def save_agrotech_revision_proposal(
                     cycle_id, analysis_id, card_id, crop_id, source_revision_id,
                     proposed_version_major, proposed_version_minor, proposed_content,
                     proposed_norms, proposed_changes, ai_reasoning, status,
-                    auto_apply_eligible, safety_notes, raw_response, created_at, updated_at
+                    auto_apply_eligible, safety_notes, raw_response,
+                    applied_revision_id, apply_error, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
                 ON CONFLICT (cycle_id) DO UPDATE
                 SET analysis_id = EXCLUDED.analysis_id,
                     card_id = EXCLUDED.card_id,
@@ -3083,6 +3104,9 @@ def save_agrotech_revision_proposal(
                     auto_apply_eligible = EXCLUDED.auto_apply_eligible,
                     safety_notes = EXCLUDED.safety_notes,
                     raw_response = EXCLUDED.raw_response,
+                    applied_revision_id = EXCLUDED.applied_revision_id,
+                    applied_at = NULL,
+                    apply_error = EXCLUDED.apply_error,
                     updated_at = now()
                 RETURNING *
                 """,
@@ -3102,6 +3126,8 @@ def save_agrotech_revision_proposal(
                     bool(auto_apply_eligible),
                     Jsonb(safety_notes or []),
                     Jsonb(raw_response or {}),
+                    applied_revision_id,
+                    apply_error,
                 ),
             )
             return row_to_agrotech_revision_proposal(cursor.fetchone())
@@ -3164,6 +3190,319 @@ def list_agrotech_revision_proposals(status: str | None = None, limit: int = 100
                     (normalized_limit,),
                 )
             return [row_to_agrotech_revision_proposal(row) for row in cursor.fetchall()]
+
+
+def _get_revision_for_apply(cursor, revision_id: int | None) -> dict[str, Any] | None:
+    if revision_id is None:
+        return None
+    cursor.execute(
+        """
+        SELECT id, card_id, version_major, version_minor,
+               parent_revision_id, content, source,
+               change_reason, created_by, created_at, is_active
+        FROM agrotech_card_revisions
+        WHERE id = %s
+        """,
+        (revision_id,),
+    )
+    return with_version_label(cursor.fetchone())
+
+
+def _get_latest_revision_version(cursor, card_id: int) -> tuple[int, int]:
+    cursor.execute(
+        """
+        SELECT version_major, version_minor
+        FROM agrotech_card_revisions
+        WHERE card_id = %s
+        ORDER BY version_major DESC, version_minor DESC, id DESC
+        LIMIT 1
+        """,
+        (card_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return 1, 0
+    return int(row["version_major"]), int(row["version_minor"])
+
+
+def _coerce_norm_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_numeric_values(value: Any) -> list[float]:
+    if isinstance(value, dict):
+        values = []
+        for key in ("min", "max", "target", "value"):
+            number = _coerce_norm_number(value.get(key))
+            if number is not None:
+                values.append(number)
+        return values
+    number = _coerce_norm_number(value)
+    return [number] if number is not None else []
+
+
+def _norm_change_threshold(metric: str) -> float:
+    if metric == "ph":
+        return 0.3
+    if metric == "ec":
+        return 0.4
+    if metric in {"air_temp", "water_temp"}:
+        return 3.0
+    if metric == "humidity":
+        return 15.0
+    return 25.0
+
+
+def _find_agrotech_norm_safety_notes(source_norms: dict[str, Any], proposed_norms: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    for metric, proposed_value in proposed_norms.items():
+        if metric not in AGROTECH_NORM_KEYS:
+            continue
+        old_numbers = _norm_numeric_values(source_norms.get(metric))
+        new_numbers = _norm_numeric_values(proposed_value)
+        if not old_numbers or not new_numbers:
+            continue
+        threshold = _norm_change_threshold(metric)
+        comparable_count = min(len(old_numbers), len(new_numbers))
+        for index in range(comparable_count):
+            delta = abs(new_numbers[index] - old_numbers[index])
+            if delta > threshold:
+                notes.append(
+                    f"{metric}: proposed norm change is too large ({old_numbers[index]} -> {new_numbers[index]})"
+                )
+                break
+    return notes
+
+
+def _merge_revision_norms(source_norms: dict[str, Any], proposed_norms: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(source_norms or {})
+    for metric in AGROTECH_NORM_KEYS:
+        if metric in proposed_norms and proposed_norms[metric] is not None:
+            merged[metric] = proposed_norms[metric]
+    return merged
+
+
+def _update_proposal_apply_error(cursor, proposal_id: int, status: str, reason: str) -> dict[str, Any]:
+    cursor.execute(
+        """
+        UPDATE agrotech_revision_proposals
+        SET status = %s,
+            apply_error = %s,
+            updated_at = now()
+        WHERE id = %s
+        RETURNING *
+        """,
+        (status, reason, proposal_id),
+    )
+    return row_to_agrotech_revision_proposal(cursor.fetchone())
+
+
+def _build_apply_result(
+    *,
+    status: str,
+    proposal: dict[str, Any],
+    created_revision: dict[str, Any] | None = None,
+    existing_revision: dict[str, Any] | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "proposal": proposal,
+        "created_revision": created_revision,
+        "existing_revision": existing_revision,
+        "reason": reason,
+    }
+
+
+def apply_agrotech_revision_proposal(proposal_id: int, force: bool = False) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            ensure_agrotech_norms_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM agrotech_revision_proposals
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (proposal_id,),
+            )
+            proposal_row = cursor.fetchone()
+            if proposal_row is None:
+                raise AgrotechRevisionProposalNotFoundError(
+                    f"Agrotech revision proposal '{proposal_id}' not found"
+                )
+
+            proposal = row_to_agrotech_revision_proposal(proposal_row)
+            if proposal["status"] == "auto_applied" and proposal["applied_revision_id"]:
+                existing_revision = _get_revision_for_apply(cursor, proposal["applied_revision_id"])
+                return _build_apply_result(
+                    status="already_applied",
+                    proposal=proposal,
+                    existing_revision=existing_revision,
+                )
+
+            if not proposal["auto_apply_eligible"] and not force:
+                reason = "Proposal is not auto-apply eligible. Use force=true only for test application."
+                updated_proposal = _update_proposal_apply_error(cursor, proposal_id, "auto_deferred", reason)
+                return _build_apply_result(status="auto_deferred", proposal=updated_proposal, reason=reason)
+
+            if not proposal["card_id"] or not proposal["crop_id"] or not proposal["source_revision_id"]:
+                reason = "Proposal is missing card_id, crop_id or source_revision_id"
+                updated_proposal = _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+
+            source_revision = _get_revision_for_apply(cursor, proposal["source_revision_id"])
+            if source_revision is None:
+                reason = f"Source revision '{proposal['source_revision_id']}' not found"
+                _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+            if source_revision["card_id"] != proposal["card_id"]:
+                reason = "Source revision card_id does not match proposal card_id"
+                _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+            if not source_revision["is_active"]:
+                reason = "Source revision is no longer active for this card"
+                updated_proposal = _update_proposal_apply_error(cursor, proposal_id, "auto_deferred", reason)
+                return _build_apply_result(status="auto_deferred", proposal=updated_proposal, reason=reason)
+
+            proposed_content = (proposal["proposed_content"] or "").strip()
+            proposed_changes = proposal["proposed_changes"]
+            proposed_norms = proposal["proposed_norms"] or {}
+            if not proposed_content:
+                reason = "Proposal content is empty"
+                _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+            if not isinstance(proposed_changes, list) or not proposed_changes:
+                reason = "Proposal changes must be a non-empty list"
+                _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+            if proposed_norms is not None and not isinstance(proposed_norms, dict):
+                reason = "Proposal norms must be a JSON object"
+                _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+
+            source_norms = get_revision_norms(cursor, proposal["source_revision_id"])
+            norm_safety_notes = _find_agrotech_norm_safety_notes(source_norms, proposed_norms)
+            if norm_safety_notes and not force:
+                reason = "; ".join(norm_safety_notes)
+                updated_proposal = _update_proposal_apply_error(cursor, proposal_id, "auto_deferred", reason)
+                return _build_apply_result(status="auto_deferred", proposal=updated_proposal, reason=reason)
+
+            latest_major, latest_minor = _get_latest_revision_version(cursor, proposal["card_id"])
+            new_major = latest_major
+            new_minor = latest_minor + 1
+            merged_norms = _merge_revision_norms(source_norms, proposed_norms)
+            safety_notes = proposal["safety_notes"] or []
+            change_reason_parts = [
+                proposal["ai_reasoning"] or "AI auto improvement proposal",
+                f"proposal_id={proposal['id']}",
+                f"cycle_id={proposal['cycle_id']}",
+            ]
+            if proposal["analysis_id"]:
+                change_reason_parts.append(f"analysis_id={proposal['analysis_id']}")
+            if safety_notes:
+                change_reason_parts.append(f"safety_notes={json.dumps(safety_notes, ensure_ascii=False)}")
+            if norm_safety_notes:
+                change_reason_parts.append(f"forced_norm_safety_notes={json.dumps(norm_safety_notes, ensure_ascii=False)}")
+            change_reason = " | ".join(change_reason_parts)
+
+            cursor.execute(
+                """
+                UPDATE agrotech_card_revisions
+                SET is_active = false
+                WHERE card_id = %s
+                  AND is_active
+                """,
+                (proposal["card_id"],),
+            )
+            cursor.execute(
+                """
+                INSERT INTO agrotech_card_revisions (
+                    card_id, version_major, version_minor,
+                    parent_revision_id, content, source,
+                    change_reason, created_by, is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, true)
+                RETURNING id, card_id, version_major, version_minor,
+                          parent_revision_id, content, source,
+                          change_reason, created_by, created_at, is_active
+                """,
+                (
+                    proposal["card_id"],
+                    new_major,
+                    new_minor,
+                    proposal["source_revision_id"],
+                    proposed_content,
+                    "ai_auto_improvement",
+                    change_reason,
+                    "neirognom",
+                ),
+            )
+            created_revision = with_version_label(cursor.fetchone())
+            save_revision_norms(cursor, created_revision["id"], merged_norms)
+            save_card_sections(cursor, created_revision["id"], proposed_content)
+            cursor.execute(
+                """
+                INSERT INTO agrotech_audit_log (
+                    card_id, revision_id, action, reason, created_at
+                )
+                VALUES (%s, %s, %s, %s, now())
+                """,
+                (
+                    proposal["card_id"],
+                    created_revision["id"],
+                    "auto_revision_created",
+                    change_reason,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE agrotech_revision_proposals
+                SET status = 'auto_applied',
+                    applied_revision_id = %s,
+                    applied_at = now(),
+                    apply_error = NULL,
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (created_revision["id"], proposal_id),
+            )
+            updated_proposal = row_to_agrotech_revision_proposal(cursor.fetchone())
+            return _build_apply_result(
+                status="auto_applied",
+                proposal=updated_proposal,
+                created_revision=created_revision,
+            )
+
+
+def apply_cycle_agrotech_revision_proposal(cycle_id: int, force: bool = False) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            cursor.execute(
+                """
+                SELECT id
+                FROM agrotech_revision_proposals
+                WHERE cycle_id = %s
+                """,
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise AgrotechRevisionProposalNotFoundError(
+                    f"Agrotech revision proposal for cycle '{cycle_id}' not found"
+                )
+    return apply_agrotech_revision_proposal(row["id"], force=force)
 
 
 def validate_cycle_result_payload(

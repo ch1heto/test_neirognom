@@ -18,12 +18,16 @@ from pydantic import BaseModel
 from db import (
     ActiveCardRevisionNotFoundError,
     ActiveGrowingCycleExistsError,
+    AgrotechRevisionProposalApplyError,
+    AgrotechRevisionProposalNotFoundError,
     CropNotFoundError,
     GrowingCycleNotFinishedError,
     GrowingCycleNotFoundError,
     InvalidCycleResultError,
     NoActiveGrowingCycleError,
     aggregate_completed_hours,
+    apply_agrotech_revision_proposal,
+    apply_cycle_agrotech_revision_proposal,
     build_cycle_analysis_report,
     delete_old_raw_data,
     finish_growing_cycle,
@@ -3605,6 +3609,32 @@ def api_get_agrotech_revision_proposal(proposal_id: int) -> dict[str, Any]:
     if proposal is None:
         raise HTTPException(status_code=404, detail={"error": f"Agrotech revision proposal '{proposal_id}' not found"})
     return proposal
+
+
+@app.post("/api/agrotech-revision-proposals/{proposal_id}/auto-apply")
+def api_auto_apply_agrotech_revision_proposal(
+    proposal_id: int,
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return apply_agrotech_revision_proposal(proposal_id, force=force)
+    except AgrotechRevisionProposalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except AgrotechRevisionProposalApplyError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@app.post("/api/cycles/{cycle_id}/apply-agrotech-revision-proposal")
+def api_apply_cycle_agrotech_revision_proposal(
+    cycle_id: int,
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return apply_cycle_agrotech_revision_proposal(cycle_id, force=force)
+    except AgrotechRevisionProposalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except AgrotechRevisionProposalApplyError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
 
 @app.get("/api/cycles/{cycle_id}/result")
