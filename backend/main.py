@@ -37,6 +37,8 @@ from db import (
     get_cycle_result,
     get_crop_agrotech_card_from_db,
     get_database_model_summary,
+    get_agrotech_revision_proposal,
+    get_cycle_agrotech_revision_proposal,
     get_hourly_history,
     get_last_climate_records,
     get_last_water_records,
@@ -52,13 +54,16 @@ from db import (
     get_cycle_analysis_report,
     get_cycle_ai_analysis,
     get_cycle_with_result,
+    get_cycle_source_revision_context,
     init_db,
+    list_agrotech_revision_proposals,
     get_metric_snapshot_after,
     get_pending_recommendations_for_effect_evaluation,
     save_ai_log,
     save_ai_recommendation,
     save_cycle_analysis_report,
     save_cycle_ai_analysis,
+    save_agrotech_revision_proposal,
     save_anomaly_event,
     save_cycle_result,
     save_device_event,
@@ -2286,6 +2291,290 @@ async def run_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail={"error": str(exc), "analysis": failed}) from exc
 
 
+AGROTECH_PROPOSAL_PROMPT_VERSION = "agrotech_revision_proposal_v1"
+AGROTECH_PROPOSAL_PRIORITIES = {"low", "medium", "high"}
+
+
+def parse_agrotech_revision_proposal_json(raw_text: str) -> dict[str, Any]:
+    cleaned = strip_markdown_backticks(raw_text)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("Agrotech proposal response must be a JSON object")
+    return parsed
+
+
+def normalize_proposal_changes(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    changes: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        priority = str(item.get("priority") or "low").strip().lower()
+        changes.append(
+            {
+                "section": str(item.get("section") or "general").strip(),
+                "change_type": str(item.get("change_type") or "clarify_instruction").strip(),
+                "old_value": str(item.get("old_value") or "").strip(),
+                "new_value": str(item.get("new_value") or "").strip(),
+                "reason": str(item.get("reason") or "данных недостаточно").strip(),
+                "priority": priority if priority in AGROTECH_PROPOSAL_PRIORITIES else "low",
+            }
+        )
+    return changes
+
+
+def normalize_proposed_norms(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def norm_bound_delta_too_large(metric_name: str, old_value: Any, new_value: Any) -> bool:
+    if not isinstance(old_value, (int, float)) or not isinstance(new_value, (int, float)):
+        return False
+    delta = abs(float(new_value) - float(old_value))
+    if metric_name == "ph":
+        return delta > 0.3
+    if metric_name == "ec":
+        return delta > 0.4
+    if metric_name in {"air_temp", "water_temp"}:
+        return delta > 3.0
+    if metric_name == "humidity":
+        return delta > 15.0
+    if old_value != 0:
+        return delta / abs(float(old_value)) > 0.25
+    return delta > 1.0
+
+
+def find_agrotech_norm_safety_notes(
+    source_norms: dict[str, Any],
+    proposed_norms: dict[str, Any],
+) -> list[str]:
+    notes: list[str] = []
+    for metric_name, proposed_value in proposed_norms.items():
+        source_value = source_norms.get(metric_name)
+        if not isinstance(source_value, dict) or not isinstance(proposed_value, dict):
+            continue
+        for bound in ("min", "max", "target"):
+            if bound not in proposed_value or bound not in source_value:
+                continue
+            if norm_bound_delta_too_large(metric_name, source_value.get(bound), proposed_value.get(bound)):
+                notes.append(
+                    f"norm_change: {metric_name}.{bound} changes from {source_value.get(bound)} to {proposed_value.get(bound)}; auto-apply disabled."
+                )
+    return notes
+
+
+def normalize_agrotech_proposal_payload(
+    payload: dict[str, Any],
+    *,
+    source_content: str,
+    source_norms: dict[str, Any],
+) -> dict[str, Any]:
+    proposed_content = str(payload.get("proposed_content") or "").strip()
+    proposed_norms = normalize_proposed_norms(payload.get("proposed_norms"))
+    proposed_changes = normalize_proposal_changes(payload.get("proposed_changes"))
+    safety_notes = [
+        str(item).strip()
+        for item in (payload.get("safety_notes") if isinstance(payload.get("safety_notes"), list) else [])
+        if str(item).strip()
+    ]
+
+    auto_apply_eligible = bool(payload.get("auto_apply_eligible", False))
+    if not proposed_content:
+        proposed_content = source_content
+        safety_notes.append("empty_content: model returned empty proposed_content; source content preserved.")
+        auto_apply_eligible = False
+    if not proposed_changes:
+        safety_notes.append("no_changes: model returned no structured proposed_changes.")
+        auto_apply_eligible = False
+
+    norm_notes = find_agrotech_norm_safety_notes(source_norms, proposed_norms)
+    if norm_notes:
+        safety_notes.extend(norm_notes)
+        auto_apply_eligible = False
+
+    has_medium_or_high = any(change.get("priority") in {"medium", "high"} for change in proposed_changes)
+    if not has_medium_or_high:
+        safety_notes.append("low_priority_only: no medium/high priority changes; auto-apply disabled.")
+        auto_apply_eligible = False
+
+    return {
+        "proposed_content": proposed_content,
+        "proposed_norms": proposed_norms,
+        "proposed_changes": proposed_changes,
+        "ai_reasoning": str(payload.get("ai_reasoning") or "").strip() or None,
+        "auto_apply_eligible": auto_apply_eligible,
+        "safety_notes": safety_notes,
+    }
+
+
+def build_agrotech_revision_proposal_prompt(
+    *,
+    source_revision: dict[str, Any],
+    analysis: dict[str, Any],
+    report: dict[str, Any],
+) -> str:
+    source_payload = {
+        "cycle_id": source_revision["cycle_id"],
+        "crop_slug": source_revision["crop_slug"],
+        "crop_name_ru": source_revision["crop_name_ru"],
+        "source_revision_id": source_revision["source_revision_id"],
+        "source_version": source_revision["source_version_label"],
+        "source_content": source_revision["content"],
+        "source_norms": source_revision.get("norms") or {},
+    }
+    analysis_payload = {
+        "summary": analysis.get("summary"),
+        "main_findings": analysis.get("main_findings"),
+        "recommendation_review": analysis.get("recommendation_review"),
+        "potential_improvements": analysis.get("potential_improvements"),
+        "should_propose_new_revision": analysis.get("should_propose_new_revision"),
+        "revision_reason": analysis.get("revision_reason"),
+        "confidence": analysis.get("confidence"),
+    }
+    return (
+        "Ты Нейрогном. Подготовь черновик улучшения АгроТехКарты по завершённому циклу.\n"
+        "Это только proposal: НЕ создавай новую ревизию в БД, НЕ меняй active revision, НЕ пиши оператору кнопки принятия.\n"
+        "Используй только source_revision, cycle_analysis_report.report_payload и cycle_ai_analysis ниже.\n"
+        "Не придумывай факты, которых нет в отчёте или AI-анализе.\n"
+        "Не переписывай карту радикально. Улучшай в первую очередь инструкции, порядок действий и уточнения.\n"
+        "Числовые нормы pH/EC/температуры/влажности меняй только при очень сильном обосновании в анализе.\n"
+        "Если данных недостаточно, proposed_content должен быть близок к исходному, auto_apply_eligible=false.\n"
+        "Верни только валидный JSON без markdown.\n\n"
+        "JSON schema:\n"
+        "{\n"
+        '  "proposed_content": "...полный текст улучшенной АгроТехКарты...",\n'
+        '  "proposed_norms": {},\n'
+        '  "proposed_changes": [{"section": "solution", "change_type": "clarify_instruction", "old_value": "...", "new_value": "...", "reason": "...", "priority": "low/medium/high"}],\n'
+        '  "ai_reasoning": "...",\n'
+        '  "auto_apply_eligible": false,\n'
+        '  "safety_notes": ["..."]\n'
+        "}\n\n"
+        f"source_revision:\n{json.dumps(source_payload, ensure_ascii=False, default=str)}\n\n"
+        f"cycle_ai_analysis:\n{json.dumps(analysis_payload, ensure_ascii=False, default=str)}\n\n"
+        f"cycle_analysis_report_payload:\n{json.dumps(report.get('report_payload') or {}, ensure_ascii=False, default=str)}"
+    )
+
+
+async def run_agrotech_revision_proposal(cycle_id: int, force: bool = False) -> dict[str, Any]:
+    analysis = await asyncio.to_thread(get_cycle_ai_analysis, cycle_id)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail={"error": f"AI analysis for cycle '{cycle_id}' not found"})
+
+    report = await asyncio.to_thread(get_cycle_analysis_report, cycle_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail={"error": f"Analysis report for cycle '{cycle_id}' not found"})
+
+    source_revision = await asyncio.to_thread(get_cycle_source_revision_context, cycle_id)
+    if source_revision is None:
+        raise HTTPException(status_code=404, detail={"error": f"Source revision for cycle '{cycle_id}' not found"})
+
+    proposed_major = int(source_revision["version_major"])
+    proposed_minor = int(source_revision["version_minor"]) + 1
+
+    if not force and not bool(analysis.get("should_propose_new_revision")):
+        return await asyncio.to_thread(
+            save_agrotech_revision_proposal,
+            cycle_id=cycle_id,
+            analysis_id=analysis["id"],
+            card_id=source_revision["card_id"],
+            crop_id=source_revision["crop_id"],
+            source_revision_id=source_revision["source_revision_id"],
+            proposed_version_major=proposed_major,
+            proposed_version_minor=proposed_minor,
+            proposed_content=None,
+            proposed_norms={},
+            proposed_changes=[],
+            ai_reasoning=analysis.get("revision_reason") or "AI analysis did not recommend preparing a new revision proposal.",
+            status="auto_deferred",
+            auto_apply_eligible=False,
+            safety_notes=["deferred: should_propose_new_revision=false and force=false."],
+            raw_response={"source": "backend_defer", "analysis": analysis},
+        )
+
+    model_name = os.getenv("AI_MODEL", "gpt-5.4-mini")
+    prompt = build_agrotech_revision_proposal_prompt(
+        source_revision=source_revision,
+        analysis=analysis,
+        report=report,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        raw_text = response.choices[0].message.content or ""
+        parsed = parse_agrotech_revision_proposal_json(raw_text)
+        normalized = normalize_agrotech_proposal_payload(
+            parsed,
+            source_content=str(source_revision.get("content") or ""),
+            source_norms=source_revision.get("norms") or {},
+        )
+        if not normalized["proposed_content"].strip():
+            raise ValueError("proposed_content is empty")
+
+        return await asyncio.to_thread(
+            save_agrotech_revision_proposal,
+            cycle_id=cycle_id,
+            analysis_id=analysis["id"],
+            card_id=source_revision["card_id"],
+            crop_id=source_revision["crop_id"],
+            source_revision_id=source_revision["source_revision_id"],
+            proposed_version_major=proposed_major,
+            proposed_version_minor=proposed_minor,
+            proposed_content=normalized["proposed_content"],
+            proposed_norms=normalized["proposed_norms"],
+            proposed_changes=normalized["proposed_changes"],
+            ai_reasoning=normalized["ai_reasoning"],
+            status="generated",
+            auto_apply_eligible=normalized["auto_apply_eligible"],
+            safety_notes=normalized["safety_notes"],
+            raw_response={
+                "model_name": model_name,
+                "prompt_version": AGROTECH_PROPOSAL_PROMPT_VERSION,
+                "response": parsed,
+            },
+        )
+    except json.JSONDecodeError as exc:
+        failed = await asyncio.to_thread(
+            save_agrotech_revision_proposal,
+            cycle_id=cycle_id,
+            analysis_id=analysis["id"],
+            card_id=source_revision["card_id"],
+            crop_id=source_revision["crop_id"],
+            source_revision_id=source_revision["source_revision_id"],
+            proposed_version_major=proposed_major,
+            proposed_version_minor=proposed_minor,
+            status="failed",
+            auto_apply_eligible=False,
+            safety_notes=["failed: model returned invalid JSON."],
+            raw_response={"error": str(exc), "raw_response": raw_text if "raw_text" in locals() else ""},
+        )
+        raise HTTPException(status_code=502, detail={"error": "AI model returned invalid JSON", "proposal": failed}) from exc
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        failed = await asyncio.to_thread(
+            save_agrotech_revision_proposal,
+            cycle_id=cycle_id,
+            analysis_id=analysis["id"],
+            card_id=source_revision["card_id"],
+            crop_id=source_revision["crop_id"],
+            source_revision_id=source_revision["source_revision_id"],
+            proposed_version_major=proposed_major,
+            proposed_version_minor=proposed_minor,
+            status="failed",
+            auto_apply_eligible=False,
+            safety_notes=[f"failed: {exc}"],
+            raw_response={"error": str(exc)},
+        )
+        raise HTTPException(status_code=502, detail={"error": str(exc), "proposal": failed}) from exc
+
+
 async def extract_recommendations_from_reply(
     reply: str,
     user_message: str,
@@ -3292,6 +3581,30 @@ def api_get_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
     if analysis is None:
         raise HTTPException(status_code=404, detail={"error": f"AI analysis for cycle '{cycle_id}' not found"})
     return analysis
+
+
+@app.post("/api/cycles/{cycle_id}/agrotech-revision-proposal")
+async def api_run_agrotech_revision_proposal(
+    cycle_id: int,
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    return await run_agrotech_revision_proposal(cycle_id, force=force)
+
+
+@app.get("/api/cycles/{cycle_id}/agrotech-revision-proposal")
+def api_get_cycle_agrotech_revision_proposal(cycle_id: int) -> dict[str, Any]:
+    proposal = get_cycle_agrotech_revision_proposal(cycle_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail={"error": f"Agrotech revision proposal for cycle '{cycle_id}' not found"})
+    return proposal
+
+
+@app.get("/api/agrotech-revision-proposals/{proposal_id}")
+def api_get_agrotech_revision_proposal(proposal_id: int) -> dict[str, Any]:
+    proposal = get_agrotech_revision_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail={"error": f"Agrotech revision proposal '{proposal_id}' not found"})
+    return proposal
 
 
 @app.get("/api/cycles/{cycle_id}/result")

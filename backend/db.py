@@ -2865,6 +2865,307 @@ def get_cycle_ai_analysis(cycle_id: int) -> dict[str, Any] | None:
             return row_to_cycle_ai_analysis(cursor.fetchone())
 
 
+def ensure_agrotech_revision_proposals_schema(cursor) -> None:
+    ensure_cycle_ai_analysis_schema(cursor)
+    ensure_agrotech_schema(cursor)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agrotech_revision_proposals (
+            id BIGSERIAL PRIMARY KEY,
+            cycle_id BIGINT NOT NULL UNIQUE,
+            analysis_id BIGINT,
+            card_id BIGINT NOT NULL,
+            crop_id BIGINT NOT NULL,
+            source_revision_id BIGINT NOT NULL,
+            proposed_version_major INTEGER,
+            proposed_version_minor INTEGER,
+            proposed_content TEXT,
+            proposed_norms JSONB NOT NULL DEFAULT '{}'::jsonb,
+            proposed_changes JSONB NOT NULL DEFAULT '[]'::jsonb,
+            ai_reasoning TEXT,
+            status TEXT NOT NULL DEFAULT 'generated',
+            auto_apply_eligible BOOLEAN NOT NULL DEFAULT false,
+            safety_notes JSONB NOT NULL DEFAULT '[]'::jsonb,
+            raw_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    for column_name, column_type in (
+        ("cycle_id", "BIGINT"),
+        ("analysis_id", "BIGINT"),
+        ("card_id", "BIGINT"),
+        ("crop_id", "BIGINT"),
+        ("source_revision_id", "BIGINT"),
+        ("proposed_version_major", "INTEGER"),
+        ("proposed_version_minor", "INTEGER"),
+        ("proposed_content", "TEXT"),
+        ("proposed_norms", "JSONB"),
+        ("proposed_changes", "JSONB"),
+        ("ai_reasoning", "TEXT"),
+        ("status", "TEXT"),
+        ("auto_apply_eligible", "BOOLEAN"),
+        ("safety_notes", "JSONB"),
+        ("raw_response", "JSONB"),
+        ("created_at", "TIMESTAMPTZ"),
+        ("updated_at", "TIMESTAMPTZ"),
+    ):
+        cursor.execute(
+            sql.SQL("ALTER TABLE agrotech_revision_proposals ADD COLUMN IF NOT EXISTS {} {}").format(
+                sql.Identifier(column_name),
+                sql.SQL(column_type),
+            )
+        )
+    for column_name in ("proposed_norms", "proposed_changes", "safety_notes", "raw_response"):
+        ensure_jsonb_column(cursor, "agrotech_revision_proposals", column_name)
+    cursor.execute("UPDATE agrotech_revision_proposals SET proposed_norms = '{}'::jsonb WHERE proposed_norms IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET proposed_changes = '[]'::jsonb WHERE proposed_changes IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET status = 'generated' WHERE status IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET auto_apply_eligible = false WHERE auto_apply_eligible IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET safety_notes = '[]'::jsonb WHERE safety_notes IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET raw_response = '{}'::jsonb WHERE raw_response IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("UPDATE agrotech_revision_proposals SET updated_at = now() WHERE updated_at IS NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN cycle_id SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN card_id SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN crop_id SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN source_revision_id SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN proposed_norms SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN proposed_norms SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN proposed_changes SET DEFAULT '[]'::jsonb")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN proposed_changes SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN status SET DEFAULT 'generated'")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN status SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN auto_apply_eligible SET DEFAULT false")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN auto_apply_eligible SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN safety_notes SET DEFAULT '[]'::jsonb")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN safety_notes SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN raw_response SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN raw_response SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN created_at SET NOT NULL")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN updated_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE agrotech_revision_proposals ALTER COLUMN updated_at SET NOT NULL")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agrotech_revision_proposals_cycle_id
+        ON agrotech_revision_proposals(cycle_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agrotech_revision_proposals_status_updated_at
+        ON agrotech_revision_proposals(status, updated_at DESC)
+        """
+    )
+    for table_name, constraint_name, column_name, ref_table in (
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_cycle_id_cycles", "cycle_id", "growing_cycles"),
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_analysis_id_analysis", "analysis_id", "cycle_ai_analysis"),
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_card_id_cards", "card_id", "agrotech_cards"),
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_crop_id_crops", "crop_id", "crops"),
+        ("agrotech_revision_proposals", "fk_agrotech_revision_proposals_source_revision_id_revisions", "source_revision_id", "agrotech_card_revisions"),
+    ):
+        add_foreign_key_if_missing(
+            cursor,
+            table_name,
+            constraint_name,
+            column_name,
+            ref_table,
+            "id",
+        )
+
+
+def row_to_agrotech_revision_proposal(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "cycle_id": row["cycle_id"],
+        "analysis_id": row["analysis_id"],
+        "card_id": row["card_id"],
+        "crop_id": row["crop_id"],
+        "source_revision_id": row["source_revision_id"],
+        "proposed_version_major": row["proposed_version_major"],
+        "proposed_version_minor": row["proposed_version_minor"],
+        "proposed_content": row["proposed_content"],
+        "proposed_norms": row["proposed_norms"] or {},
+        "proposed_changes": row["proposed_changes"] or [],
+        "ai_reasoning": row["ai_reasoning"],
+        "status": row["status"],
+        "auto_apply_eligible": row["auto_apply_eligible"],
+        "safety_notes": row["safety_notes"] or [],
+        "raw_response": row["raw_response"] or {},
+        "created_at": format_timestamp(row["created_at"]),
+        "updated_at": format_timestamp(row["updated_at"]),
+    }
+
+
+def get_cycle_source_revision_context(cycle_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_norms_schema(cursor)
+            cursor.execute(
+                """
+                SELECT
+                    growing_cycles.id AS cycle_id,
+                    growing_cycles.status AS cycle_status,
+                    growing_cycles.card_revision_id AS source_revision_id,
+                    crops.id AS crop_id,
+                    crops.slug AS crop_slug,
+                    crops.name_ru AS crop_name_ru,
+                    agrotech_cards.id AS card_id,
+                    agrotech_card_revisions.version_major,
+                    agrotech_card_revisions.version_minor,
+                    agrotech_card_revisions.content
+                FROM growing_cycles
+                JOIN crops ON crops.id = growing_cycles.crop_id
+                JOIN agrotech_card_revisions
+                  ON agrotech_card_revisions.id = growing_cycles.card_revision_id
+                JOIN agrotech_cards
+                  ON agrotech_cards.id = agrotech_card_revisions.card_id
+                WHERE growing_cycles.id = %s
+                """,
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                **row,
+                "source_version_label": make_version_label(row["version_major"], row["version_minor"]),
+                "norms": get_revision_norms(cursor, row["source_revision_id"]),
+            }
+
+
+def save_agrotech_revision_proposal(
+    *,
+    cycle_id: int,
+    analysis_id: int | None,
+    card_id: int,
+    crop_id: int,
+    source_revision_id: int,
+    proposed_version_major: int | None = None,
+    proposed_version_minor: int | None = None,
+    proposed_content: str | None = None,
+    proposed_norms: dict[str, Any] | None = None,
+    proposed_changes: list[dict[str, Any]] | None = None,
+    ai_reasoning: str | None = None,
+    status: str = "generated",
+    auto_apply_eligible: bool = False,
+    safety_notes: list[Any] | None = None,
+    raw_response: dict[str, Any] | list[Any] | None = None,
+) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            cursor.execute(
+                """
+                INSERT INTO agrotech_revision_proposals (
+                    cycle_id, analysis_id, card_id, crop_id, source_revision_id,
+                    proposed_version_major, proposed_version_minor, proposed_content,
+                    proposed_norms, proposed_changes, ai_reasoning, status,
+                    auto_apply_eligible, safety_notes, raw_response, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (cycle_id) DO UPDATE
+                SET analysis_id = EXCLUDED.analysis_id,
+                    card_id = EXCLUDED.card_id,
+                    crop_id = EXCLUDED.crop_id,
+                    source_revision_id = EXCLUDED.source_revision_id,
+                    proposed_version_major = EXCLUDED.proposed_version_major,
+                    proposed_version_minor = EXCLUDED.proposed_version_minor,
+                    proposed_content = EXCLUDED.proposed_content,
+                    proposed_norms = EXCLUDED.proposed_norms,
+                    proposed_changes = EXCLUDED.proposed_changes,
+                    ai_reasoning = EXCLUDED.ai_reasoning,
+                    status = EXCLUDED.status,
+                    auto_apply_eligible = EXCLUDED.auto_apply_eligible,
+                    safety_notes = EXCLUDED.safety_notes,
+                    raw_response = EXCLUDED.raw_response,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    cycle_id,
+                    analysis_id,
+                    card_id,
+                    crop_id,
+                    source_revision_id,
+                    proposed_version_major,
+                    proposed_version_minor,
+                    proposed_content,
+                    Jsonb(proposed_norms or {}),
+                    Jsonb(proposed_changes or []),
+                    ai_reasoning,
+                    status,
+                    bool(auto_apply_eligible),
+                    Jsonb(safety_notes or []),
+                    Jsonb(raw_response or {}),
+                ),
+            )
+            return row_to_agrotech_revision_proposal(cursor.fetchone())
+
+
+def get_cycle_agrotech_revision_proposal(cycle_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM agrotech_revision_proposals
+                WHERE cycle_id = %s
+                """,
+                (cycle_id,),
+            )
+            return row_to_agrotech_revision_proposal(cursor.fetchone())
+
+
+def get_agrotech_revision_proposal(proposal_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM agrotech_revision_proposals
+                WHERE id = %s
+                """,
+                (proposal_id,),
+            )
+            return row_to_agrotech_revision_proposal(cursor.fetchone())
+
+
+def list_agrotech_revision_proposals(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 500))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_agrotech_revision_proposals_schema(cursor)
+            if status:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM agrotech_revision_proposals
+                    WHERE status = %s
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (status, normalized_limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM agrotech_revision_proposals
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (normalized_limit,),
+                )
+            return [row_to_agrotech_revision_proposal(row) for row in cursor.fetchall()]
+
+
 def validate_cycle_result_payload(
     harvest_status: str,
     harvest_mass_grams: float | None,
@@ -3503,6 +3804,7 @@ def get_database_model_summary() -> dict[str, Any]:
             "crops",
             "agrotech_cards",
             "agrotech_card_revisions",
+            "agrotech_revision_proposals",
             "agrotech_card_sections",
             "agrotech_revision_norms",
             "agrotech_audit_log",
@@ -4163,6 +4465,7 @@ def init_db() -> None:
             ensure_cycle_results_schema(cursor)
             ensure_cycle_analysis_reports_schema(cursor)
             ensure_cycle_ai_analysis_schema(cursor)
+            ensure_agrotech_revision_proposals_schema(cursor)
             ensure_advisor_reports_schema(cursor)
             ensure_ai_logs_schema(cursor)
             ensure_ai_log_commands_schema(cursor)
