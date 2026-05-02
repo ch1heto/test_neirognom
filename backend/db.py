@@ -2415,6 +2415,175 @@ def ensure_ai_log_commands_schema(cursor) -> None:
     )
 
 
+def ensure_ai_recommendations_schema(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_recommendations (
+            id BIGSERIAL PRIMARY KEY,
+            cycle_id BIGINT NOT NULL,
+            tray_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            category TEXT NOT NULL,
+            metric_name TEXT,
+            recommendation_text TEXT NOT NULL,
+            reason TEXT,
+            sensor_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            norm_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS tray_id TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS source TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS category TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS metric_name TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS recommendation_text TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS reason TEXT")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS sensor_snapshot JSONB")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS norm_snapshot JSONB")
+    cursor.execute("ALTER TABLE ai_recommendations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    ensure_jsonb_column(cursor, "ai_recommendations", "sensor_snapshot")
+    ensure_jsonb_column(cursor, "ai_recommendations", "norm_snapshot")
+    cursor.execute("UPDATE ai_recommendations SET tray_id = %s WHERE tray_id IS NULL", (DEFAULT_TRAY_ID,))
+    cursor.execute("UPDATE ai_recommendations SET source = 'system' WHERE source IS NULL")
+    cursor.execute("UPDATE ai_recommendations SET category = 'general' WHERE category IS NULL")
+    cursor.execute("UPDATE ai_recommendations SET recommendation_text = '' WHERE recommendation_text IS NULL")
+    cursor.execute("UPDATE ai_recommendations SET sensor_snapshot = '{}'::jsonb WHERE sensor_snapshot IS NULL")
+    cursor.execute("UPDATE ai_recommendations SET norm_snapshot = '{}'::jsonb WHERE norm_snapshot IS NULL")
+    cursor.execute("UPDATE ai_recommendations SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN tray_id SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN source SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN category SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN recommendation_text SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN sensor_snapshot SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN sensor_snapshot SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN norm_snapshot SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN norm_snapshot SET NOT NULL")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE ai_recommendations ALTER COLUMN created_at SET NOT NULL")
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_recommendations_cycle_created_at
+        ON ai_recommendations(cycle_id, created_at DESC)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_recommendations_recent_dedup
+        ON ai_recommendations(cycle_id, source, category, metric_name, created_at DESC)
+        """
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "ai_recommendations",
+        "fk_ai_recommendations_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "ai_recommendations",
+        "fk_ai_recommendations_tray_id_trays",
+        "tray_id",
+        "trays",
+        "id",
+    )
+
+
+def ensure_recommendation_effects_schema(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_effects (
+            id BIGSERIAL PRIMARY KEY,
+            recommendation_id BIGINT NOT NULL,
+            cycle_id BIGINT NOT NULL,
+            tray_id TEXT NOT NULL,
+            window_minutes INTEGER NOT NULL,
+            before_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            after_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            delta_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            effect_status TEXT NOT NULL,
+            effect_summary TEXT,
+            confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS recommendation_id BIGINT")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS tray_id TEXT")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS window_minutes INTEGER")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS before_snapshot JSONB")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS after_snapshot JSONB")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS delta_snapshot JSONB")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS effect_status TEXT")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS effect_summary TEXT")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE recommendation_effects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    ensure_jsonb_column(cursor, "recommendation_effects", "before_snapshot")
+    ensure_jsonb_column(cursor, "recommendation_effects", "after_snapshot")
+    ensure_jsonb_column(cursor, "recommendation_effects", "delta_snapshot")
+    cursor.execute("UPDATE recommendation_effects SET tray_id = %s WHERE tray_id IS NULL", (DEFAULT_TRAY_ID,))
+    cursor.execute("UPDATE recommendation_effects SET window_minutes = 30 WHERE window_minutes IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET before_snapshot = '{}'::jsonb WHERE before_snapshot IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET after_snapshot = '{}'::jsonb WHERE after_snapshot IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET delta_snapshot = '{}'::jsonb WHERE delta_snapshot IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET effect_status = 'inconclusive' WHERE effect_status IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET confidence = 0 WHERE confidence IS NULL")
+    cursor.execute("UPDATE recommendation_effects SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN tray_id SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN window_minutes SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN before_snapshot SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN before_snapshot SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN after_snapshot SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN after_snapshot SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN delta_snapshot SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN delta_snapshot SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN effect_status SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN confidence SET DEFAULT 0")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN confidence SET NOT NULL")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN created_at SET NOT NULL")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendation_effects_recommendation_window
+        ON recommendation_effects(recommendation_id, window_minutes)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_recommendation_effects_cycle_created_at
+        ON recommendation_effects(cycle_id, created_at DESC)
+        """
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "recommendation_effects",
+        "fk_recommendation_effects_recommendation_id_recommendations",
+        "recommendation_id",
+        "ai_recommendations",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "recommendation_effects",
+        "fk_recommendation_effects_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "recommendation_effects",
+        "fk_recommendation_effects_tray_id_trays",
+        "tray_id",
+        "trays",
+        "id",
+    )
+
+
 def normalize_ai_log_command_items(commands: Any) -> list[Any]:
     if isinstance(commands, list):
         return commands
@@ -2523,6 +2692,8 @@ def get_database_model_summary() -> dict[str, Any]:
         "ai": [
             "ai_logs",
             "ai_log_commands",
+            "ai_recommendations",
+            "recommendation_effects",
             "advisor_reports",
             "advisor_report_findings",
             "advisor_report_recommendations",
@@ -3169,6 +3340,8 @@ def init_db() -> None:
             ensure_advisor_reports_schema(cursor)
             ensure_ai_logs_schema(cursor)
             ensure_ai_log_commands_schema(cursor)
+            ensure_ai_recommendations_schema(cursor)
+            ensure_recommendation_effects_schema(cursor)
             migrate_ai_log_commands_from_legacy(cursor)
             drop_strict_3nf_legacy_objects(cursor)
 
@@ -3642,6 +3815,304 @@ def save_ai_log(
             )
             row = cursor.fetchone()
             save_ai_log_commands(cursor, row["id"], commands)
+
+
+def normalize_recommendation_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def row_to_ai_recommendation(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "cycle_id": row["cycle_id"],
+        "tray_id": row["tray_id"],
+        "source": row["source"],
+        "category": row["category"],
+        "metric_name": row["metric_name"],
+        "recommendation_text": row["recommendation_text"],
+        "reason": row["reason"],
+        "sensor_snapshot": row["sensor_snapshot"] or {},
+        "norm_snapshot": row["norm_snapshot"] or {},
+        "created_at": format_timestamp(row["created_at"]),
+    }
+
+
+def row_to_recommendation_effect(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "recommendation_id": row["recommendation_id"],
+        "cycle_id": row["cycle_id"],
+        "tray_id": row["tray_id"],
+        "window_minutes": row["window_minutes"],
+        "before_snapshot": row["before_snapshot"] or {},
+        "after_snapshot": row["after_snapshot"] or {},
+        "delta_snapshot": row["delta_snapshot"] or {},
+        "effect_status": row["effect_status"],
+        "effect_summary": row["effect_summary"],
+        "confidence": row["confidence"],
+        "created_at": format_timestamp(row["created_at"]),
+    }
+
+
+def save_ai_recommendation(
+    *,
+    cycle_id: int,
+    tray_id: str,
+    source: str,
+    category: str,
+    metric_name: str | None,
+    recommendation_text: str,
+    reason: str | None = None,
+    sensor_snapshot: dict[str, Any] | None = None,
+    norm_snapshot: dict[str, Any] | None = None,
+    dedup_minutes: int = 15,
+) -> dict[str, Any] | None:
+    normalized_text = normalize_recommendation_text(recommendation_text)
+    if not normalized_text:
+        return None
+
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    normalized_source = str(source or "system").strip().lower() or "system"
+    normalized_category = str(category or "general").strip().lower() or "general"
+    normalized_metric_name = str(metric_name).strip().lower() if metric_name else None
+    if normalized_metric_name == "":
+        normalized_metric_name = None
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            ensure_tray(cursor, normalized_tray_id)
+            cursor.execute(
+                """
+                WITH recent_duplicate AS (
+                    SELECT 1
+                    FROM ai_recommendations
+                    WHERE cycle_id = %s
+                      AND source = %s
+                      AND category = %s
+                      AND metric_name IS NOT DISTINCT FROM %s
+                      AND lower(regexp_replace(recommendation_text, '\\s+', ' ', 'g')) = %s
+                      AND created_at >= now() - (%s * interval '1 minute')
+                    LIMIT 1
+                )
+                INSERT INTO ai_recommendations (
+                    cycle_id, tray_id, source, category, metric_name,
+                    recommendation_text, reason, sensor_snapshot, norm_snapshot, created_at
+                )
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, now()
+                WHERE NOT EXISTS (SELECT 1 FROM recent_duplicate)
+                RETURNING *
+                """,
+                (
+                    cycle_id,
+                    normalized_source,
+                    normalized_category,
+                    normalized_metric_name,
+                    normalized_text,
+                    max(1, dedup_minutes),
+                    cycle_id,
+                    normalized_tray_id,
+                    normalized_source,
+                    normalized_category,
+                    normalized_metric_name,
+                    recommendation_text.strip(),
+                    reason,
+                    Jsonb(sensor_snapshot or {}),
+                    Jsonb(norm_snapshot or {}),
+                ),
+            )
+            row = cursor.fetchone()
+            return row_to_ai_recommendation(row) if row else None
+
+
+def get_recent_ai_recommendations(limit: int = 50) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 200))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM ai_recommendations
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (normalized_limit,),
+            )
+            rows = cursor.fetchall()
+    return [row_to_ai_recommendation(row) for row in rows]
+
+
+def get_cycle_ai_recommendations(cycle_id: int) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM ai_recommendations
+                WHERE cycle_id = %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (cycle_id,),
+            )
+            rows = cursor.fetchall()
+    return [row_to_ai_recommendation(row) for row in rows]
+
+
+def save_recommendation_effect(
+    *,
+    recommendation_id: int,
+    cycle_id: int,
+    tray_id: str,
+    window_minutes: int,
+    before_snapshot: dict[str, Any],
+    after_snapshot: dict[str, Any],
+    delta_snapshot: dict[str, Any],
+    effect_status: str,
+    effect_summary: str,
+    confidence: float,
+) -> dict[str, Any] | None:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            ensure_recommendation_effects_schema(cursor)
+            ensure_tray(cursor, normalized_tray_id)
+            cursor.execute(
+                """
+                INSERT INTO recommendation_effects (
+                    recommendation_id, cycle_id, tray_id, window_minutes,
+                    before_snapshot, after_snapshot, delta_snapshot,
+                    effect_status, effect_summary, confidence, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (recommendation_id, window_minutes) DO NOTHING
+                RETURNING *
+                """,
+                (
+                    recommendation_id,
+                    cycle_id,
+                    normalized_tray_id,
+                    int(window_minutes),
+                    Jsonb(before_snapshot or {}),
+                    Jsonb(after_snapshot or {}),
+                    Jsonb(delta_snapshot or {}),
+                    effect_status,
+                    effect_summary,
+                    float(confidence),
+                ),
+            )
+            row = cursor.fetchone()
+            return row_to_recommendation_effect(row) if row else None
+
+
+def get_recommendation_effects(cycle_id: int | None = None) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            ensure_recommendation_effects_schema(cursor)
+            if cycle_id is None:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM recommendation_effects
+                    ORDER BY created_at DESC, id DESC
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM recommendation_effects
+                    WHERE cycle_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (cycle_id,),
+                )
+            rows = cursor.fetchall()
+    return [row_to_recommendation_effect(row) for row in rows]
+
+
+def get_pending_recommendations_for_effect_evaluation(
+    windows_minutes: list[int] | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    windows = windows_minutes or [30, 60, 120]
+    normalized_windows = sorted({int(window) for window in windows if int(window) > 0})
+    if not normalized_windows:
+        return []
+
+    pending: list[dict[str, Any]] = []
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ai_recommendations_schema(cursor)
+            ensure_recommendation_effects_schema(cursor)
+            for window_minutes in normalized_windows:
+                cursor.execute(
+                    """
+                    SELECT ai_recommendations.*, %s::integer AS window_minutes
+                    FROM ai_recommendations
+                    WHERE ai_recommendations.created_at <= now() - (%s * interval '1 minute')
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM recommendation_effects
+                          WHERE recommendation_effects.recommendation_id = ai_recommendations.id
+                            AND recommendation_effects.window_minutes = %s
+                      )
+                    ORDER BY ai_recommendations.created_at ASC, ai_recommendations.id ASC
+                    LIMIT %s
+                    """,
+                    (window_minutes, window_minutes, window_minutes, max(1, int(limit))),
+                )
+                for row in cursor.fetchall():
+                    item = row_to_ai_recommendation(row)
+                    item["window_minutes"] = row["window_minutes"]
+                    pending.append(item)
+
+    return pending[: max(1, int(limit))]
+
+
+def get_metric_snapshot_after(
+    *,
+    tray_id: str,
+    after_timestamp: datetime,
+    metric_names: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    metrics = metric_names or ["air_temp", "humidity", "water_temp", "ph", "ec"]
+    snapshot: dict[str, Any] = {metric_name: None for metric_name in metrics}
+    snapshot["observed_at"] = {}
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT ON (metrics.code)
+                    metrics.code AS metric_name,
+                    telemetry_values.value,
+                    telemetry_readings.recorded_at
+                FROM telemetry_values
+                JOIN telemetry_readings ON telemetry_readings.id = telemetry_values.reading_id
+                JOIN catalog_items AS metrics
+                  ON metrics.id = telemetry_values.metric_id
+                 AND metrics.category = 'metric'
+                WHERE telemetry_readings.tray_id = %s
+                  AND telemetry_readings.recorded_at >= %s
+                  AND metrics.code = ANY(%s)
+                ORDER BY metrics.code ASC, telemetry_readings.recorded_at ASC, telemetry_readings.id ASC
+                """,
+                (normalized_tray_id, after_timestamp, metrics),
+            )
+            rows = cursor.fetchall()
+
+    observed_at = snapshot["observed_at"]
+    for row in rows:
+        metric_name = row["metric_name"]
+        snapshot[metric_name] = row["value"]
+        observed_at[metric_name] = format_timestamp(row["recorded_at"])
+
+    return snapshot
 
 
 def row_to_telemetry_record(row: dict[str, Any]) -> dict[str, Any]:

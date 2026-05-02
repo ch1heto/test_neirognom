@@ -4,7 +4,7 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,14 +42,21 @@ from db import (
     get_recent_anomaly_events,
     get_recent_device_events,
     get_recent_ai_logs,
+    get_recent_ai_recommendations,
     get_recent_hourly_summary,
     get_recent_system_feed_events,
     get_recent_telemetry,
+    get_recommendation_effects,
+    get_cycle_ai_recommendations,
     init_db,
+    get_metric_snapshot_after,
+    get_pending_recommendations_for_effect_evaluation,
     save_ai_log,
+    save_ai_recommendation,
     save_anomaly_event,
     save_cycle_result,
     save_device_event,
+    save_recommendation_effect,
     save_telemetry,
     start_growing_cycle,
     update_device_status,
@@ -70,6 +77,23 @@ client = AsyncOpenAI(
 
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5-nano")
 POLZA_BASE_URL = os.getenv("POLZA_BASE_URL", "https://polza.ai/api/v1/chat/completions")
+
+
+def parse_int_list_env(name: str, default: list[int]) -> list[int]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    values: list[int] = []
+    for part in raw_value.split(","):
+        try:
+            value = int(part.strip())
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return sorted(set(values)) or default
+
+
 KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
@@ -84,6 +108,11 @@ PREDICTIVE_HISTORY_HOURS = 8
 PREDICTIVE_HORIZON_HOURS = 4
 PREDICTIVE_EVENT_COOLDOWN_MINUTES = 60
 PREDICTIVE_MIN_POINTS = 3
+RECOMMENDATION_EFFECT_WINDOWS_MINUTES = parse_int_list_env(
+    "RECOMMENDATION_EFFECT_WINDOWS_MINUTES",
+    [30, 60, 120],
+)
+RECOMMENDATION_EFFECT_INTERVAL_SECONDS = int(os.getenv("RECOMMENDATION_EFFECT_INTERVAL_SECONDS", "300"))
 WATCHDOG_DEFAULT_TRAY_ID = "tray_1"
 WATCHDOG_DEFAULT_NORM_RANGES = {
     "air_temp": (18.0, 28.0),
@@ -1851,6 +1880,494 @@ def parse_event_timestamp(value: Any) -> datetime | None:
     return None
 
 
+RECOMMENDATION_SOURCES = {"chat", "advisor", "predictive", "system"}
+RECOMMENDATION_CATEGORIES = {
+    "solution",
+    "watering",
+    "light",
+    "climate",
+    "ventilation",
+    "sensor",
+    "general",
+}
+RECOMMENDATION_METRICS = {"ph", "ec", "humidity", "air_temp", "water_temp"}
+RECOMMENDATION_ACTION_KEYWORDS = (
+    "проверь",
+    "проверить",
+    "скоррект",
+    "отрегули",
+    "перемеш",
+    "повтори",
+    "повторите",
+    "замер",
+    "измер",
+    "подним",
+    "поднять",
+    "внос",
+    "корректор",
+    "долить",
+    "добав",
+    "замен",
+    "сниз",
+    "повыс",
+    "включ",
+    "выключ",
+    "очист",
+    "насос",
+    "помп",
+    "свет",
+    "ламп",
+    "вентиля",
+    "датчик",
+    "полив",
+    "раствор",
+    "check",
+    "adjust",
+    "refill",
+    "replace",
+    "ventilation",
+    "sensor",
+    "pump",
+)
+RECOMMENDATION_SKIP_KEYWORDS = (
+    "привет",
+    "здравств",
+    "все нормально",
+    "всё нормально",
+    "существенных рисков",
+    "продолжайте наблюдение",
+    "данных пока нет",
+    "данных по",
+    "истории пока мало",
+    "оценка трендов ограничена",
+    "нет данных",
+    "по почасовой истории",
+    "hello",
+)
+RECOMMENDATION_DOMAIN_KEYWORDS = (
+    "ph",
+    "ec",
+    "насос",
+    "помп",
+    "свет",
+    "ламп",
+    "вентиля",
+    "датчик",
+    "температур",
+    "влаж",
+    "полив",
+    "раствор",
+    "корректор",
+    "pump",
+    "light",
+    "ventilation",
+    "sensor",
+)
+METRIC_EFFECT_THRESHOLDS = {
+    "ph": 0.05,
+    "ec": 0.03,
+    "humidity": 1.0,
+    "air_temp": 0.2,
+    "water_temp": 0.2,
+}
+
+
+def is_actionable_recommendation_text(text: Any) -> bool:
+    normalized = str(text or "").strip().lower()
+    if len(normalized) < 8:
+        return False
+    has_action = any(keyword in normalized for keyword in RECOMMENDATION_ACTION_KEYWORDS)
+    has_domain = any(keyword in normalized for keyword in RECOMMENDATION_DOMAIN_KEYWORDS)
+    if has_action and has_domain:
+        return True
+
+    skip_hit = any(keyword in normalized for keyword in RECOMMENDATION_SKIP_KEYWORDS)
+    if skip_hit and not has_action:
+        return False
+
+    return has_action and len(normalized) >= 20
+
+
+def derive_recommendation_metric(text: str, metric_name: Any = None) -> str | None:
+    normalized_metric = str(metric_name or "").strip().lower()
+    if normalized_metric == "temperature":
+        normalized_metric = "air_temp"
+    if normalized_metric in RECOMMENDATION_METRICS:
+        return normalized_metric
+
+    normalized_text = text.lower()
+    if "ph" in normalized_text or "pH" in text:
+        return "ph"
+    if "ec" in normalized_text:
+        return "ec"
+    if "влаж" in normalized_text or "humidity" in normalized_text:
+        return "humidity"
+    if "вод" in normalized_text and "температур" in normalized_text:
+        return "water_temp"
+    if "воздух" in normalized_text and "температур" in normalized_text:
+        return "air_temp"
+    if "temperature" in normalized_text:
+        return "air_temp"
+    return None
+
+
+def derive_recommendation_category(text: str, category: Any = None) -> str:
+    normalized_category = str(category or "").strip().lower()
+    if normalized_category in RECOMMENDATION_CATEGORIES:
+        return normalized_category
+
+    normalized_text = text.lower()
+    if any(marker in normalized_text for marker in ("ph", "ec", "раствор", "питател")):
+        return "solution"
+    if any(marker in normalized_text for marker in ("полив", "насос", "помп", "долить", "water", "pump")):
+        return "watering"
+    if any(marker in normalized_text for marker in ("свет", "ламп", "освещ", "light")):
+        return "light"
+    if any(marker in normalized_text for marker in ("вентиля", "fan", "ventilation")):
+        return "ventilation"
+    if any(marker in normalized_text for marker in ("температур", "влаж", "climate", "humidity")):
+        return "climate"
+    if any(marker in normalized_text for marker in ("датчик", "sensor")):
+        return "sensor"
+    return "general"
+
+
+def normalize_recommendation_candidate(item: Any, source: str) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        text = item.strip()
+        raw: dict[str, Any] = {}
+    elif isinstance(item, dict):
+        raw = item
+        text = str(
+            raw.get("recommendation_text")
+            or raw.get("text")
+            or raw.get("recommendation")
+            or ""
+        ).strip()
+    else:
+        return None
+
+    if not is_actionable_recommendation_text(text):
+        print(f"[RECOMMENDATIONS] Dropped by actionable filter: {text[:160]}")
+        return None
+
+    normalized_source = source if source in RECOMMENDATION_SOURCES else "system"
+    return {
+        "source": normalized_source,
+        "category": derive_recommendation_category(text, raw.get("category")),
+        "metric_name": derive_recommendation_metric(text, raw.get("metric_name")),
+        "recommendation_text": text,
+        "reason": str(raw.get("reason") or "").strip() or None,
+    }
+
+
+def build_fallback_recommendation_from_reply(reply: str, source: str = "chat") -> dict[str, Any] | None:
+    text = str(reply or "").strip()
+    if not is_actionable_recommendation_text(text):
+        print(f"[RECOMMENDATIONS] Fallback skipped by actionable filter: {text[:160]}")
+        return None
+
+    return {
+        "source": source,
+        "category": derive_recommendation_category(text),
+        "metric_name": derive_recommendation_metric(text),
+        "recommendation_text": text,
+        "reason": "Fallback extraction: reply contains farm domain terms and actionable instructions.",
+    }
+
+
+def parse_recommendation_extraction_json(raw_text: str) -> list[Any]:
+    cleaned = strip_markdown_backticks(raw_text)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}|\[.*\]", cleaned, flags=re.DOTALL)
+        if not match:
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        recommendations = parsed.get("recommendations")
+        return recommendations if isinstance(recommendations, list) else []
+    return []
+
+
+async def extract_recommendations_from_reply(
+    reply: str,
+    user_message: str,
+    context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not reply or not is_actionable_recommendation_text(reply):
+        print(f"[RECOMMENDATIONS] Reply skipped before extraction: {str(reply or '')[:160]}")
+        return []
+
+    extraction_prompt = (
+        "Extract only actionable farm recommendations from the assistant reply. "
+        "Return strict JSON only: {\"recommendations\": [...]}. "
+        "Each item must have category, metric_name, recommendation_text, reason. "
+        "Allowed category values: solution, watering, light, climate, ventilation, sensor, general. "
+        "Allowed metric_name values: ph, ec, humidity, air_temp, water_temp, null. "
+        "Save only concrete actions such as adjust pH/EC, check pump, add water, check light, "
+        "ventilation, sensor, temperature. Do not include greetings, normal-status messages, "
+        "or generic observation-only statements. If there are no actionable recommendations, "
+        "return {\"recommendations\": []}.\n\n"
+        f"User message: {user_message}\n\n"
+        f"Active cycle context: {json.dumps(context or {}, ensure_ascii=False, default=str)}\n\n"
+        f"Assistant reply: {reply}"
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=os.getenv("AI_MODEL", "gpt-5.4-mini"),
+            messages=[
+                {"role": "system", "content": "You return strict JSON only."},
+                {"role": "user", "content": extraction_prompt},
+            ],
+            temperature=0,
+        )
+    except Exception as exc:
+        print(f"[RECOMMENDATIONS] Extraction failed: {exc}")
+        fallback = build_fallback_recommendation_from_reply(reply, "chat")
+        recommendations = [fallback] if fallback else []
+        print(f"[RECOMMENDATIONS] Extractor found 0 recommendations; fallback={len(recommendations)}")
+        return recommendations
+
+    raw_content = response.choices[0].message.content or ""
+    items = parse_recommendation_extraction_json(raw_content)
+    recommendations: list[dict[str, Any]] = []
+    for item in items:
+        normalized = normalize_recommendation_candidate(item, "chat")
+        if normalized:
+            recommendations.append(normalized)
+    print(f"[RECOMMENDATIONS] Extractor found {len(recommendations)} recommendations")
+    if not recommendations:
+        fallback = build_fallback_recommendation_from_reply(reply, "chat")
+        if fallback:
+            recommendations.append(fallback)
+            print("[RECOMMENDATIONS] Fallback recommendation created")
+    return recommendations
+
+
+def current_sensor_snapshot_for_recommendation() -> dict[str, Any]:
+    records = get_recent_telemetry(30)
+    snapshot = latest_metric_snapshot(records)
+    return {
+        "tray_id": snapshot.get("tray_id"),
+        "air_temp": snapshot.get("air_temp"),
+        "humidity": snapshot.get("humidity"),
+        "water_temp": snapshot.get("water_temp"),
+        "ph": snapshot.get("ph"),
+        "ec": snapshot.get("ec"),
+    }
+
+
+async def persist_ai_recommendations(
+    recommendations: list[dict[str, Any]],
+    *,
+    active_cycle: dict[str, Any] | None,
+    source: str,
+) -> list[dict[str, Any]]:
+    if not recommendations or not active_cycle:
+        print(
+            "[RECOMMENDATIONS] Save skipped: "
+            f"recommendations={len(recommendations) if recommendations else 0}, "
+            f"active_cycle={bool(active_cycle)}"
+        )
+        return []
+
+    cycle_id = active_cycle.get("cycle_id")
+    tray_id = str(active_cycle.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID)
+    if not isinstance(cycle_id, int):
+        print(f"[RECOMMENDATIONS] Save skipped: invalid cycle_id={cycle_id}")
+        return []
+
+    try:
+        sensor_snapshot = await asyncio.to_thread(current_sensor_snapshot_for_recommendation)
+        norm_snapshot = active_cycle.get("norms") if isinstance(active_cycle.get("norms"), dict) else {}
+        saved: list[dict[str, Any]] = []
+        for recommendation in recommendations:
+            normalized = normalize_recommendation_candidate(recommendation, source)
+            if not normalized:
+                continue
+            saved_item = await asyncio.to_thread(
+                save_ai_recommendation,
+                cycle_id=cycle_id,
+                tray_id=tray_id,
+                source=source,
+                category=normalized["category"],
+                metric_name=normalized["metric_name"],
+                recommendation_text=normalized["recommendation_text"],
+                reason=normalized.get("reason"),
+                sensor_snapshot=sensor_snapshot,
+                norm_snapshot=norm_snapshot,
+            )
+            if saved_item:
+                saved.append(saved_item)
+        print(f"[RECOMMENDATIONS] Saved {len(saved)} of {len(recommendations)} recommendations")
+        return saved
+    except Exception as exc:
+        print(f"[RECOMMENDATIONS] Save failed: {exc}")
+        return []
+
+
+def norm_range_for_metric(norm_snapshot: dict[str, Any], metric_name: str) -> tuple[float, float] | None:
+    value = norm_snapshot.get(metric_name) if isinstance(norm_snapshot, dict) else None
+    if not isinstance(value, dict):
+        return None
+    low = value.get("min")
+    high = value.get("max")
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        return float(low), float(high)
+    return None
+
+
+def distance_outside_norm(value: float, metric_range: tuple[float, float]) -> float:
+    low, high = metric_range
+    if value < low:
+        return low - value
+    if value > high:
+        return value - high
+    return 0.0
+
+
+def classify_metric_effect(
+    metric_name: str,
+    before_value: Any,
+    after_value: Any,
+    norm_snapshot: dict[str, Any],
+) -> tuple[str, float | None, float]:
+    if not isinstance(before_value, (int, float)) or not isinstance(after_value, (int, float)):
+        return "inconclusive", None, 0.2
+
+    before_float = float(before_value)
+    after_float = float(after_value)
+    delta = after_float - before_float
+    threshold = METRIC_EFFECT_THRESHOLDS.get(metric_name, 0.1)
+    metric_range = norm_range_for_metric(norm_snapshot, metric_name)
+    if metric_range is None:
+        if abs(delta) <= threshold:
+            return "unchanged", delta, 0.45
+        return "inconclusive", delta, 0.35
+
+    before_distance = distance_outside_norm(before_float, metric_range)
+    after_distance = distance_outside_norm(after_float, metric_range)
+    if after_distance + threshold < before_distance:
+        return "improved", delta, 0.7
+    if after_distance > before_distance + threshold:
+        return "worsened", delta, 0.65
+    return "unchanged", delta, 0.6
+
+
+def combine_metric_effect_status(statuses: list[str]) -> str:
+    meaningful = [status for status in statuses if status != "inconclusive"]
+    if not meaningful:
+        return "inconclusive"
+    if "improved" in meaningful and "worsened" not in meaningful:
+        return "improved"
+    if "worsened" in meaningful and "improved" not in meaningful:
+        return "worsened"
+    if all(status == "unchanged" for status in meaningful):
+        return "unchanged"
+    return "inconclusive"
+
+
+def build_effect_summary(
+    recommendation: dict[str, Any],
+    metrics: list[str],
+    before_snapshot: dict[str, Any],
+    after_snapshot: dict[str, Any],
+    delta_snapshot: dict[str, Any],
+    status: str,
+) -> str:
+    parts: list[str] = []
+    for metric_name in metrics:
+        before_value = before_snapshot.get(metric_name)
+        after_value = after_snapshot.get(metric_name)
+        delta_value = delta_snapshot.get(metric_name)
+        if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
+            if isinstance(delta_value, (int, float)):
+                parts.append(f"{metric_name}: {before_value:g} -> {after_value:g} ({delta_value:+.2f})")
+            else:
+                parts.append(f"{metric_name}: {before_value:g} -> {after_value:g}")
+
+    window = recommendation.get("window_minutes")
+    if not parts:
+        return f"After {window} minutes there was not enough telemetry to compare the recommendation effect."
+
+    status_text = {
+        "improved": "moved closer to the active norm",
+        "unchanged": "changed insignificantly",
+        "worsened": "moved farther from the active norm",
+        "inconclusive": "does not allow a confident conclusion",
+    }.get(status, "does not allow a confident conclusion")
+    return f"After {window} minutes the metric changed: {', '.join(parts)}. This {status_text}."
+
+
+async def evaluate_recommendation_effect(recommendation: dict[str, Any]) -> dict[str, Any] | None:
+    created_at = parse_event_timestamp(recommendation.get("created_at"))
+    window_minutes = int(recommendation.get("window_minutes") or 0)
+    if created_at is None or window_minutes <= 0:
+        return None
+
+    target_time = created_at + timedelta(minutes=window_minutes)
+    metric_name = recommendation.get("metric_name")
+    metrics = [metric_name] if metric_name in RECOMMENDATION_METRICS else list(RECOMMENDATION_METRICS)
+    before_snapshot = recommendation.get("sensor_snapshot") or {}
+    norm_snapshot = recommendation.get("norm_snapshot") or {}
+    after_snapshot = await asyncio.to_thread(
+        get_metric_snapshot_after,
+        tray_id=str(recommendation.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID),
+        after_timestamp=target_time,
+        metric_names=metrics,
+    )
+
+    delta_snapshot: dict[str, Any] = {}
+    statuses: list[str] = []
+    confidences: list[float] = []
+    for metric in metrics:
+        status, delta, confidence = classify_metric_effect(
+            metric,
+            before_snapshot.get(metric),
+            after_snapshot.get(metric),
+            norm_snapshot,
+        )
+        statuses.append(status)
+        confidences.append(confidence)
+        delta_snapshot[metric] = delta
+
+    effect_status = combine_metric_effect_status(statuses)
+    confidence = min(0.95, max(0.0, sum(confidences) / len(confidences))) if confidences else 0.0
+    if effect_status == "inconclusive":
+        confidence = min(confidence, 0.4)
+    effect_summary = build_effect_summary(
+        recommendation,
+        metrics,
+        before_snapshot,
+        after_snapshot,
+        delta_snapshot,
+        effect_status,
+    )
+
+    return await asyncio.to_thread(
+        save_recommendation_effect,
+        recommendation_id=int(recommendation["id"]),
+        cycle_id=int(recommendation["cycle_id"]),
+        tray_id=str(recommendation.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID),
+        window_minutes=window_minutes,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+        delta_snapshot=delta_snapshot,
+        effect_status=effect_status,
+        effect_summary=effect_summary,
+        confidence=confidence,
+    )
+
+
 def format_event_age(value: Any) -> str:
     event_time = parse_event_timestamp(value)
     if event_time is None:
@@ -2188,6 +2705,31 @@ async def predictive_watchdog_worker() -> None:
         await asyncio.sleep(PREDICTIVE_WATCHDOG_INTERVAL_SECONDS)
 
 
+async def recommendation_effect_worker() -> None:
+    print("[RECOMMENDATIONS] Effect worker started")
+
+    while True:
+        try:
+            pending = await asyncio.to_thread(
+                get_pending_recommendations_for_effect_evaluation,
+                RECOMMENDATION_EFFECT_WINDOWS_MINUTES,
+                100,
+            )
+            saved_count = 0
+            for recommendation in pending:
+                saved = await evaluate_recommendation_effect(recommendation)
+                if saved:
+                    saved_count += 1
+            if saved_count:
+                print(f"[RECOMMENDATIONS] Saved recommendation effects: {saved_count}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[RECOMMENDATIONS] Effect worker error: {exc}")
+
+        await asyncio.sleep(RECOMMENDATION_EFFECT_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -2201,13 +2743,17 @@ async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(internal_watchdog())
     aggregation_task = asyncio.create_task(hourly_aggregation_worker())
     predictive_task = asyncio.create_task(predictive_watchdog_worker())
+    recommendation_effect_task = asyncio.create_task(recommendation_effect_worker())
 
     try:
         yield
     finally:
+        recommendation_effect_task.cancel()
         predictive_task.cancel()
         aggregation_task.cancel()
         watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recommendation_effect_task
         with suppress(asyncio.CancelledError):
             await predictive_task
         with suppress(asyncio.CancelledError):
@@ -2410,6 +2956,19 @@ async def ai_decide() -> dict[str, Any]:
     logs.append("Автоуправление отключено: AI не отправляет MQTT-команды.")
 
     await asyncio.to_thread(save_ai_log, thought, [], source="advisor")
+    if isinstance(recommendations, list):
+        advisor_recommendations = [
+            {
+                "recommendation_text": str(recommendation),
+                "reason": thought,
+            }
+            for recommendation in recommendations
+        ]
+        await persist_ai_recommendations(
+            advisor_recommendations,
+            active_cycle=active_cycle,
+            source="advisor",
+        )
     return {"logs": logs, "thought": thought, "commands": []}
 
 
@@ -2474,6 +3033,23 @@ def api_finish_growing_cycle(request: FinishCycleRequest) -> dict[str, Any]:
 @app.get("/api/cycles/{cycle_id}/advisor-reports")
 def api_get_cycle_advisor_reports(cycle_id: int) -> list[dict[str, Any]]:
     return get_cycle_advisor_reports(cycle_id)
+
+
+@app.get("/api/recommendations/recent")
+def api_get_recent_ai_recommendations(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
+    return get_recent_ai_recommendations(limit)
+
+
+@app.get("/api/cycles/{cycle_id}/recommendations")
+def api_get_cycle_ai_recommendations(cycle_id: int) -> list[dict[str, Any]]:
+    return get_cycle_ai_recommendations(cycle_id)
+
+
+@app.get("/api/cycles/{cycle_id}/recommendation-effects")
+def api_get_cycle_recommendation_effects(cycle_id: int) -> list[dict[str, Any]]:
+    return get_recommendation_effects(cycle_id)
 
 
 @app.get("/api/cycles/{cycle_id}/result")
@@ -2572,6 +3148,17 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
         },
         source="chat",
     )
+    if active_cycle:
+        extracted_recommendations = await extract_recommendations_from_reply(
+            reply,
+            user_prompt,
+            active_cycle,
+        )
+        await persist_ai_recommendations(
+            extracted_recommendations,
+            active_cycle=active_cycle,
+            source="chat",
+        )
     return {
         "reply": reply,
         "analysis_steps": analysis_steps,
