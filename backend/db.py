@@ -2043,6 +2043,633 @@ def get_cycle_result(cycle_id: int) -> dict[str, Any] | None:
             return row_to_cycle_result(_get_cycle_result(cursor, cycle_id))
 
 
+def ensure_cycle_analysis_reports_schema(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cycle_analysis_reports (
+            id BIGSERIAL PRIMARY KEY,
+            cycle_id BIGINT NOT NULL UNIQUE,
+            report_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            summary_text TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE cycle_analysis_reports ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ADD COLUMN IF NOT EXISTS report_payload JSONB")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ADD COLUMN IF NOT EXISTS summary_text TEXT")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+    ensure_jsonb_column(cursor, "cycle_analysis_reports", "report_payload")
+    cursor.execute("UPDATE cycle_analysis_reports SET report_payload = '{}'::jsonb WHERE report_payload IS NULL")
+    cursor.execute("UPDATE cycle_analysis_reports SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("UPDATE cycle_analysis_reports SET updated_at = now() WHERE updated_at IS NULL")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN cycle_id SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN report_payload SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN report_payload SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN created_at SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN updated_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE cycle_analysis_reports ALTER COLUMN updated_at SET NOT NULL")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cycle_analysis_reports_cycle_id
+        ON cycle_analysis_reports(cycle_id)
+        """
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "cycle_analysis_reports",
+        "fk_cycle_analysis_reports_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+
+
+def row_to_cycle_analysis_report(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "cycle_id": row["cycle_id"],
+        "report_payload": row["report_payload"] or {},
+        "summary_text": row["summary_text"],
+        "created_at": format_timestamp(row["created_at"]),
+        "updated_at": format_timestamp(row["updated_at"]),
+    }
+
+
+def cycle_report_norm_range(norms: dict[str, Any], metric_name: str) -> tuple[float | None, float | None]:
+    value = norms.get(metric_name) if isinstance(norms, dict) else None
+    if not isinstance(value, dict):
+        return None, None
+    low = value.get("min")
+    high = value.get("max")
+    return (
+        float(low) if isinstance(low, (int, float)) else None,
+        float(high) if isinstance(high, (int, float)) else None,
+    )
+
+
+def build_cycle_telemetry_metric_summary(
+    cursor,
+    *,
+    tray_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+    metric_name: str,
+    metric_norm: dict[str, Any],
+) -> dict[str, Any]:
+    norm_min, norm_max = cycle_report_norm_range(metric_norm, metric_name)
+    cursor.execute(
+        """
+        WITH metric_rows AS (
+            SELECT
+                telemetry_values.value,
+                telemetry_readings.recorded_at
+            FROM telemetry_values
+            JOIN telemetry_readings ON telemetry_readings.id = telemetry_values.reading_id
+            JOIN catalog_items AS metrics
+              ON metrics.id = telemetry_values.metric_id
+             AND metrics.category = 'metric'
+            WHERE telemetry_readings.tray_id = %s
+              AND telemetry_readings.recorded_at >= %s
+              AND telemetry_readings.recorded_at <= %s
+              AND metrics.code = %s
+        )
+        SELECT
+            COUNT(*)::integer AS count_value,
+            MIN(value) AS min_value,
+            MAX(value) AS max_value,
+            AVG(value) AS avg_value,
+            COUNT(*) FILTER (WHERE %s IS NOT NULL AND value < %s)::integer AS below_norm_count,
+            COUNT(*) FILTER (WHERE %s IS NOT NULL AND value > %s)::integer AS above_norm_count,
+            (ARRAY_AGG(value ORDER BY recorded_at ASC))[1] AS first_value,
+            (ARRAY_AGG(value ORDER BY recorded_at DESC))[1] AS last_value
+        FROM metric_rows
+        """,
+        (
+            tray_id,
+            started_at,
+            ended_at,
+            metric_name,
+            norm_min,
+            norm_min,
+            norm_max,
+            norm_max,
+        ),
+    )
+    row = cursor.fetchone() or {}
+    count_value = int(row.get("count_value") or 0)
+    below_count = int(row.get("below_norm_count") or 0)
+    above_count = int(row.get("above_norm_count") or 0)
+    first_value = row.get("first_value")
+    last_value = row.get("last_value")
+    trend_delta = (
+        float(last_value) - float(first_value)
+        if isinstance(first_value, (int, float)) and isinstance(last_value, (int, float))
+        else None
+    )
+    return {
+        "has_data": count_value > 0,
+        "count": count_value,
+        "min": row.get("min_value"),
+        "max": row.get("max_value"),
+        "avg": row.get("avg_value"),
+        "first_value": first_value,
+        "last_value": last_value,
+        "below_norm_count": below_count,
+        "above_norm_count": above_count,
+        "out_of_norm_count": below_count + above_count,
+        "trend_delta": trend_delta,
+    }
+
+
+def build_cycle_telemetry_summary(
+    cursor,
+    *,
+    tray_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+    norms: dict[str, Any],
+) -> dict[str, Any]:
+    metric_names = ("air_temp", "humidity", "water_temp", "ph", "ec")
+    return {
+        metric_name: build_cycle_telemetry_metric_summary(
+            cursor,
+            tray_id=tray_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            metric_name=metric_name,
+            metric_norm=norms,
+        )
+        for metric_name in metric_names
+    }
+
+
+def count_rows_between(
+    cursor,
+    table_name: str,
+    *,
+    tray_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+) -> int:
+    cursor.execute(
+        sql.SQL(
+            """
+            SELECT COUNT(*)::integer AS total
+            FROM {}
+            WHERE tray_id = %s
+              AND created_at >= %s
+              AND created_at <= %s
+            """
+        ).format(sql.Identifier(table_name)),
+        (tray_id, started_at, ended_at),
+    )
+    row = cursor.fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+def build_cycle_anomalies_summary(
+    cursor,
+    *,
+    tray_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+    limit: int = 10,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            COALESCE(event_types.code, 'unknown') AS event_type,
+            COALESCE(metrics.code, 'unknown') AS metric_name,
+            COALESCE(severities.code, 'unknown') AS severity,
+            COUNT(*)::integer AS count_value
+        FROM anomaly_events
+        LEFT JOIN catalog_items AS event_types
+          ON event_types.id = anomaly_events.event_type_id
+         AND event_types.category = 'anomaly_type'
+        LEFT JOIN catalog_items AS metrics
+          ON metrics.id = anomaly_events.metric_id
+         AND metrics.category = 'metric'
+        LEFT JOIN catalog_items AS severities
+          ON severities.id = anomaly_events.severity_id
+         AND severities.category = 'severity'
+        WHERE anomaly_events.tray_id = %s
+          AND anomaly_events.created_at >= %s
+          AND anomaly_events.created_at <= %s
+        GROUP BY 1, 2, 3
+        ORDER BY count_value DESC, event_type ASC, metric_name ASC, severity ASC
+        """,
+        (tray_id, started_at, ended_at),
+    )
+    groups = [
+        {
+            "event_type": row["event_type"],
+            "metric_name": None if row["metric_name"] == "unknown" else row["metric_name"],
+            "severity": row["severity"],
+            "count": row["count_value"],
+        }
+        for row in cursor.fetchall()
+    ]
+    cursor.execute(
+        """
+        SELECT
+            anomaly_events.id,
+            event_types.code AS event_type,
+            metrics.code AS metric_name,
+            severities.code AS severity,
+            anomaly_events.value,
+            anomaly_events.message,
+            anomaly_events.created_at
+        FROM anomaly_events
+        LEFT JOIN catalog_items AS event_types
+          ON event_types.id = anomaly_events.event_type_id
+         AND event_types.category = 'anomaly_type'
+        LEFT JOIN catalog_items AS metrics
+          ON metrics.id = anomaly_events.metric_id
+         AND metrics.category = 'metric'
+        LEFT JOIN catalog_items AS severities
+          ON severities.id = anomaly_events.severity_id
+         AND severities.category = 'severity'
+        WHERE anomaly_events.tray_id = %s
+          AND anomaly_events.created_at >= %s
+          AND anomaly_events.created_at <= %s
+        ORDER BY anomaly_events.created_at DESC, anomaly_events.id DESC
+        LIMIT %s
+        """,
+        (tray_id, started_at, ended_at, limit),
+    )
+    recent = [
+        {
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "metric_name": row["metric_name"],
+            "severity": row["severity"],
+            "value": row["value"],
+            "message": row["message"],
+            "created_at": format_timestamp(row["created_at"]),
+        }
+        for row in cursor.fetchall()
+    ]
+    total = sum(group["count"] for group in groups)
+    return {"total": total, "groups": groups, "recent_events": recent}
+
+
+def build_cycle_device_events_summary(
+    cursor,
+    *,
+    tray_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+    limit: int = 10,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            device_events.device_id,
+            COALESCE(event_types.code, device_events.command, 'unknown') AS event_type,
+            device_events.command,
+            device_events.source,
+            COUNT(*)::integer AS count_value
+        FROM device_events
+        LEFT JOIN catalog_items AS event_types
+          ON event_types.id = device_events.event_type_id
+         AND event_types.category = 'event_type'
+        WHERE device_events.tray_id = %s
+          AND device_events.created_at >= %s
+          AND device_events.created_at <= %s
+        GROUP BY 1, 2, 3, 4
+        ORDER BY count_value DESC, device_events.device_id ASC, event_type ASC, device_events.source ASC
+        """,
+        (tray_id, started_at, ended_at),
+    )
+    groups = [
+        {
+            "device_id": row["device_id"],
+            "event_type": row["event_type"],
+            "command": row["command"],
+            "source": row["source"],
+            "count": row["count_value"],
+        }
+        for row in cursor.fetchall()
+    ]
+    cursor.execute(
+        """
+        SELECT
+            device_events.id,
+            device_events.device_id,
+            event_types.code AS event_type,
+            device_events.command,
+            device_events.value,
+            device_events.source,
+            device_events.created_at
+        FROM device_events
+        LEFT JOIN catalog_items AS event_types
+          ON event_types.id = device_events.event_type_id
+         AND event_types.category = 'event_type'
+        WHERE device_events.tray_id = %s
+          AND device_events.created_at >= %s
+          AND device_events.created_at <= %s
+        ORDER BY device_events.created_at DESC, device_events.id DESC
+        LIMIT %s
+        """,
+        (tray_id, started_at, ended_at, limit),
+    )
+    recent = [
+        {
+            "id": row["id"],
+            "device_id": row["device_id"],
+            "event_type": row["event_type"],
+            "command": row["command"],
+            "value": row["value"],
+            "source": row["source"],
+            "created_at": format_timestamp(row["created_at"]),
+        }
+        for row in cursor.fetchall()
+    ]
+    total = sum(group["count"] for group in groups)
+    return {"total": total, "groups": groups, "recent_events": recent}
+
+
+def build_cycle_ai_recommendations_summary(
+    cursor,
+    *,
+    cycle_id: int,
+    started_at: datetime,
+    ended_at: datetime,
+    limit: int = 10,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            source,
+            category,
+            COALESCE(metric_name, 'none') AS metric_name,
+            COUNT(*)::integer AS count_value
+        FROM ai_recommendations
+        WHERE cycle_id = %s
+          AND created_at >= %s
+          AND created_at <= %s
+        GROUP BY source, category, COALESCE(metric_name, 'none')
+        ORDER BY count_value DESC, source ASC, category ASC, metric_name ASC
+        """,
+        (cycle_id, started_at, ended_at),
+    )
+    groups = [
+        {
+            "source": row["source"],
+            "category": row["category"],
+            "metric_name": None if row["metric_name"] == "none" else row["metric_name"],
+            "count": row["count_value"],
+        }
+        for row in cursor.fetchall()
+    ]
+    cursor.execute(
+        """
+        SELECT *
+        FROM ai_recommendations
+        WHERE cycle_id = %s
+          AND created_at >= %s
+          AND created_at <= %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (cycle_id, started_at, ended_at, limit),
+    )
+    recent_recommendations = [row_to_ai_recommendation(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT
+            recommendation_effects.window_minutes,
+            recommendation_effects.effect_status,
+            COUNT(*)::integer AS count_value,
+            AVG(recommendation_effects.confidence) AS avg_confidence
+        FROM recommendation_effects
+        WHERE recommendation_effects.cycle_id = %s
+        GROUP BY recommendation_effects.window_minutes, recommendation_effects.effect_status
+        ORDER BY recommendation_effects.window_minutes ASC, recommendation_effects.effect_status ASC
+        """,
+        (cycle_id,),
+    )
+    effects_groups = [
+        {
+            "window_minutes": row["window_minutes"],
+            "effect_status": row["effect_status"],
+            "count": row["count_value"],
+            "avg_confidence": row["avg_confidence"],
+        }
+        for row in cursor.fetchall()
+    ]
+    cursor.execute(
+        """
+        SELECT *
+        FROM recommendation_effects
+        WHERE cycle_id = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (cycle_id, limit),
+    )
+    recent_effects = [row_to_recommendation_effect(row) for row in cursor.fetchall()]
+    total = sum(group["count"] for group in groups)
+    effects_total = sum(group["count"] for group in effects_groups)
+    return {
+        "total": total,
+        "groups": groups,
+        "recent_recommendations": recent_recommendations,
+        "effects_summary": {
+            "total": effects_total,
+            "groups": effects_groups,
+            "recent_effects": recent_effects,
+        },
+    }
+
+
+def build_cycle_consistency_notes(
+    *,
+    telemetry_summary: dict[str, Any],
+    anomalies_summary: dict[str, Any],
+    device_events_summary: dict[str, Any],
+    ai_recommendations_summary: dict[str, Any],
+    cycle_result: dict[str, Any] | None,
+) -> list[str]:
+    notes: list[str] = []
+    if not any(metric.get("has_data") for metric in telemetry_summary.values()):
+        notes.append("no_data: в периоде цикла нет агрегируемой телеметрии по ключевым метрикам.")
+    if anomalies_summary["total"] == 0:
+        notes.append("alerts: за период цикла алерты не найдены.")
+    if device_events_summary["total"] == 0:
+        notes.append("devices: за период цикла события устройств не найдены.")
+    if ai_recommendations_summary["total"] == 0:
+        notes.append("ai_recommendations: за период цикла сохранённые рекомендации не найдены.")
+    if cycle_result is None:
+        notes.append("cycle_result: итоговый опросник оператора не найден.")
+        return notes
+
+    problem_severity = cycle_result.get("problem_severity")
+    if problem_severity in {"none", "minor"} and anomalies_summary["total"] >= 10:
+        notes.append(
+            "consistency: оператор указал, что проблем почти не было, но в цикле было много алертов."
+        )
+    if cycle_result.get("followed_ai_advice") == "no_advice" and ai_recommendations_summary["total"] > 0:
+        notes.append(
+            "consistency: оператор указал, что советов AI не было, но в журнале есть сохранённые рекомендации."
+        )
+    if problem_severity in {"noticeable", "bad"} and anomalies_summary["total"] == 0:
+        notes.append(
+            "consistency: оператор отметил проблемы, но за период цикла алерты не найдены."
+        )
+    return notes
+
+
+def build_cycle_analysis_summary_text(report_payload: dict[str, Any]) -> str:
+    cycle = report_payload["cycle"]
+    telemetry_summary = report_payload["telemetry_summary"]
+    telemetry_metrics_with_data = [
+        metric_name
+        for metric_name, metric_summary in telemetry_summary.items()
+        if metric_summary.get("has_data")
+    ]
+    return (
+        f"Cycle {cycle['id']} ({cycle.get('crop_name_ru') or cycle.get('crop_slug')}) "
+        f"finished after {cycle.get('duration_days')} days. "
+        f"Telemetry metrics with data: {len(telemetry_metrics_with_data)}. "
+        f"Anomalies: {report_payload['anomalies_summary']['total']}. "
+        f"Device events: {report_payload['device_events_summary']['total']}. "
+        f"AI recommendations: {report_payload['ai_recommendations_summary']['total']}."
+    )
+
+
+def build_cycle_analysis_report(cycle_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_telemetry_normalized_schema(cursor)
+            ensure_device_events_schema(cursor)
+            ensure_anomaly_event_refs_schema(cursor)
+            ensure_cycle_results_schema(cursor)
+            ensure_ai_recommendations_schema(cursor)
+            ensure_recommendation_effects_schema(cursor)
+            ensure_cycle_analysis_reports_schema(cursor)
+            cycle_row = _select_growing_cycle_by_id(cursor, cycle_id)
+            if cycle_row is None:
+                raise GrowingCycleNotFoundError(f"Growing cycle '{cycle_id}' not found")
+            if cycle_row["status"] != "finished" or cycle_row["finished_at"] is None:
+                raise GrowingCycleNotFinishedError(
+                    f"Growing cycle '{cycle_id}' is not finished; analysis report can be built only for completed cycles"
+                )
+
+            started_at = cycle_row["started_at"]
+            ended_at = cycle_row["finished_at"]
+            norms = get_revision_norms(cursor, cycle_row["card_revision_id"])
+            cycle_result = row_to_cycle_result(_get_cycle_result(cursor, cycle_id))
+            duration_days = calculate_cycle_day_number(started_at, ended_at, cycle_row["status"])
+            telemetry_summary = build_cycle_telemetry_summary(
+                cursor,
+                tray_id=cycle_row["tray_id"],
+                started_at=started_at,
+                ended_at=ended_at,
+                norms=norms,
+            )
+            anomalies_summary = build_cycle_anomalies_summary(
+                cursor,
+                tray_id=cycle_row["tray_id"],
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            device_events_summary = build_cycle_device_events_summary(
+                cursor,
+                tray_id=cycle_row["tray_id"],
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            ai_recommendations_summary = build_cycle_ai_recommendations_summary(
+                cursor,
+                cycle_id=cycle_id,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            report_payload = {
+                "cycle": {
+                    "id": cycle_row["id"],
+                    "crop_slug": cycle_row["crop_slug"],
+                    "crop_name_ru": cycle_row["crop_name_ru"],
+                    "tray_id": cycle_row["tray_id"],
+                    "card_revision_id": cycle_row["card_revision_id"],
+                    "agrotech_card_version": cycle_row["version_label"],
+                    "started_at": format_timestamp(started_at),
+                    "ended_at": format_timestamp(ended_at),
+                    "duration_days": duration_days,
+                },
+                "norms": {
+                    key: norms.get(key)
+                    for key in ("ph", "ec", "air_temp", "humidity", "water_temp", "light_hours", "light_intensity")
+                    if key in norms
+                },
+                "telemetry_summary": telemetry_summary,
+                "anomalies_summary": anomalies_summary,
+                "device_events_summary": device_events_summary,
+                "ai_recommendations_summary": ai_recommendations_summary,
+                "cycle_result": cycle_result,
+                "consistency_notes": build_cycle_consistency_notes(
+                    telemetry_summary=telemetry_summary,
+                    anomalies_summary=anomalies_summary,
+                    device_events_summary=device_events_summary,
+                    ai_recommendations_summary=ai_recommendations_summary,
+                    cycle_result=cycle_result,
+                ),
+            }
+            summary_text = build_cycle_analysis_summary_text(report_payload)
+            return {
+                "cycle_id": cycle_id,
+                "report_payload": report_payload,
+                "summary_text": summary_text,
+            }
+
+
+def save_cycle_analysis_report(
+    cycle_id: int,
+    report_payload: dict[str, Any],
+    summary_text: str | None = None,
+) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_cycle_analysis_reports_schema(cursor)
+            cursor.execute(
+                """
+                INSERT INTO cycle_analysis_reports (
+                    cycle_id, report_payload, summary_text, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, now(), now())
+                ON CONFLICT (cycle_id) DO UPDATE
+                SET report_payload = EXCLUDED.report_payload,
+                    summary_text = EXCLUDED.summary_text,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (cycle_id, Jsonb(report_payload or {}), summary_text),
+            )
+            return row_to_cycle_analysis_report(cursor.fetchone())
+
+
+def get_cycle_analysis_report(cycle_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_cycle_analysis_reports_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM cycle_analysis_reports
+                WHERE cycle_id = %s
+                """,
+                (cycle_id,),
+            )
+            return row_to_cycle_analysis_report(cursor.fetchone())
+
+
 def validate_cycle_result_payload(
     harvest_status: str,
     harvest_mass_grams: float | None,
@@ -2687,6 +3314,7 @@ def get_database_model_summary() -> dict[str, Any]:
         ],
         "farm_structure": ["trays", "devices", "device_events"],
         "growing": ["growing_cycles", "cycle_results"],
+        "cycle_analysis": ["cycle_analysis_reports"],
         "telemetry": ["telemetry_readings", "telemetry_values", "telemetry_hourly_values"],
         "alerts": ["anomaly_events"],
         "ai": [
@@ -3337,6 +3965,7 @@ def init_db() -> None:
             backfill_anomaly_event_refs(cursor)
             drop_anomaly_legacy_columns(cursor)
             ensure_cycle_results_schema(cursor)
+            ensure_cycle_analysis_reports_schema(cursor)
             ensure_advisor_reports_schema(cursor)
             ensure_ai_logs_schema(cursor)
             ensure_ai_log_commands_schema(cursor)

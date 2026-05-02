@@ -24,6 +24,7 @@ from db import (
     InvalidCycleResultError,
     NoActiveGrowingCycleError,
     aggregate_completed_hours,
+    build_cycle_analysis_report,
     delete_old_raw_data,
     finish_growing_cycle,
     finish_growing_cycle_with_result,
@@ -48,11 +49,13 @@ from db import (
     get_recent_telemetry,
     get_recommendation_effects,
     get_cycle_ai_recommendations,
+    get_cycle_analysis_report,
     init_db,
     get_metric_snapshot_after,
     get_pending_recommendations_for_effect_evaluation,
     save_ai_log,
     save_ai_recommendation,
+    save_cycle_analysis_report,
     save_anomaly_event,
     save_cycle_result,
     save_device_event,
@@ -3019,11 +3022,23 @@ def api_finish_growing_cycle(request: FinishCycleRequest) -> dict[str, Any]:
         result_payload = request.dict(
             exclude={"tray_id", "notes"},
         )
-        return finish_growing_cycle_with_result(
+        finished = finish_growing_cycle_with_result(
             tray_id=request.tray_id,
             result_payload=result_payload,
             notes=request.notes,
         )
+        try:
+            cycle_id = finished.get("cycle", {}).get("id")
+            if isinstance(cycle_id, int):
+                report = build_cycle_analysis_report(cycle_id)
+                save_cycle_analysis_report(
+                    cycle_id,
+                    report["report_payload"],
+                    report["summary_text"],
+                )
+        except Exception as exc:
+            print(f"[CYCLE_ANALYSIS] Failed to auto-build report after finish: {exc}")
+        return finished
     except NoActiveGrowingCycleError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
     except InvalidCycleResultError as exc:
@@ -3050,6 +3065,29 @@ def api_get_cycle_ai_recommendations(cycle_id: int) -> list[dict[str, Any]]:
 @app.get("/api/cycles/{cycle_id}/recommendation-effects")
 def api_get_cycle_recommendation_effects(cycle_id: int) -> list[dict[str, Any]]:
     return get_recommendation_effects(cycle_id)
+
+
+@app.post("/api/cycles/{cycle_id}/analysis-report")
+def api_build_cycle_analysis_report(cycle_id: int) -> dict[str, Any]:
+    try:
+        report = build_cycle_analysis_report(cycle_id)
+        return save_cycle_analysis_report(
+            cycle_id,
+            report["report_payload"],
+            report["summary_text"],
+        )
+    except GrowingCycleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except GrowingCycleNotFinishedError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@app.get("/api/cycles/{cycle_id}/analysis-report")
+def api_get_cycle_analysis_report(cycle_id: int) -> dict[str, Any]:
+    report = get_cycle_analysis_report(cycle_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail={"error": f"Analysis report for cycle '{cycle_id}' not found"})
+    return report
 
 
 @app.get("/api/cycles/{cycle_id}/result")
