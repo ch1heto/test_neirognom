@@ -121,6 +121,10 @@ class ActiveCardRevisionNotFoundError(ValueError):
     pass
 
 
+class ActiveCardRevisionConflictError(ValueError):
+    pass
+
+
 class ActiveGrowingCycleExistsError(ValueError):
     pass
 
@@ -1567,11 +1571,32 @@ def _get_active_card_revision(cursor, crop_slug: str) -> dict[str, Any] | None:
           ON agrotech_card_revisions.card_id = agrotech_cards.id
         WHERE crops.slug = %s
           AND agrotech_card_revisions.is_active
-        LIMIT 1
+        ORDER BY agrotech_cards.id, agrotech_card_revisions.version_major DESC,
+                 agrotech_card_revisions.version_minor DESC, agrotech_card_revisions.id DESC
         """,
         (crop_slug,),
     )
-    return with_version_label(cursor.fetchone())
+    rows = cursor.fetchall()
+    if not rows:
+        return None
+
+    active_revision_count_by_card: dict[int, int] = {}
+    for row in rows:
+        active_revision_count_by_card[row["card_id"]] = active_revision_count_by_card.get(row["card_id"], 0) + 1
+    conflicted_card_ids = [
+        card_id
+        for card_id, active_count in active_revision_count_by_card.items()
+        if active_count > 1
+    ]
+    if conflicted_card_ids:
+        raise ActiveCardRevisionConflictError(
+            f"Crop '{crop_slug}' has multiple active agrotech revisions for card_id={conflicted_card_ids[0]}"
+        )
+    if len(rows) > 1:
+        raise ActiveCardRevisionConflictError(
+            f"Crop '{crop_slug}' has multiple active agrotech cards"
+        )
+    return with_version_label(rows[0])
 
 
 def get_active_card_revision(crop_slug: str) -> dict[str, Any] | None:
@@ -1613,15 +1638,37 @@ def get_crop_agrotech_card_from_db(crop_name_or_slug: Any) -> dict[str, Any] | N
                    OR lower(crops.name_ru) = lower(%s)
                    OR replace(replace(lower(crops.slug), '_', ' '), '-', ' ') = %s
                    OR replace(replace(lower(COALESCE(crops.name_ru, '')), '_', ' '), '-', ' ') = %s
-                ORDER BY crops.slug
-                LIMIT 1
+                ORDER BY crops.slug, agrotech_cards.id,
+                         agrotech_card_revisions.version_major DESC,
+                         agrotech_card_revisions.version_minor DESC,
+                         agrotech_card_revisions.id DESC
                 """,
                 (lookup, lookup, normalized_lookup, normalized_lookup),
             )
-            row = cursor.fetchone()
-            if row is None:
+            rows = cursor.fetchall()
+            if not rows:
                 return None
 
+            active_revision_count_by_card: dict[int, int] = {}
+            for candidate in rows:
+                active_revision_count_by_card[candidate["card_id"]] = (
+                    active_revision_count_by_card.get(candidate["card_id"], 0) + 1
+                )
+            conflicted_card_ids = [
+                card_id
+                for card_id, active_count in active_revision_count_by_card.items()
+                if active_count > 1
+            ]
+            if conflicted_card_ids:
+                raise ActiveCardRevisionConflictError(
+                    f"Crop '{rows[0]['crop_slug']}' has multiple active agrotech revisions for card_id={conflicted_card_ids[0]}"
+                )
+            if len({candidate["card_id"] for candidate in rows}) > 1:
+                raise ActiveCardRevisionConflictError(
+                    f"Crop '{rows[0]['crop_slug']}' has multiple active agrotech cards"
+                )
+
+            row = rows[0]
             norms = get_revision_norms(cursor, row["revision_id"])
 
             cursor.execute(
@@ -4472,24 +4519,49 @@ def get_available_crops() -> list[dict[str, Any]]:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                WITH active_revisions AS (
+                    SELECT
+                        agrotech_card_revisions.*,
+                        count(*) OVER (PARTITION BY agrotech_card_revisions.card_id) AS active_revision_count
+                    FROM agrotech_card_revisions
+                    WHERE agrotech_card_revisions.is_active
+                )
                 SELECT
                     crops.id,
                     crops.slug,
                     crops.name_ru,
                     crops.crop_type,
                     agrotech_cards.id AS card_id,
-                    agrotech_card_revisions.id AS active_revision_id,
-                    agrotech_card_revisions.version_major,
-                    agrotech_card_revisions.version_minor
+                    active_revisions.id AS active_revision_id,
+                    active_revisions.version_major,
+                    active_revisions.version_minor,
+                    active_revisions.active_revision_count,
+                    count(*) OVER (PARTITION BY crops.id) AS active_card_count
                 FROM crops
                 JOIN agrotech_cards ON agrotech_cards.crop_id = crops.id
-                JOIN agrotech_card_revisions
-                  ON agrotech_card_revisions.card_id = agrotech_cards.id
-                 AND agrotech_card_revisions.is_active
+                JOIN active_revisions
+                  ON active_revisions.card_id = agrotech_cards.id
                 ORDER BY crops.slug
                 """
             )
-            return [with_version_label(row) for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            for row in rows:
+                if row["active_revision_count"] > 1:
+                    raise ActiveCardRevisionConflictError(
+                        f"Crop '{row['slug']}' has multiple active agrotech revisions for card_id={row['card_id']}"
+                    )
+                if row["active_card_count"] > 1:
+                    raise ActiveCardRevisionConflictError(
+                        f"Crop '{row['slug']}' has multiple active agrotech cards"
+                    )
+
+            result = []
+            for row in rows:
+                item = with_version_label(row)
+                item.pop("active_revision_count", None)
+                item.pop("active_card_count", None)
+                result.append(item)
+            return result
 
 
 def get_current_growing_cycle(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any] | None:
@@ -4550,6 +4622,7 @@ def get_active_cycle_ai_context(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any
         "crop_type": row["crop_type"],
         "card_id": row["card_id"],
         "revision_id": row["revision_id"],
+        "card_revision_id": row["revision_id"],
         "version_label": row["version_label"],
         "norms": norms,
         "content": row["content"],

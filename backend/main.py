@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from db import (
     ActiveCardRevisionNotFoundError,
+    ActiveCardRevisionConflictError,
     ActiveGrowingCycleExistsError,
     AgrotechRevisionProposalApplyError,
     AgrotechRevisionProposalNotFoundError,
@@ -3469,7 +3470,10 @@ def api_get_advisor_report(report_id: int) -> dict[str, Any]:
 
 @app.get("/api/crops")
 def api_get_crops() -> list[dict[str, Any]]:
-    return get_available_crops()
+    try:
+        return get_available_crops()
+    except ActiveCardRevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
 
 @app.get("/api/cycles/current")
@@ -3491,6 +3495,8 @@ def api_start_growing_cycle(request: StartGrowingCycleRequest) -> dict[str, Any]
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
     except ActiveCardRevisionNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except ActiveCardRevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
     except ActiveGrowingCycleExistsError as exc:
         raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
