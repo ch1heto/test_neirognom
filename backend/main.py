@@ -50,12 +50,15 @@ from db import (
     get_recommendation_effects,
     get_cycle_ai_recommendations,
     get_cycle_analysis_report,
+    get_cycle_ai_analysis,
+    get_cycle_with_result,
     init_db,
     get_metric_snapshot_after,
     get_pending_recommendations_for_effect_evaluation,
     save_ai_log,
     save_ai_recommendation,
     save_cycle_analysis_report,
+    save_cycle_ai_analysis,
     save_anomaly_event,
     save_cycle_result,
     save_device_event,
@@ -2100,6 +2103,189 @@ def parse_recommendation_extraction_json(raw_text: str) -> list[Any]:
     return []
 
 
+CYCLE_AI_ANALYSIS_PROMPT_VERSION = "cycle_ai_analysis_v1"
+CYCLE_AI_ANALYSIS_AREAS = {"solution", "light", "watering", "climate", "sensor", "general"}
+CYCLE_AI_ANALYSIS_CONFIDENCE = {"low", "medium", "high"}
+CYCLE_AI_ANALYSIS_USEFULNESS = {
+    "useful",
+    "partially_useful",
+    "not_useful",
+    "harmful",
+    "inconclusive",
+}
+CYCLE_AI_ANALYSIS_METRICS = {"ph", "ec", "humidity", "air_temp", "water_temp", None}
+
+
+def parse_cycle_ai_analysis_json(raw_text: str) -> dict[str, Any]:
+    cleaned = strip_markdown_backticks(raw_text)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("AI analysis response must be a JSON object")
+    return parsed
+
+
+def normalize_cycle_ai_analysis_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    main_findings: list[dict[str, Any]] = []
+    for item in payload.get("main_findings") or []:
+        if not isinstance(item, dict):
+            continue
+        area = str(item.get("area") or "general").strip().lower()
+        confidence = str(item.get("confidence") or "low").strip().lower()
+        evidence = item.get("evidence")
+        main_findings.append(
+            {
+                "area": area if area in CYCLE_AI_ANALYSIS_AREAS else "general",
+                "problem": str(item.get("problem") or "данных недостаточно").strip(),
+                "evidence": evidence if isinstance(evidence, list) else [],
+                "confidence": confidence if confidence in CYCLE_AI_ANALYSIS_CONFIDENCE else "low",
+            }
+        )
+
+    recommendation_review: list[dict[str, Any]] = []
+    for item in payload.get("recommendation_review") or []:
+        if not isinstance(item, dict):
+            continue
+        raw_metric = item.get("metric_name")
+        metric_name = str(raw_metric).strip().lower() if raw_metric is not None else None
+        usefulness = str(item.get("usefulness") or "inconclusive").strip().lower()
+        recommendation_review.append(
+            {
+                "metric_name": metric_name if metric_name in CYCLE_AI_ANALYSIS_METRICS else None,
+                "recommendation_summary": str(item.get("recommendation_summary") or "").strip(),
+                "observed_effect": str(item.get("observed_effect") or "данных недостаточно").strip(),
+                "usefulness": usefulness if usefulness in CYCLE_AI_ANALYSIS_USEFULNESS else "inconclusive",
+                "comment": str(item.get("comment") or "").strip(),
+            }
+        )
+
+    potential_improvements: list[dict[str, Any]] = []
+    for item in payload.get("potential_improvements") or []:
+        if not isinstance(item, dict):
+            continue
+        priority = str(item.get("priority") or "low").strip().lower()
+        potential_improvements.append(
+            {
+                "target_section": str(item.get("target_section") or "general").strip(),
+                "suggested_change": str(item.get("suggested_change") or "").strip(),
+                "reason": str(item.get("reason") or "данных недостаточно").strip(),
+                "priority": priority if priority in CYCLE_AI_ANALYSIS_CONFIDENCE else "low",
+            }
+        )
+
+    confidence = str(payload.get("confidence") or "low").strip().lower()
+    return {
+        "summary": str(payload.get("summary") or "данных недостаточно").strip(),
+        "main_findings": main_findings,
+        "recommendation_review": recommendation_review,
+        "potential_improvements": potential_improvements,
+        "should_propose_new_revision": bool(payload.get("should_propose_new_revision", False)),
+        "revision_reason": str(payload.get("revision_reason") or "").strip() or None,
+        "confidence": confidence if confidence in CYCLE_AI_ANALYSIS_CONFIDENCE else "low",
+    }
+
+
+def build_cycle_ai_analysis_prompt(report_payload: dict[str, Any]) -> str:
+    return (
+        "Ты Нейрогном. Проанализируй завершённый цикл выращивания только по JSON-досье report_payload ниже.\n"
+        "Запрещено использовать внешние данные, сырую БД, догадки и текущие показания фермы.\n"
+        "Это НЕ создание новой АгроТехКарты: не пиши готовую карту, не меняй ревизии, не создавай proposal.\n"
+        "Нужно только определить проблемы, полезность сохранённых рекомендаций и потенциальные улучшения.\n"
+        "Если данных недостаточно, прямо пиши 'данных недостаточно'.\n"
+        "Не утверждай жёсткую причинно-следственную связь. Пиши 'после рекомендации наблюдалось...', а не 'рекомендация вызвала...'.\n"
+        "Верни валидный JSON без markdown и без текста вокруг.\n\n"
+        "Строгая схема ответа:\n"
+        "{\n"
+        '  "summary": "...",\n'
+        '  "main_findings": [{"area": "solution/light/watering/climate/sensor/general", "problem": "...", "evidence": ["..."], "confidence": "low/medium/high"}],\n'
+        '  "recommendation_review": [{"metric_name": "ph/ec/humidity/air_temp/water_temp/null", "recommendation_summary": "...", "observed_effect": "...", "usefulness": "useful/partially_useful/not_useful/harmful/inconclusive", "comment": "..."}],\n'
+        '  "potential_improvements": [{"target_section": "...", "suggested_change": "...", "reason": "...", "priority": "low/medium/high"}],\n'
+        '  "should_propose_new_revision": false,\n'
+        '  "revision_reason": "...",\n'
+        '  "confidence": "low/medium/high"\n'
+        "}\n\n"
+        "report_payload:\n"
+        f"{json.dumps(report_payload, ensure_ascii=False, default=str)}"
+    )
+
+
+async def run_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
+    cycle = await asyncio.to_thread(get_cycle_with_result, cycle_id)
+    if cycle.get("status") != "finished" or not cycle.get("finished_at"):
+        raise GrowingCycleNotFinishedError(
+            f"Growing cycle '{cycle_id}' is not finished; AI analysis can be run only for completed cycles"
+        )
+
+    report = await asyncio.to_thread(get_cycle_analysis_report, cycle_id)
+    if report is None:
+        built_report = await asyncio.to_thread(build_cycle_analysis_report, cycle_id)
+        report = await asyncio.to_thread(
+            save_cycle_analysis_report,
+            cycle_id,
+            built_report["report_payload"],
+            built_report["summary_text"],
+        )
+    if report is None:
+        raise RuntimeError(f"Analysis report for cycle '{cycle_id}' could not be built")
+
+    report_payload = report.get("report_payload") or {}
+    report_id = int(report["id"])
+    model_name = os.getenv("AI_MODEL", "gpt-5.4-mini")
+    prompt = build_cycle_ai_analysis_prompt(report_payload)
+
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        raw_text = response.choices[0].message.content or ""
+        parsed = parse_cycle_ai_analysis_json(raw_text)
+        normalized = normalize_cycle_ai_analysis_payload(parsed)
+        return await asyncio.to_thread(
+            save_cycle_ai_analysis,
+            cycle_id=cycle_id,
+            analysis_report_id=report_id,
+            summary=normalized["summary"],
+            main_findings=normalized["main_findings"],
+            recommendation_review=normalized["recommendation_review"],
+            potential_improvements=normalized["potential_improvements"],
+            should_propose_new_revision=normalized["should_propose_new_revision"],
+            revision_reason=normalized["revision_reason"],
+            confidence=normalized["confidence"],
+            status="completed",
+            model_name=model_name,
+            prompt_version=CYCLE_AI_ANALYSIS_PROMPT_VERSION,
+            raw_response=parsed,
+        )
+    except json.JSONDecodeError as exc:
+        failed = await asyncio.to_thread(
+            save_cycle_ai_analysis,
+            cycle_id=cycle_id,
+            analysis_report_id=report_id,
+            summary="AI analysis failed: model returned invalid JSON.",
+            status="failed",
+            model_name=model_name,
+            prompt_version=CYCLE_AI_ANALYSIS_PROMPT_VERSION,
+            raw_response={"error": str(exc), "raw_response": raw_text if "raw_text" in locals() else ""},
+        )
+        raise HTTPException(status_code=502, detail={"error": "AI model returned invalid JSON", "analysis": failed}) from exc
+    except Exception as exc:
+        failed = await asyncio.to_thread(
+            save_cycle_ai_analysis,
+            cycle_id=cycle_id,
+            analysis_report_id=report_id,
+            summary=f"AI analysis failed: {exc}",
+            status="failed",
+            model_name=model_name,
+            prompt_version=CYCLE_AI_ANALYSIS_PROMPT_VERSION,
+            raw_response={"error": str(exc)},
+        )
+        raise HTTPException(status_code=502, detail={"error": str(exc), "analysis": failed}) from exc
+
+
 async def extract_recommendations_from_reply(
     reply: str,
     user_message: str,
@@ -3088,6 +3274,24 @@ def api_get_cycle_analysis_report(cycle_id: int) -> dict[str, Any]:
     if report is None:
         raise HTTPException(status_code=404, detail={"error": f"Analysis report for cycle '{cycle_id}' not found"})
     return report
+
+
+@app.post("/api/cycles/{cycle_id}/ai-analysis")
+async def api_run_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
+    try:
+        return await run_cycle_ai_analysis(cycle_id)
+    except GrowingCycleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except GrowingCycleNotFinishedError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@app.get("/api/cycles/{cycle_id}/ai-analysis")
+def api_get_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
+    analysis = get_cycle_ai_analysis(cycle_id)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail={"error": f"AI analysis for cycle '{cycle_id}' not found"})
+    return analysis
 
 
 @app.get("/api/cycles/{cycle_id}/result")

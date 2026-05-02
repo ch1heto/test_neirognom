@@ -2670,6 +2670,201 @@ def get_cycle_analysis_report(cycle_id: int) -> dict[str, Any] | None:
             return row_to_cycle_analysis_report(cursor.fetchone())
 
 
+def ensure_cycle_ai_analysis_schema(cursor) -> None:
+    ensure_cycle_analysis_reports_schema(cursor)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cycle_ai_analysis (
+            id BIGSERIAL PRIMARY KEY,
+            cycle_id BIGINT NOT NULL UNIQUE,
+            analysis_report_id BIGINT NOT NULL,
+            summary TEXT,
+            main_findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+            recommendation_review JSONB NOT NULL DEFAULT '[]'::jsonb,
+            potential_improvements JSONB NOT NULL DEFAULT '[]'::jsonb,
+            should_propose_new_revision BOOLEAN NOT NULL DEFAULT false,
+            revision_reason TEXT,
+            confidence TEXT,
+            status TEXT NOT NULL DEFAULT 'completed',
+            model_name TEXT,
+            prompt_version TEXT,
+            raw_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS analysis_report_id BIGINT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS summary TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS main_findings JSONB")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS recommendation_review JSONB")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS potential_improvements JSONB")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS should_propose_new_revision BOOLEAN")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS revision_reason TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS confidence TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS status TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS model_name TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS prompt_version TEXT")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS raw_response JSONB")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+    ensure_jsonb_column(cursor, "cycle_ai_analysis", "main_findings")
+    ensure_jsonb_column(cursor, "cycle_ai_analysis", "recommendation_review")
+    ensure_jsonb_column(cursor, "cycle_ai_analysis", "potential_improvements")
+    ensure_jsonb_column(cursor, "cycle_ai_analysis", "raw_response")
+    cursor.execute("UPDATE cycle_ai_analysis SET main_findings = '[]'::jsonb WHERE main_findings IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET recommendation_review = '[]'::jsonb WHERE recommendation_review IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET potential_improvements = '[]'::jsonb WHERE potential_improvements IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET should_propose_new_revision = false WHERE should_propose_new_revision IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET status = 'completed' WHERE status IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET raw_response = '{}'::jsonb WHERE raw_response IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("UPDATE cycle_ai_analysis SET updated_at = now() WHERE updated_at IS NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN cycle_id SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN analysis_report_id SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN main_findings SET DEFAULT '[]'::jsonb")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN main_findings SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN recommendation_review SET DEFAULT '[]'::jsonb")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN recommendation_review SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN potential_improvements SET DEFAULT '[]'::jsonb")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN potential_improvements SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN should_propose_new_revision SET DEFAULT false")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN should_propose_new_revision SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN status SET DEFAULT 'completed'")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN status SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN raw_response SET DEFAULT '{}'::jsonb")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN raw_response SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN created_at SET NOT NULL")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN updated_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE cycle_ai_analysis ALTER COLUMN updated_at SET NOT NULL")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cycle_ai_analysis_cycle_id
+        ON cycle_ai_analysis(cycle_id)
+        """
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "cycle_ai_analysis",
+        "fk_cycle_ai_analysis_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "cycle_ai_analysis",
+        "fk_cycle_ai_analysis_report_id_reports",
+        "analysis_report_id",
+        "cycle_analysis_reports",
+        "id",
+    )
+
+
+def row_to_cycle_ai_analysis(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "cycle_id": row["cycle_id"],
+        "analysis_report_id": row["analysis_report_id"],
+        "summary": row["summary"],
+        "main_findings": row["main_findings"] or [],
+        "recommendation_review": row["recommendation_review"] or [],
+        "potential_improvements": row["potential_improvements"] or [],
+        "should_propose_new_revision": row["should_propose_new_revision"],
+        "revision_reason": row["revision_reason"],
+        "confidence": row["confidence"],
+        "status": row["status"],
+        "model_name": row["model_name"],
+        "prompt_version": row["prompt_version"],
+        "raw_response": row["raw_response"] or {},
+        "created_at": format_timestamp(row["created_at"]),
+        "updated_at": format_timestamp(row["updated_at"]),
+    }
+
+
+def save_cycle_ai_analysis(
+    *,
+    cycle_id: int,
+    analysis_report_id: int,
+    summary: str | None = None,
+    main_findings: list[dict[str, Any]] | None = None,
+    recommendation_review: list[dict[str, Any]] | None = None,
+    potential_improvements: list[dict[str, Any]] | None = None,
+    should_propose_new_revision: bool = False,
+    revision_reason: str | None = None,
+    confidence: str | None = None,
+    status: str = "completed",
+    model_name: str | None = None,
+    prompt_version: str | None = None,
+    raw_response: dict[str, Any] | list[Any] | None = None,
+) -> dict[str, Any]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_cycle_ai_analysis_schema(cursor)
+            cursor.execute(
+                """
+                INSERT INTO cycle_ai_analysis (
+                    cycle_id, analysis_report_id, summary,
+                    main_findings, recommendation_review, potential_improvements,
+                    should_propose_new_revision, revision_reason, confidence,
+                    status, model_name, prompt_version, raw_response,
+                    created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (cycle_id) DO UPDATE
+                SET analysis_report_id = EXCLUDED.analysis_report_id,
+                    summary = EXCLUDED.summary,
+                    main_findings = EXCLUDED.main_findings,
+                    recommendation_review = EXCLUDED.recommendation_review,
+                    potential_improvements = EXCLUDED.potential_improvements,
+                    should_propose_new_revision = EXCLUDED.should_propose_new_revision,
+                    revision_reason = EXCLUDED.revision_reason,
+                    confidence = EXCLUDED.confidence,
+                    status = EXCLUDED.status,
+                    model_name = EXCLUDED.model_name,
+                    prompt_version = EXCLUDED.prompt_version,
+                    raw_response = EXCLUDED.raw_response,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    cycle_id,
+                    analysis_report_id,
+                    summary,
+                    Jsonb(main_findings or []),
+                    Jsonb(recommendation_review or []),
+                    Jsonb(potential_improvements or []),
+                    bool(should_propose_new_revision),
+                    revision_reason,
+                    confidence,
+                    status,
+                    model_name,
+                    prompt_version,
+                    Jsonb(raw_response or {}),
+                ),
+            )
+            return row_to_cycle_ai_analysis(cursor.fetchone())
+
+
+def get_cycle_ai_analysis(cycle_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_cycle_ai_analysis_schema(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM cycle_ai_analysis
+                WHERE cycle_id = %s
+                """,
+                (cycle_id,),
+            )
+            return row_to_cycle_ai_analysis(cursor.fetchone())
+
+
 def validate_cycle_result_payload(
     harvest_status: str,
     harvest_mass_grams: float | None,
@@ -3322,6 +3517,7 @@ def get_database_model_summary() -> dict[str, Any]:
             "ai_log_commands",
             "ai_recommendations",
             "recommendation_effects",
+            "cycle_ai_analysis",
             "advisor_reports",
             "advisor_report_findings",
             "advisor_report_recommendations",
@@ -3966,6 +4162,7 @@ def init_db() -> None:
             drop_anomaly_legacy_columns(cursor)
             ensure_cycle_results_schema(cursor)
             ensure_cycle_analysis_reports_schema(cursor)
+            ensure_cycle_ai_analysis_schema(cursor)
             ensure_advisor_reports_schema(cursor)
             ensure_ai_logs_schema(cursor)
             ensure_ai_log_commands_schema(cursor)
