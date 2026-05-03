@@ -41,6 +41,7 @@ from db import (
     get_current_growing_cycle,
     get_cycle_result,
     get_crop_agrotech_card_from_db,
+    get_crop_learning_history,
     get_database_model_summary,
     get_agrotech_revision_proposal,
     get_cycle_agrotech_revision_proposal,
@@ -3474,6 +3475,14 @@ def api_get_crops() -> list[dict[str, Any]]:
         return get_available_crops()
     except ActiveCardRevisionConflictError as exc:
         raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+
+@app.get("/api/crops/{crop_slug}/learning-history")
+def api_get_crop_learning_history(crop_slug: str) -> dict[str, Any]:
+    try:
+        return get_crop_learning_history(crop_slug)
+    except CropNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
 
 
 @app.get("/api/cycles/current")

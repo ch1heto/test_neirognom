@@ -3552,6 +3552,326 @@ def apply_cycle_agrotech_revision_proposal(cycle_id: int, force: bool = False) -
     return apply_agrotech_revision_proposal(row["id"], force=force)
 
 
+def shorten_learning_text(value: Any, limit: int = 240) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def learning_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def shorten_learning_value(value: Any, limit: int = 160) -> Any:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        return shorten_learning_text(value, limit)
+    try:
+        encoded = json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        encoded = str(value)
+    return shorten_learning_text(encoded, limit)
+
+
+def shorten_proposed_changes(value: Any, limit: int = 6) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for item in learning_json_list(value)[:limit]:
+        if not isinstance(item, dict):
+            continue
+        changes.append(
+            {
+                "section": shorten_learning_value(item.get("section") or item.get("section_title"), 80),
+                "priority": shorten_learning_value(item.get("priority"), 40),
+                "reason": shorten_learning_text(item.get("reason"), 180),
+                "new_value": shorten_learning_value(item.get("new_value"), 180),
+            }
+        )
+    return changes
+
+
+def shorten_main_findings(value: Any, limit: int = 6) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for item in learning_json_list(value)[:limit]:
+        if not isinstance(item, dict):
+            continue
+        findings.append(
+            {
+                "area": shorten_learning_value(item.get("area"), 60),
+                "problem": shorten_learning_text(item.get("problem") or item.get("finding"), 180),
+                "confidence": shorten_learning_value(item.get("confidence"), 40),
+            }
+        )
+    return findings
+
+
+def build_revision_effectiveness(cycles: list[dict[str, Any]]) -> dict[str, Any]:
+    harvest_status_counts: dict[str, int] = {}
+    problem_severity_counts: dict[str, int] = {}
+    finished_cycles = 0
+    successful_cycles = 0
+    failed_cycles = 0
+
+    for cycle in cycles:
+        harvest_status = cycle.get("harvest_status")
+        problem_severity = cycle.get("problem_severity")
+        if harvest_status:
+            harvest_status_counts[harvest_status] = harvest_status_counts.get(harvest_status, 0) + 1
+        if problem_severity:
+            problem_severity_counts[problem_severity] = problem_severity_counts.get(problem_severity, 0) + 1
+
+        if cycle.get("status") != "finished":
+            continue
+        finished_cycles += 1
+        if harvest_status in {"suitable", "partial", "weak_suitable"}:
+            successful_cycles += 1
+        if harvest_status in {"failed", "stopped_early"} or problem_severity == "bad":
+            failed_cycles += 1
+
+    cycles_total = len(cycles)
+    has_enough_data = finished_cycles >= 2
+    if finished_cycles == 0:
+        summary = "Недостаточно данных: на этой версии еще нет завершенных циклов."
+    elif not has_enough_data:
+        summary = (
+            "Данных мало: есть только один завершенный цикл, "
+            "по нему нельзя уверенно оценивать эффективность версии."
+        )
+    else:
+        summary = (
+            f"Завершено циклов: {finished_cycles}; "
+            f"успешных: {successful_cycles}; проблемных: {failed_cycles}."
+        )
+
+    return {
+        "cycles_total": cycles_total,
+        "finished_cycles": finished_cycles,
+        "successful_cycles": successful_cycles,
+        "failed_cycles": failed_cycles,
+        "harvest_status_counts": harvest_status_counts,
+        "problem_severity_counts": problem_severity_counts,
+        "has_enough_data": has_enough_data,
+        "summary": summary,
+    }
+
+
+def get_crop_learning_history(crop_slug: str) -> dict[str, Any]:
+    normalized_slug = str(crop_slug or "").strip()
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    crops.id AS crop_id,
+                    crops.slug,
+                    crops.name_ru,
+                    agrotech_cards.id AS card_id
+                FROM crops
+                LEFT JOIN agrotech_cards ON agrotech_cards.crop_id = crops.id
+                WHERE crops.slug = %s
+                ORDER BY agrotech_cards.id NULLS LAST
+                LIMIT 1
+                """,
+                (normalized_slug,),
+            )
+            crop_row = cursor.fetchone()
+            if crop_row is None:
+                raise CropNotFoundError(f"Crop '{normalized_slug}' not found")
+
+            crop = {
+                "id": crop_row["crop_id"],
+                "slug": crop_row["slug"],
+                "name_ru": crop_row["name_ru"],
+            }
+            card_id = crop_row["card_id"]
+            if card_id is None:
+                return {
+                    "crop": crop,
+                    "active_revision_id": None,
+                    "versions": [],
+                    "learning_summary": [],
+                }
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    version_major,
+                    version_minor,
+                    parent_revision_id,
+                    source,
+                    change_reason,
+                    created_by,
+                    created_at,
+                    is_active
+                FROM agrotech_card_revisions
+                WHERE card_id = %s
+                ORDER BY version_major ASC, version_minor ASC, id ASC
+                """,
+                (card_id,),
+            )
+            revision_rows = cursor.fetchall()
+            revision_ids = [row["id"] for row in revision_rows]
+            active_revision_id = next((row["id"] for row in revision_rows if row["is_active"]), None)
+
+            audit_reason_by_revision_id: dict[int, str | None] = {}
+            if revision_ids and table_exists(cursor, "agrotech_audit_log"):
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (revision_id)
+                        revision_id,
+                        reason
+                    FROM agrotech_audit_log
+                    WHERE revision_id = ANY(%s::bigint[])
+                    ORDER BY revision_id, created_at DESC, id DESC
+                    """,
+                    (revision_ids,),
+                )
+                audit_reason_by_revision_id = {
+                    row["revision_id"]: row["reason"]
+                    for row in cursor.fetchall()
+                    if row["revision_id"] is not None
+                }
+
+            proposal_by_revision_id: dict[int, dict[str, Any]] = {}
+            if revision_ids and table_exists(cursor, "agrotech_revision_proposals"):
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        cycle_id,
+                        source_revision_id,
+                        proposed_changes,
+                        ai_reasoning,
+                        applied_revision_id
+                    FROM agrotech_revision_proposals
+                    WHERE applied_revision_id = ANY(%s::bigint[])
+                    ORDER BY applied_at DESC NULLS LAST, updated_at DESC, id DESC
+                    """,
+                    (revision_ids,),
+                )
+                for row in cursor.fetchall():
+                    if row["applied_revision_id"] not in proposal_by_revision_id:
+                        proposal_by_revision_id[row["applied_revision_id"]] = row
+
+            cycles_by_revision_id: dict[int, list[dict[str, Any]]] = {revision_id: [] for revision_id in revision_ids}
+            if revision_ids and table_exists(cursor, "growing_cycles"):
+                has_cycle_results = table_exists(cursor, "cycle_results")
+                has_analysis_reports = table_exists(cursor, "cycle_analysis_reports")
+                has_ai_analysis = table_exists(cursor, "cycle_ai_analysis")
+                cursor.execute(
+                    f"""
+                    SELECT
+                        growing_cycles.id AS cycle_id,
+                        growing_cycles.card_revision_id,
+                        growing_cycles.status,
+                        growing_cycles.started_at,
+                        growing_cycles.finished_at,
+                        {'cycle_results.harvest_status' if has_cycle_results else 'NULL'} AS harvest_status,
+                        {'cycle_results.problem_severity' if has_cycle_results else 'NULL'} AS problem_severity,
+                        {'cycle_analysis_reports.summary_text' if has_analysis_reports else 'NULL'} AS report_summary,
+                        {'cycle_ai_analysis.summary' if has_ai_analysis else 'NULL'} AS ai_summary,
+                        {'cycle_ai_analysis.main_findings' if has_ai_analysis else "'[]'::jsonb"} AS main_findings
+                    FROM growing_cycles
+                    {'LEFT JOIN cycle_results ON cycle_results.cycle_id = growing_cycles.id' if has_cycle_results else ''}
+                    {'LEFT JOIN cycle_analysis_reports ON cycle_analysis_reports.cycle_id = growing_cycles.id' if has_analysis_reports else ''}
+                    {'LEFT JOIN cycle_ai_analysis ON cycle_ai_analysis.cycle_id = growing_cycles.id' if has_ai_analysis else ''}
+                    WHERE growing_cycles.crop_id = %s
+                      AND growing_cycles.card_revision_id = ANY(%s::bigint[])
+                    ORDER BY growing_cycles.started_at ASC, growing_cycles.id ASC
+                    """,
+                    (crop_row["crop_id"], revision_ids),
+                )
+                for row in cursor.fetchall():
+                    cycle = {
+                        "cycle_id": row["cycle_id"],
+                        "status": row["status"],
+                        "started_at": format_timestamp(row["started_at"]),
+                        "finished_at": format_timestamp(row["finished_at"]) if row["finished_at"] else None,
+                        "harvest_status": row["harvest_status"],
+                        "problem_severity": row["problem_severity"],
+                        "ai_analysis_summary": shorten_learning_text(row["ai_summary"] or row["report_summary"], 260),
+                        "main_findings_short": shorten_main_findings(row["main_findings"]),
+                    }
+                    cycles_by_revision_id.setdefault(row["card_revision_id"], []).append(cycle)
+
+            revision_label_by_id = {
+                row["id"]: make_version_label(row["version_major"], row["version_minor"])
+                for row in revision_rows
+            }
+            versions: list[dict[str, Any]] = []
+            learning_summary: list[str] = []
+
+            for row in revision_rows:
+                revision_id = row["id"]
+                proposal = proposal_by_revision_id.get(revision_id)
+                created_from = None
+                if proposal:
+                    created_from = {
+                        "proposal_id": proposal["id"],
+                        "source_cycle_id": proposal["cycle_id"],
+                        "source_revision_id": proposal["source_revision_id"],
+                        "ai_reasoning_short": shorten_learning_text(proposal["ai_reasoning"], 260),
+                        "top_changes": shorten_proposed_changes(proposal["proposed_changes"]),
+                    }
+                    source_label = revision_label_by_id.get(proposal["source_revision_id"])
+                    reason = created_from["ai_reasoning_short"] or "примененный proposal"
+                    if source_label:
+                        learning_summary.append(
+                            f"{make_version_label(row['version_major'], row['version_minor'])} создана после цикла "
+                            f"#{proposal['cycle_id']} на {source_label}: {reason}"
+                        )
+                    else:
+                        learning_summary.append(
+                            f"{make_version_label(row['version_major'], row['version_minor'])} создана после цикла "
+                            f"#{proposal['cycle_id']}: {reason}"
+                        )
+
+                revision_cycles = cycles_by_revision_id.get(revision_id, [])
+                effectiveness = build_revision_effectiveness(revision_cycles)
+                if revision_cycles and not effectiveness["has_enough_data"]:
+                    learning_summary.append(
+                        f"{make_version_label(row['version_major'], row['version_minor'])}: "
+                        f"{effectiveness['summary']}"
+                    )
+
+                change_reason = row["change_reason"] or audit_reason_by_revision_id.get(revision_id)
+                versions.append(
+                    {
+                        "revision_id": revision_id,
+                        "version_label": make_version_label(row["version_major"], row["version_minor"]),
+                        "is_active": row["is_active"],
+                        "parent_revision_id": row["parent_revision_id"],
+                        "source": row["source"],
+                        "created_by": row["created_by"],
+                        "created_at": format_timestamp(row["created_at"]),
+                        "change_reason_short": shorten_learning_text(change_reason, 260),
+                        "created_from": created_from,
+                        "cycles_on_this_revision": revision_cycles,
+                        "effectiveness": effectiveness,
+                    }
+                )
+
+            return {
+                "crop": crop,
+                "active_revision_id": active_revision_id,
+                "versions": versions,
+                "learning_summary": learning_summary[:10],
+            }
+
+
 def validate_cycle_result_payload(
     harvest_status: str,
     harvest_mass_grams: float | None,
