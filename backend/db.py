@@ -3272,6 +3272,127 @@ def _get_latest_revision_version(cursor, card_id: int) -> tuple[int, int]:
     return int(row["version_major"]), int(row["version_minor"])
 
 
+AGROTECH_PROPOSAL_DANGEROUS_PATTERNS = (
+    ("сразу добавь много", "dangerous dosing: 'сразу добавь много'"),
+    ("добавь много", "dangerous dosing: 'добавь много'"),
+    ("резко повысить", "abrupt correction: 'резко повысить'"),
+    ("резко понизить", "abrupt correction: 'резко понизить'"),
+    ("резко снизить", "abrupt correction: 'резко снизить'"),
+    ("быстро поднять ph", "abrupt pH correction: 'быстро поднять pH'"),
+    ("быстро снизить ph", "abrupt pH correction: 'быстро снизить pH'"),
+    ("без повторного измерения", "missing re-measurement: 'без повторного измерения'"),
+    ("без проверки", "missing check: 'без проверки'"),
+    ("игнорировать датчики", "unsafe sensor handling: 'игнорировать датчики'"),
+    ("не проверять ph", "unsafe pH handling: 'не проверять pH'"),
+    ("не проверять ec", "unsafe EC handling: 'не проверять EC'"),
+    ("отключить вентиляцию", "unsafe ventilation advice: 'отключить вентиляцию'"),
+    ("оставить без контроля", "unsafe monitoring advice: 'оставить без контроля'"),
+    ("внести максимальную дозу", "dangerous dosing: 'внести максимальную дозу'"),
+    ("превысить норму", "unsafe norm advice: 'превысить норму'"),
+    ("не измерять", "unsafe measurement advice: 'не измерять'"),
+    ("ph-up", "potentially unsafe pH-up dosing"),
+    ("ph up", "potentially unsafe pH-up dosing"),
+    ("ph-down", "potentially unsafe pH-down dosing"),
+    ("ph down", "potentially unsafe pH-down dosing"),
+    ("ignore sensors", "unsafe sensor handling: 'ignore sensors'"),
+    ("no measurement", "unsafe measurement advice: 'no measurement'"),
+    ("without measuring", "unsafe measurement advice: 'without measuring'"),
+)
+
+AGROTECH_PROPOSAL_SAFE_CORRECTION_MARKERS = (
+    "малыми шагами",
+    "небольшими шагами",
+    "повторно измер",
+    "перепроверь",
+    "проверить раствор",
+    "перемеш",
+    "после каждой правки",
+    "не делать несколько правок подряд",
+)
+
+AGROTECH_PROPOSAL_CORRECTION_KEYWORDS = (
+    "корректир",
+    "поднять",
+    "подними",
+    "повысить",
+    "повысь",
+    "снизить",
+    "снизь",
+    "понизить",
+    "понизь",
+    "довести",
+    "доведи",
+    "добавить",
+    "добавь",
+    "внести",
+    "внеси",
+    "разбавить",
+    "разбавь",
+    "adjust",
+    "raise",
+    "lower",
+    "increase",
+    "decrease",
+    "add",
+    "dose",
+)
+
+
+def _normalize_safety_text(value: Any) -> str:
+    text = str(value or "").lower().replace("ё", "е")
+    return " ".join(text.replace("_", " ").split())
+
+
+def _proposal_changes_to_safety_text(proposed_changes: Any) -> str:
+    try:
+        return json.dumps(proposed_changes, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(proposed_changes or "")
+
+
+def _proposal_mentions_ph_ec_correction(normalized_text: str) -> bool:
+    if not re.search(r"\bph\b|\bec\b", normalized_text, re.IGNORECASE):
+        return False
+    return any(keyword in normalized_text for keyword in AGROTECH_PROPOSAL_CORRECTION_KEYWORDS)
+
+
+def validate_agrotech_proposal_safety(proposal: dict[str, Any]) -> dict[str, Any]:
+    blocking_reasons: list[str] = []
+    warnings: list[str] = []
+
+    proposed_content = str(proposal.get("proposed_content") or "").strip()
+    proposed_changes = proposal.get("proposed_changes")
+    if not proposed_content:
+        blocking_reasons.append("proposed_content is empty")
+    if not isinstance(proposed_changes, list) or not proposed_changes:
+        blocking_reasons.append("proposed_changes must be a non-empty list")
+
+    combined_text = _normalize_safety_text(
+        proposed_content + "\n" + _proposal_changes_to_safety_text(proposed_changes)
+    )
+    for pattern, reason in AGROTECH_PROPOSAL_DANGEROUS_PATTERNS:
+        if _normalize_safety_text(pattern) in combined_text:
+            blocking_reasons.append(reason)
+
+    if _proposal_mentions_ph_ec_correction(combined_text):
+        has_safe_marker = any(
+            _normalize_safety_text(marker) in combined_text
+            for marker in AGROTECH_PROPOSAL_SAFE_CORRECTION_MARKERS
+        )
+        if not has_safe_marker:
+            blocking_reasons.append(
+                "pH/EC correction advice lacks safe markers: small steps, re-measurement, solution check or mixing"
+            )
+        else:
+            warnings.append("pH/EC correction advice includes safe re-check markers")
+
+    return {
+        "is_safe": not blocking_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warnings": warnings,
+    }
+
+
 def _coerce_norm_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -3437,6 +3558,15 @@ def apply_agrotech_revision_proposal(proposal_id: int, force: bool = False) -> d
                 _update_proposal_apply_error(cursor, proposal_id, "failed", reason)
                 raise AgrotechRevisionProposalApplyError(reason)
 
+            safety_validation = validate_agrotech_proposal_safety(proposal)
+            if not safety_validation["is_safe"] and not force:
+                reason = (
+                    "proposal safety validation failed: "
+                    + "; ".join(safety_validation["blocking_reasons"])
+                )
+                _update_proposal_apply_error(cursor, proposal_id, "auto_deferred", reason)
+                raise AgrotechRevisionProposalApplyError(reason)
+
             source_norms = get_revision_norms(cursor, proposal["source_revision_id"])
             norm_safety_notes = _find_agrotech_norm_safety_notes(source_norms, proposed_norms)
             if norm_safety_notes and not force:
@@ -3460,6 +3590,16 @@ def apply_agrotech_revision_proposal(proposal_id: int, force: bool = False) -> d
                 change_reason_parts.append(f"safety_notes={json.dumps(safety_notes, ensure_ascii=False)}")
             if norm_safety_notes:
                 change_reason_parts.append(f"forced_norm_safety_notes={json.dumps(norm_safety_notes, ensure_ascii=False)}")
+            if force and not safety_validation["is_safe"]:
+                change_reason_parts.append(
+                    "forced_rule_safety_blockers="
+                    + json.dumps(safety_validation["blocking_reasons"], ensure_ascii=False)
+                )
+            if safety_validation["warnings"]:
+                change_reason_parts.append(
+                    "rule_safety_warnings="
+                    + json.dumps(safety_validation["warnings"], ensure_ascii=False)
+                )
             change_reason = " | ".join(change_reason_parts)
 
             cursor.execute(
