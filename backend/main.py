@@ -269,16 +269,23 @@ CHAT_SYSTEM_PROMPT = (
     "Не придумывай историю устройств, если её нет в device_events. "
     "Не говори, что полив в норме, если нет истории насоса и нет достаточных данных влажности. "
     "Для pH/EC не советуй добавлять щёлочь, кислоту или менять раствор без текущего значения pH/EC.\n"
-    "10. Если пользователь задаёт follow-up вопрос с местоимениями вроде 'он', 'она', 'сколько раз', "
+    "10. Если backend передал блок 'Контекст свежести датчиков', используй его как факт. "
+    "Если water-датчики устарели, не утверждай уверенно, что pH, EC или температура воды сейчас в норме, "
+    "и не советуй корректировать pH/EC без повторного свежего замера. "
+    "Если climate-датчики устарели, не утверждай уверенно, что температура воздуха или влажность сейчас в норме. "
+    "При stale-данных сначала советуй проверить датчик, MQTT/ESP32/симулятор и повторить измерение. "
+    "Не пугай пользователя, если stale-событие старое и новые данные уже пришли. "
+    "Если пользователь просто здоровается или спрашивает не про ферму, не пересказывай stale-контекст.\n"
+    "11. Если пользователь задаёт follow-up вопрос с местоимениями вроде 'он', 'она', 'сколько раз', "
     "'когда последний раз', используй расширенный контекст фермы, который backend добавил на основе недавней темы диалога. "
     "Не говори, что точных данных нет, если в расширенном контексте есть counts/history из device_events.\n"
-    "11. Если backend передал блок 'Прошлый опыт культуры', используй его как дополнительный источник фактов только для активной культуры. "
+    "12. Если backend передал блок 'Прошлый опыт культуры', используй его как дополнительный источник фактов только для активной культуры. "
     "Не смешивай опыт разных культур. Не утверждай, что новая версия АгроТехКарты эффективнее, если завершённых циклов на ней ещё нет или данных недостаточно. "
     "Не делай жёсткие причинно-следственные выводы: формулируй осторожно, через 'раньше наблюдалось', 'в прошлых циклах было видно'. "
     "При советах по pH, EC, поливу и температуре учитывай прошлые проблемы и внесённые улучшения, но текущие датчики и активная АгроТехКарта важнее прошлого опыта. "
     "Не рассказывай пользователю proposal_id, revision_id, source_revision_id и внутреннюю историю версий, если он прямо не спрашивает. "
     "Если пользователь просто здоровается или спрашивает не про ферму, не пересказывай прошлый опыт.\n"
-    "12. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
+    "13. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
     "Не придумывай количество включений устройств, pH, EC, аномалии, активную культуру или историю метрик. "
     "Если пользователь задаёт follow-up вопрос, используй историю диалога и вызывай подходящий инструмент. "
     "Если пользователь спрашивает про несколько устройств, запроси данные по каждому устройству. "
@@ -287,8 +294,8 @@ CHAT_SYSTEM_PROMPT = (
     "Не советуй добавлять щёлочь, кислоту или менять раствор без текущего значения pH. "
     "Для вопросов про конкретную культуру вызывай get_crop_card_tool. "
     "Для вопросов про текущее состояние фермы используй текущие метрики, активный цикл и, при необходимости, аномалии.\n"
-    "13. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
-    "14. Для конкретной культуры сначала используй get_crop_card_tool. "
+    "14. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
+    "15. Для конкретной культуры сначала используй get_crop_card_tool. "
     "Если tool вернул suitability_status='db_supported', отвечай по АгроТехКарте. "
     "Если suitability_status='compatible_not_in_db', можно дать только общую справку и обязательно сказать, что точной АгроТехКарты в БД нет. "
     "Если suitability_status='advanced_or_unsuitable', не рассказывай подробную агротехнику для этой установки; объясни, что культура может требовать другой гидропонной системы, большего объёма, опоры, опыления или другого формата выращивания. "
@@ -1522,7 +1529,15 @@ def execute_farm_ai_tool(name: str, arguments: dict) -> dict[str, Any]:
     try:
         args = arguments if isinstance(arguments, dict) else {}
         if name == "get_current_metrics_tool":
-            return {"ok": True, "metrics": get_current_metrics()}
+            freshness = get_sensor_freshness_status_for_ai()
+            metrics_payload = metrics_for_ai_with_freshness(get_current_metrics(), freshness)
+            return {
+                "ok": True,
+                "metrics": metrics_payload["current"],
+                "stale_last_known": metrics_payload["stale_last_known"],
+                "sensor_freshness": freshness,
+                "freshness_warning": metrics_payload["freshness_warning"],
+            }
 
         if name == "get_active_cycle_tool":
             tray_id = str(args.get("tray_id") or "tray_1")
@@ -1738,21 +1753,46 @@ def get_latest_data_snapshot() -> dict[str, Any]:
     return latest_snapshot
 
 
-def format_latest_data_for_prompt() -> str:
+def is_sensor_type_fresh(
+    sensor_freshness: dict[str, dict[str, Any]] | None,
+    sensor_type: str,
+) -> bool:
+    if not isinstance(sensor_freshness, dict):
+        return True
+    status = sensor_freshness.get(sensor_type)
+    if not isinstance(status, dict):
+        return True
+    return bool(status.get("is_fresh"))
+
+
+def format_current_or_stale_value(value: Any, unit: str, is_fresh: bool) -> str:
+    if is_fresh:
+        return format_sensor_value(value, unit)
+    if value is None:
+        return "нет свежего подтверждённого значения"
+    return f"нет свежего подтверждённого значения, последнее устаревшее значение: {format_sensor_value(value, unit)}"
+
+
+def format_latest_data_for_prompt(sensor_freshness: dict[str, dict[str, Any]] | None = None) -> str:
     latest_data = get_latest_data_snapshot()
+    water_is_fresh = is_sensor_type_fresh(sensor_freshness, "water")
+    climate_is_fresh = is_sensor_type_fresh(sensor_freshness, "climate")
 
     air_temp = latest_data.get("Температура")
     humidity = latest_data.get("Влажность")
     water_temp = latest_data.get("Темп. воды")
     ph = latest_data.get("pH")
     ec = latest_data.get("EC")
-    ph_text = format_sensor_value(ph, "") if ph is not None else "данных по pH пока нет"
-    ec_text = format_sensor_value(ec, "") if ec is not None else "данных по EC пока нет"
+    air_temp_text = format_current_or_stale_value(air_temp, " C", climate_is_fresh)
+    humidity_text = format_current_or_stale_value(humidity, "%", climate_is_fresh)
+    water_temp_text = format_current_or_stale_value(water_temp, " C", water_is_fresh)
+    ph_text = format_current_or_stale_value(ph, "", water_is_fresh)
+    ec_text = format_current_or_stale_value(ec, "", water_is_fresh)
 
     return (
-        f"Текущие показатели: Температура воздуха {format_sensor_value(air_temp, ' C')}, "
-        f"Влажность {format_sensor_value(humidity, '%')}, "
-        f"Температура воды {format_sensor_value(water_temp, ' C')}, "
+        f"Текущие показатели: Температура воздуха {air_temp_text}, "
+        f"Влажность {humidity_text}, "
+        f"Температура воды {water_temp_text}, "
         f"pH {ph_text}, EC {ec_text}"
     )
 
@@ -1983,6 +2023,151 @@ def build_crop_learning_context_for_ai(crop_slug: str) -> str:
         "если он прямо не спрашивает."
     )
     return "\n".join(lines)
+
+
+def sensor_record_age_seconds(recorded_at: Any) -> int | None:
+    if not isinstance(recorded_at, datetime):
+        return None
+    now = datetime.now(recorded_at.tzinfo) if recorded_at.tzinfo else datetime.now()
+    return max(0, int((now - recorded_at).total_seconds()))
+
+
+def latest_sensor_record_status(
+    records: list[dict[str, Any]],
+    affected_metrics: list[str],
+) -> dict[str, Any]:
+    latest_record = records[-1] if records else None
+    recorded_at = latest_record.get("recorded_at") if isinstance(latest_record, dict) else None
+    age_seconds = sensor_record_age_seconds(recorded_at)
+    payload = latest_record.get("parsed_payload") if isinstance(latest_record, dict) else None
+    return {
+        "is_fresh": age_seconds is not None and age_seconds <= SENSOR_STALE_SECONDS,
+        "age_seconds": age_seconds,
+        "last_recorded_at": recorded_at.strftime("%Y-%m-%d %H:%M:%S") if isinstance(recorded_at, datetime) else None,
+        "affected_metrics": affected_metrics,
+        "last_values": payload if isinstance(payload, dict) else {},
+    }
+
+
+def metrics_for_ai_with_freshness(
+    metrics: dict[str, Any],
+    freshness: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    current_metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    stale_last_known: dict[str, Any] = {}
+    warnings: list[str] = []
+
+    water = freshness.get("water", {})
+    if isinstance(water, dict) and not water.get("is_fresh"):
+        last_values = water.get("last_values") if isinstance(water.get("last_values"), dict) else {}
+        for metric_name in ("ph", "ec", "water_temp"):
+            stale_last_known[metric_name] = last_values.get(metric_name, current_metrics.get(metric_name))
+            current_metrics[metric_name] = None
+        warnings.append("water metrics are stale; do not treat ph/ec/water_temp as current")
+
+    climate = freshness.get("climate", {})
+    if isinstance(climate, dict) and not climate.get("is_fresh"):
+        last_values = climate.get("last_values") if isinstance(climate.get("last_values"), dict) else {}
+        for metric_name in ("temperature", "humidity"):
+            payload_key = "air_temp" if metric_name == "temperature" else metric_name
+            stale_last_known[metric_name] = last_values.get(payload_key, current_metrics.get(metric_name))
+            current_metrics[metric_name] = None
+        warnings.append("climate metrics are stale; do not treat air_temp/humidity as current")
+
+    return {
+        "current": current_metrics,
+        "stale_last_known": stale_last_known,
+        "freshness_warning": "; ".join(warnings) if warnings else "",
+    }
+
+
+def get_sensor_freshness_status_for_ai() -> dict[str, dict[str, Any]]:
+    water_records = get_last_water_records(1)
+    climate_records = get_last_climate_records(1)
+    return {
+        "water": latest_sensor_record_status(
+            water_records,
+            ["ph", "ec", "water_temp"],
+        ),
+        "climate": latest_sensor_record_status(
+            climate_records,
+            ["air_temp", "humidity"],
+        ),
+    }
+
+
+def build_stale_sensor_context_for_ai(
+    hours: int = 24,
+    question_topics: set[str] | None = None,
+) -> str:
+    freshness = get_sensor_freshness_status_for_ai()
+    if question_topics is not None and not question_topics:
+        return ""
+
+    stale_events = [
+        event
+        for event in get_recent_anomaly_events(hours)
+        if event.get("event_type") in {"stale_water_data", "stale_climate_data", "stale_sensor_data"}
+    ]
+    stale_event_types = {str(event.get("event_type")) for event in stale_events}
+    lines: list[str] = []
+
+    water = freshness["water"]
+    if not water["is_fresh"]:
+        if "stale_water_data" in stale_event_types or "stale_sensor_data" in stale_event_types:
+            lines.append("- Недавно зафиксировано stale_water_data: данные водных датчиков могли устареть.")
+        elif water["last_recorded_at"] is None:
+            lines.append("- Нет свежих записей водных датчиков: pH, EC и температура воды неизвестны.")
+        else:
+            lines.append(
+                f"- Последние данные водных датчиков старше {SENSOR_STALE_SECONDS} секунд "
+                f"(возраст около {water['age_seconds']} секунд)."
+            )
+        lines.append("- Для pH, EC и температуры воды сначала попроси перепроверить актуальность показаний.")
+        lines.append("- Не давай уверенных рекомендаций по корректировке раствора, пока pH/EC не подтверждены свежим измерением.")
+
+    climate = freshness["climate"]
+    if not climate["is_fresh"]:
+        if "stale_climate_data" in stale_event_types or "stale_sensor_data" in stale_event_types:
+            lines.append("- Недавно зафиксировано stale_climate_data: данные климатических датчиков могли устареть.")
+        elif climate["last_recorded_at"] is None:
+            lines.append("- Нет свежих записей климатических датчиков: температура воздуха и влажность неизвестны.")
+        else:
+            lines.append(
+                f"- Последние данные климатических датчиков старше {SENSOR_STALE_SECONDS} секунд "
+                f"(возраст около {climate['age_seconds']} секунд)."
+            )
+        lines.append("- Для температуры воздуха и влажности сначала попроси перепроверить актуальность показаний.")
+
+    if not lines:
+        return ""
+
+    topic_lines: list[str] = []
+    if question_topics is None or "solution" in question_topics:
+        if not water["is_fresh"]:
+            topic_lines.append(
+                "- Вопрос связан с pH/EC/раствором, а water.is_fresh=false: "
+                "в ответе сначала скажи, что данные pH/EC могли устареть и нужен свежий замер. "
+                "Не начинай с оценки 'pH сейчас в норме'."
+            )
+    if question_topics is None or "temperature" in question_topics or "watering" in question_topics or "general" in question_topics:
+        if not climate["is_fresh"]:
+            topic_lines.append(
+                "- Вопрос связан с температурой/влажностью, а climate.is_fresh=false: "
+                "сначала скажи, что данные климата могли устареть и их нужно подтвердить."
+            )
+
+    return "\n".join([
+        "Контекст свежести датчиков:",
+        *lines,
+        *topic_lines,
+        "- Если water stale и вопрос про pH/EC, запрещено начинать ответ с оценки текущего pH/EC; первая смысловая фраза должна быть о том, что water-показания устарели или не подтверждены.",
+        "- Если climate stale и вопрос про температуру воздуха/влажность, запрещено начинать ответ с оценки текущей температуры/влажности; сначала скажи, что climate-показания нужно подтвердить.",
+        "- Если вопрос пользователя касается затронутых метрик, начни ответ с того, что показания нужно подтвердить свежим замером.",
+        "- Не пиши, что pH, EC, температура воды, температура воздуха или влажность 'сейчас' в норме/падают/растут, если соответствующий sensor type stale.",
+        "- При stale-данных сначала советуй проверить датчик, MQTT/ESP32/симулятор и повторить измерение.",
+        "- Если новые данные уже пришли и соответствующий sensor type свежий, не считай старые stale-события актуальной проблемой.",
+    ])
 
 
 def detect_farm_question_topics(message: str) -> set[str]:
@@ -3071,12 +3256,19 @@ def build_device_events_fact_lines(
     return lines
 
 
-def build_farm_facts_context_for_prompt(message: str, tray_id: str = "tray_1", messages: list | None = None) -> str:
+def build_farm_facts_context_for_prompt(
+    message: str,
+    tray_id: str = "tray_1",
+    messages: list | None = None,
+    sensor_freshness: dict[str, dict[str, Any]] | None = None,
+) -> str:
     topics = detect_farm_question_topics_from_dialog(message, messages)
     if not topics:
         return ""
 
     latest_data = get_latest_data_snapshot()
+    water_is_fresh = is_sensor_type_fresh(sensor_freshness, "water")
+    climate_is_fresh = is_sensor_type_fresh(sensor_freshness, "climate")
     active_cycle = get_active_cycle_ai_context(tray_id)
     norms = active_cycle.get("norms") if isinstance(active_cycle, dict) and isinstance(active_cycle.get("norms"), dict) else {}
     anomaly_events = get_recent_anomaly_events(24)
@@ -3088,11 +3280,11 @@ def build_farm_facts_context_for_prompt(message: str, tray_id: str = "tray_1", m
         "- темы вопроса: " + ", ".join(sorted(topics)),
         (
             "- текущие показатели: "
-            f"air_temp={format_sensor_value(latest_data.get('Температура'), ' C')}; "
-            f"humidity={format_sensor_value(latest_data.get('Влажность'), '%')}; "
-            f"water_temp={format_sensor_value(latest_data.get('Темп. воды'), ' C')}; "
-            f"ph={format_sensor_value(latest_data.get('pH'), '')}; "
-            f"ec={format_sensor_value(latest_data.get('EC'), '')}"
+            f"air_temp={format_current_or_stale_value(latest_data.get('Температура'), ' C', climate_is_fresh)}; "
+            f"humidity={format_current_or_stale_value(latest_data.get('Влажность'), '%', climate_is_fresh)}; "
+            f"water_temp={format_current_or_stale_value(latest_data.get('Темп. воды'), ' C', water_is_fresh)}; "
+            f"ph={format_current_or_stale_value(latest_data.get('pH'), '', water_is_fresh)}; "
+            f"ec={format_current_or_stale_value(latest_data.get('EC'), '', water_is_fresh)}"
         ),
     ]
 
@@ -3124,7 +3316,7 @@ def build_farm_facts_context_for_prompt(message: str, tray_id: str = "tray_1", m
         lines.append("Контекст полива:")
         lines.extend(build_device_events_fact_lines(device_events, "pump", "насоса"))
         lines.extend([
-            f"- текущая влажность: {format_sensor_value(latest_data.get('Влажность'), '%')}",
+            f"- текущая влажность: {format_current_or_stale_value(latest_data.get('Влажность'), '%', climate_is_fresh)}",
             f"- норма влажности активной культуры: {format_norm_for_fact(norms, 'humidity')}",
             f"- аномалии low_humidity за 24 часа: {'есть' if low_humidity_events else 'нет'}",
         ])
@@ -3147,8 +3339,8 @@ def build_farm_facts_context_for_prompt(message: str, tray_id: str = "tray_1", m
         ]
         lines.extend([
             "Контекст питательного раствора:",
-            f"- текущий pH: {format_sensor_value(latest_data.get('pH'), '')}",
-            f"- текущий EC: {format_sensor_value(latest_data.get('EC'), '')}",
+            f"- текущий pH: {format_current_or_stale_value(latest_data.get('pH'), '', water_is_fresh)}",
+            f"- текущий EC: {format_current_or_stale_value(latest_data.get('EC'), '', water_is_fresh)}",
             f"- норма pH активной культуры: {format_norm_for_fact(norms, 'ph')}",
             f"- норма EC активной культуры: {format_norm_for_fact(norms, 'ec')}",
             f"- аномалии low_ph/high_ph/low_ec/high_ec за 24 часа: {'есть' if solution_anomalies else 'нет'}",
@@ -3161,8 +3353,8 @@ def build_farm_facts_context_for_prompt(message: str, tray_id: str = "tray_1", m
         ]
         lines.extend([
             "Контекст температуры:",
-            f"- текущая температура воздуха: {format_sensor_value(latest_data.get('Температура'), ' C')}",
-            f"- текущая температура воды: {format_sensor_value(latest_data.get('Темп. воды'), ' C')}",
+            f"- текущая температура воздуха: {format_current_or_stale_value(latest_data.get('Температура'), ' C', climate_is_fresh)}",
+            f"- текущая температура воды: {format_current_or_stale_value(latest_data.get('Темп. воды'), ' C', water_is_fresh)}",
             f"- норма температуры воздуха: {format_norm_for_fact(norms, 'air_temp')}",
             f"- норма температуры воды: {format_norm_for_fact(norms, 'water_temp')}",
         ])
@@ -3231,11 +3423,41 @@ def build_chat_prompt(
     message: str,
     history: list[dict[str, str]] | None = None,
     learning_context: str | None = None,
+    stale_sensor_context: str | None = None,
 ) -> str:
-    translated_data_string = format_latest_data_for_prompt()
-    farm_facts_context = build_farm_facts_context_for_prompt(message, "tray_1", messages=history)
+    sensor_freshness_for_prompt: dict[str, dict[str, Any]] = {}
+    try:
+        sensor_freshness_for_prompt = get_sensor_freshness_status_for_ai()
+    except Exception as exc:
+        print(f"[AI_STALE_CONTEXT] freshness status unavailable for prompt: {exc}")
+    translated_data_string = format_latest_data_for_prompt(sensor_freshness_for_prompt)
+
+    stale_metric_notes: list[str] = []
+    water_status = sensor_freshness_for_prompt.get("water") if isinstance(sensor_freshness_for_prompt, dict) else None
+    if isinstance(water_status, dict) and not water_status.get("is_fresh"):
+        stale_metric_notes.append("pH/EC/температура воды не подтверждены свежими water-данными")
+    climate_status = sensor_freshness_for_prompt.get("climate") if isinstance(sensor_freshness_for_prompt, dict) else None
+    if isinstance(climate_status, dict) and not climate_status.get("is_fresh"):
+        stale_metric_notes.append("температура воздуха/влажность не подтверждены свежими climate-данными")
+    if stale_metric_notes:
+        translated_data_string += "; stale: " + "; ".join(stale_metric_notes)
+
+    farm_facts_context = build_farm_facts_context_for_prompt(
+        message,
+        "tray_1",
+        messages=history,
+        sensor_freshness=sensor_freshness_for_prompt,
+    )
     crop_context = build_crop_context_for_prompt(message, messages=history, tray_id="tray_1")
-    prompt_parts = [
+    if stale_sensor_context:
+        translated_data_string += (
+            ". Внимание: часть показаний может быть устаревшей; смотри блок "
+            "'Контекст свежести датчиков' и не оценивай stale-метрики как текущие"
+        )
+    prompt_parts = []
+    if stale_sensor_context:
+        prompt_parts.append(stale_sensor_context)
+    prompt_parts.extend([
         f"Данные датчиков: {translated_data_string}",
         format_active_cycle_for_prompt("tray_1"),
         (
@@ -3244,7 +3466,7 @@ def build_chat_prompt(
             "- общие справки допустимы только по культурам, подходящим для компактной гидропоники;\n"
             "- крупные плодоносящие, корнеплодные и требующие опоры культуры не считать подходящими для этой установки без отдельной АгроТехКарты."
         ),
-    ]
+    ])
     if farm_facts_context:
         prompt_parts.append(farm_facts_context)
     if crop_context:
@@ -3894,6 +4116,13 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
     ]
     analysis_steps.append("Добавляю актуальные показатели фермы в контекст")
     active_cycle = await asyncio.to_thread(get_active_cycle_ai_context, "tray_1")
+    analysis_steps.append("Проверяю свежесть данных датчиков")
+    question_topics = detect_farm_question_topics_from_dialog(user_prompt, history)
+    stale_sensor_context = await asyncio.to_thread(
+        build_stale_sensor_context_for_ai,
+        24,
+        question_topics,
+    )
     learning_context = ""
     if active_cycle:
         analysis_steps.append("Добавляю активный цикл выращивания в контекст ИИ")
@@ -3913,7 +4142,12 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
         if unsupported_crop_context:
             analysis_steps.append("Проверяю ограничения по неподходящим культурам")
 
-    enriched_prompt = build_chat_prompt(user_prompt, history, learning_context=learning_context)
+    enriched_prompt = build_chat_prompt(
+        user_prompt,
+        history,
+        learning_context=learning_context,
+        stale_sensor_context=stale_sensor_context,
+    )
     if not active_cycle:
         if crop_rules_context:
             enriched_prompt = f"{crop_rules_context}\n\n{enriched_prompt}"
