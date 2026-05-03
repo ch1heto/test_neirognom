@@ -226,19 +226,6 @@ function createInitialFinishCycleForm() {
   }
 }
 
-const FALLBACK_CROPS = [
-  { slug: 'basil', name_ru: 'Базилик', crop_type: 'herb', version_label: 'v1.0' },
-  { slug: 'lettuce', name_ru: 'Салат', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'arugula', name_ru: 'Руккола', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'spinach', name_ru: 'Шпинат', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'cilantro', name_ru: 'Кинза', crop_type: 'herb', version_label: 'v1.0' },
-  { slug: 'mangold', name_ru: 'Мангольд', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'dill', name_ru: 'Укроп', crop_type: 'herb', version_label: 'v1.0' },
-  { slug: 'mint', name_ru: 'Мята', crop_type: 'herb', version_label: 'v1.0' },
-  { slug: 'pak_choi', name_ru: 'Пак-чой', crop_type: 'leafy', version_label: 'v1.0' },
-  { slug: 'parsley', name_ru: 'Петрушка', crop_type: 'herb', version_label: 'v1.0' },
-]
-
 const CROP_VISUALS = {
   basil: { label: 'Базилик', image: basilImage, gradient: 'from-emerald-300/24 via-green-500/14 to-emerald-950/20' },
   lettuce: { label: 'Салат', image: lettuceImage, gradient: 'from-lime-300/22 via-green-500/12 to-slate-900/20' },
@@ -348,6 +335,11 @@ async function requestJson(path, options = {}) {
 function getCropLabel(crop) {
   if (!crop) return 'Культура'
   return crop.name_ru || crop.crop_name_ru || CROP_VISUALS[crop.slug]?.label || crop.slug
+}
+
+function formatTrayName(trayId) {
+  if (!trayId || trayId === DEFAULT_TRAY_ID) return 'Основной модуль'
+  return `Модуль ${String(trayId).replace(/^tray_/, '')}`
 }
 
 function normalizeCrop(crop) {
@@ -535,7 +527,7 @@ function FinishCycleModal({
             ['Культура', currentCycle?.crop_name_ru || 'Культура'],
             ['АгроТехКарта', currentCycle?.version_label || 'v1.0'],
             ['День цикла', currentCycle?.day_number || 1],
-            ['Лоток', currentCycle?.tray_id || DEFAULT_TRAY_ID],
+            ['Лоток', formatTrayName(currentCycle?.tray_id || DEFAULT_TRAY_ID)],
           ].map(([label, value]) => (
             <div key={label} className="min-w-0">
               <div className="text-xs uppercase tracking-[0.12em] text-white/38">{label}</div>
@@ -728,8 +720,10 @@ export default function App() {
   const [currentDate, setCurrentDate] = useState(formatDate())
   const [activeLedStage, setActiveLedStage] = useState(5)
   const [isLedPlaying, setIsLedPlaying] = useState(false)
-  const [crops, setCrops] = useState(FALLBACK_CROPS)
-  const [selectedCropSlug, setSelectedCropSlug] = useState('basil')
+  const [crops, setCrops] = useState([])
+  const [selectedCropSlug, setSelectedCropSlug] = useState('')
+  const [cropsLoading, setCropsLoading] = useState(true)
+  const [cropsError, setCropsError] = useState('')
   const [currentCycle, setCurrentCycle] = useState(null)
   const [isCycleLoading, setIsCycleLoading] = useState(false)
   const [cycleError, setCycleError] = useState('')
@@ -825,35 +819,53 @@ export default function App() {
     return data
   }
 
+  const loadCrops = async () => {
+    setCropsLoading(true)
+    setCropsError('')
+    try {
+      const cropsData = await requestJson('/api/crops')
+      const normalizedCrops = Array.isArray(cropsData)
+        ? cropsData.map(normalizeCrop).filter((crop) => crop.slug)
+        : []
+
+      setCrops(normalizedCrops)
+      setSelectedCropSlug((prev) => (
+        normalizedCrops.some((crop) => crop.slug === prev)
+          ? prev
+          : normalizedCrops[0]?.slug || ''
+      ))
+      return normalizedCrops
+    } catch (error) {
+      console.error('Failed to load crops', error)
+      setCrops([])
+      setSelectedCropSlug('')
+      setCropsError('Не удалось загрузить культуры из базы данных')
+      return null
+    } finally {
+      setCropsLoading(false)
+    }
+  }
+
   useEffect(() => {
     let isMounted = true
 
     const loadCycleData = async () => {
       setIsCycleLoading(true)
       try {
-        const [cropsData, cycleData] = await Promise.all([
-          requestJson('/api/crops'),
+        const [, cycleData] = await Promise.all([
+          loadCrops(),
           requestJson(`/api/cycles/current?tray_id=${DEFAULT_TRAY_ID}`),
         ])
 
         if (!isMounted) return
 
-        const normalizedCrops = Array.isArray(cropsData) && cropsData.length
-          ? cropsData.map(normalizeCrop)
-          : FALLBACK_CROPS
-        setCrops(normalizedCrops)
-        setSelectedCropSlug((prev) => (
-          normalizedCrops.some((crop) => crop.slug === prev) ? prev : normalizedCrops[0]?.slug || 'basil'
-        ))
         setCurrentCycle(cycleData || null)
         setCycleError('')
       } catch (error) {
         console.error('Failed to load cycle data', error)
         if (!isMounted) return
 
-        setCrops(FALLBACK_CROPS)
-        setSelectedCropSlug((prev) => prev || FALLBACK_CROPS[0].slug)
-        setCycleError('Не удалось загрузить данные цикла. Показаны доступные культуры по умолчанию.')
+        setCycleError('Не удалось загрузить данные активного цикла. Проверьте backend.')
       } finally {
         if (isMounted) setIsCycleLoading(false)
       }
@@ -944,7 +956,7 @@ export default function App() {
   )
 
   const selectedCrop = useMemo(
-    () => crops.find((crop) => crop.slug === selectedCropSlug) || crops[0] || FALLBACK_CROPS[0],
+    () => crops.find((crop) => crop.slug === selectedCropSlug) || crops[0] || null,
     [crops, selectedCropSlug],
   )
 
@@ -1020,7 +1032,19 @@ export default function App() {
   }
 
   const handleStartCycle = async () => {
-    if (!selectedCropSlug || currentCycle) return
+    if (currentCycle) return
+    if (cropsLoading) {
+      setCycleError('Дождитесь загрузки культур из базы данных.')
+      return
+    }
+    if (cropsError) {
+      setCycleError('Не удалось загрузить культуры из базы данных. Повторите загрузку перед стартом цикла.')
+      return
+    }
+    if (!selectedCropSlug || !selectedCrop) {
+      setCycleError('Выберите культуру из базы данных перед стартом цикла.')
+      return
+    }
 
     setIsCycleLoading(true)
     setCycleError('')
@@ -1205,6 +1229,7 @@ export default function App() {
     const activeVersion = currentCycle?.version_label || selectedCrop?.version_label || 'v1.0'
     const isActive = Boolean(currentCycle)
     const previewVisual = getCropVisual(currentCycle?.crop_slug || selectedCrop?.slug)
+    const canStartCycle = !isCycleLoading && !cropsLoading && !cropsError && Boolean(selectedCropSlug) && Boolean(selectedCrop)
 
     return (
       <GlassCard className="flex min-h-0 max-w-full flex-col rounded-[28px] min-[1700px]:h-full min-[1700px]:overflow-hidden">
@@ -1230,11 +1255,35 @@ export default function App() {
           {!isActive ? (
             <div className="min-w-0 max-w-full rounded-[26px] border border-white/8 bg-white/[0.035] p-4">
               <div className="mb-4 text-lg font-semibold text-white">Выбор культуры</div>
-              <div className="custom-scrollbar max-h-[260px] overflow-y-auto overflow-x-hidden pr-2 sm:max-h-[300px] min-[1700px]:max-h-[300px]">
-                <div className="grid grid-cols-2 gap-3 max-[360px]:grid-cols-1">
-                  {crops.map(renderCropCard)}
+              {cropsLoading ? (
+                <div className="rounded-[20px] border border-white/10 bg-white/[0.035] px-4 py-5 text-sm text-white/68">
+                  Загрузка культур...
                 </div>
-              </div>
+              ) : cropsError ? (
+                <div className="rounded-[20px] border border-amber-300/20 bg-amber-300/10 px-4 py-4 text-sm text-amber-100">
+                  <div>{cropsError}</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCycleError('')
+                      void loadCrops()
+                    }}
+                    className="mt-3 rounded-[14px] border border-amber-200/25 bg-amber-200/12 px-4 py-2 font-semibold text-amber-50 transition hover:bg-amber-200/18"
+                  >
+                    Повторить загрузку
+                  </button>
+                </div>
+              ) : crops.length === 0 ? (
+                <div className="rounded-[20px] border border-white/10 bg-white/[0.035] px-4 py-5 text-sm text-white/68">
+                  В базе пока нет доступных культур
+                </div>
+              ) : (
+                <div className="custom-scrollbar max-h-[260px] overflow-y-auto overflow-x-hidden pr-2 sm:max-h-[300px] min-[1700px]:max-h-[300px]">
+                  <div className="grid grid-cols-2 gap-3 max-[360px]:grid-cols-1">
+                    {crops.map(renderCropCard)}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="min-w-0 max-w-full rounded-[26px] border border-emerald-300/16 bg-emerald-400/[0.045] p-5">
@@ -1299,7 +1348,7 @@ export default function App() {
                     {[
                       ['Агротехкарта', activeVersion],
                       ['День цикла', currentCycle?.day_number || 1],
-                      ['Лоток', currentCycle?.tray_id || DEFAULT_TRAY_ID],
+                      ['Лоток', formatTrayName(currentCycle?.tray_id || DEFAULT_TRAY_ID)],
                     ].map(([label, value]) => (
                       <div key={label} className="flex items-center justify-between gap-4 py-3 text-sm">
                         <span className="text-white/54">{label}</span>
@@ -1316,7 +1365,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleStartCycle}
-                      disabled={isCycleLoading}
+                      disabled={!canStartCycle}
                       className="inline-flex min-h-[56px] items-center justify-center gap-3 rounded-[20px] border border-violet-200/30 bg-gradient-to-r from-violet-500 to-fuchsia-600 px-5 py-3 font-semibold text-white shadow-[0_0_28px_rgba(168,85,247,0.28)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-55"
                     >
                       <PlayIcon className="h-4 w-4" />
@@ -1326,8 +1375,9 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setCycleError('')
-                        setSelectedCropSlug(crops[0]?.slug || 'basil')
+                        setSelectedCropSlug(crops[0]?.slug || '')
                       }}
+                      disabled={crops.length === 0}
                       className="min-h-[56px] rounded-[20px] border border-white/10 bg-white/[0.035] px-5 py-3 font-semibold text-white/72 transition hover:bg-white/[0.065]"
                     >
                       Отмена
