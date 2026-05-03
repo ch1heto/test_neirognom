@@ -111,6 +111,9 @@ VALID_PROBLEM_PHASES = {
 }
 VALID_FOLLOWED_AI_ADVICE = {"yes", "partial", "no", "no_advice", "unknown"}
 VALID_AI_ADVICE_HELPFULNESS = {"yes", "partial", "no", "worse", "unknown"}
+RECOMMENDATION_EFFECT_INTERPRETATION_NOTE = (
+    "Изменение метрики наблюдалось после рекомендации, но причинно-следственная связь не доказана."
+)
 
 
 class CropNotFoundError(ValueError):
@@ -2540,6 +2543,11 @@ def build_cycle_ai_recommendations_summary(
             "total": effects_total,
             "groups": effects_groups,
             "recent_effects": recent_effects,
+            "interpretation_policy": (
+                "Recommendation effects are temporal observations only. "
+                "Do not state that a recommendation caused a metric change; causality is not proven."
+            ),
+            "causality": "not_proven",
         },
     }
 
@@ -4502,6 +4510,26 @@ def ensure_recommendation_effects_schema(cursor) -> None:
     cursor.execute("UPDATE recommendation_effects SET effect_status = 'inconclusive' WHERE effect_status IS NULL")
     cursor.execute("UPDATE recommendation_effects SET confidence = 0 WHERE confidence IS NULL")
     cursor.execute("UPDATE recommendation_effects SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute(
+        """
+        UPDATE recommendation_effects
+        SET delta_snapshot = jsonb_build_object(
+            'interpretation_note', %s::text,
+            'causality', 'not_proven',
+            'causality_not_proven', true,
+            'operator_action_confirmed', NULL,
+            'operator_action_unknown', true,
+            'evidence_level', 'observed_only',
+            'observed_after_recommendation', false,
+            'temporal_association', false
+        ) || delta_snapshot
+        WHERE NOT (delta_snapshot ? 'causality')
+           OR NOT (delta_snapshot ? 'causality_not_proven')
+           OR NOT (delta_snapshot ? 'interpretation_note')
+           OR NOT (delta_snapshot ? 'evidence_level')
+        """,
+        (RECOMMENDATION_EFFECT_INTERPRETATION_NOTE,),
+    )
     cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN tray_id SET NOT NULL")
     cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN window_minutes SET NOT NULL")
     cursor.execute("ALTER TABLE recommendation_effects ALTER COLUMN before_snapshot SET DEFAULT '{}'::jsonb")
@@ -5838,7 +5866,54 @@ def row_to_ai_recommendation(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ensure_recommendation_effect_caution_payload(delta_snapshot: Any) -> dict[str, Any]:
+    payload = dict(delta_snapshot) if isinstance(delta_snapshot, dict) else {}
+    operator_action_confirmed = payload.get("operator_action_confirmed")
+    if operator_action_confirmed not in {True, False, None}:
+        operator_action_confirmed = None
+
+    missing_metrics = payload.get("missing_or_stale_metrics")
+    has_missing_metrics = isinstance(missing_metrics, list) and len(missing_metrics) > 0
+    metric_delta_keys = [
+        key
+        for key, value in payload.items()
+        if key not in {
+            "interpretation_note",
+            "causality",
+            "causality_not_proven",
+            "operator_action_confirmed",
+            "operator_action_unknown",
+            "evidence_level",
+            "observed_after_recommendation",
+            "temporal_association",
+            "metric_statuses",
+            "missing_or_stale_metrics",
+        }
+        and isinstance(value, (int, float))
+    ]
+    has_numeric_deltas = bool(metric_delta_keys)
+
+    evidence_level = payload.get("evidence_level")
+    if evidence_level not in {"observed_only", "operator_reported_followed", "insufficient"}:
+        evidence_level = "insufficient" if has_missing_metrics or not has_numeric_deltas else "observed_only"
+
+    payload.update(
+        {
+            "interpretation_note": payload.get("interpretation_note") or RECOMMENDATION_EFFECT_INTERPRETATION_NOTE,
+            "causality": payload.get("causality") or "not_proven",
+            "causality_not_proven": payload.get("causality_not_proven", True),
+            "operator_action_confirmed": operator_action_confirmed,
+            "operator_action_unknown": operator_action_confirmed is None,
+            "evidence_level": evidence_level,
+            "observed_after_recommendation": payload.get("observed_after_recommendation", False),
+            "temporal_association": payload.get("temporal_association", False),
+        }
+    )
+    return payload
+
+
 def row_to_recommendation_effect(row: dict[str, Any]) -> dict[str, Any]:
+    delta_snapshot = ensure_recommendation_effect_caution_payload(row["delta_snapshot"] or {})
     return {
         "id": row["id"],
         "recommendation_id": row["recommendation_id"],
@@ -5847,10 +5922,19 @@ def row_to_recommendation_effect(row: dict[str, Any]) -> dict[str, Any]:
         "window_minutes": row["window_minutes"],
         "before_snapshot": row["before_snapshot"] or {},
         "after_snapshot": row["after_snapshot"] or {},
-        "delta_snapshot": row["delta_snapshot"] or {},
+        "delta_snapshot": delta_snapshot,
+        "payload": delta_snapshot,
         "effect_status": row["effect_status"],
         "effect_summary": row["effect_summary"],
         "confidence": row["confidence"],
+        "interpretation_note": delta_snapshot["interpretation_note"],
+        "causality": delta_snapshot["causality"],
+        "causality_not_proven": delta_snapshot["causality_not_proven"],
+        "operator_action_confirmed": delta_snapshot["operator_action_confirmed"],
+        "operator_action_unknown": delta_snapshot["operator_action_unknown"],
+        "evidence_level": delta_snapshot["evidence_level"],
+        "observed_after_recommendation": delta_snapshot["observed_after_recommendation"],
+        "temporal_association": delta_snapshot["temporal_association"],
         "created_at": format_timestamp(row["created_at"]),
     }
 
@@ -5975,6 +6059,7 @@ def save_recommendation_effect(
     confidence: float,
 ) -> dict[str, Any] | None:
     normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    cautious_delta_snapshot = ensure_recommendation_effect_caution_payload(delta_snapshot)
     with get_connection() as connection:
         with connection.cursor() as cursor:
             ensure_ai_recommendations_schema(cursor)
@@ -5988,7 +6073,9 @@ def save_recommendation_effect(
                     effect_status, effect_summary, confidence, created_at
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (recommendation_id, window_minutes) DO NOTHING
+                ON CONFLICT (recommendation_id, window_minutes)
+                DO UPDATE SET
+                    delta_snapshot = recommendation_effects.delta_snapshot || EXCLUDED.delta_snapshot
                 RETURNING *
                 """,
                 (
@@ -5998,7 +6085,7 @@ def save_recommendation_effect(
                     int(window_minutes),
                     Jsonb(before_snapshot or {}),
                     Jsonb(after_snapshot or {}),
-                    Jsonb(delta_snapshot or {}),
+                    Jsonb(cautious_delta_snapshot),
                     effect_status,
                     effect_summary,
                     float(confidence),

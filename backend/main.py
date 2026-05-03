@@ -130,6 +130,9 @@ RECOMMENDATION_EFFECT_WINDOWS_MINUTES = parse_int_list_env(
     [30, 60, 120],
 )
 RECOMMENDATION_EFFECT_INTERVAL_SECONDS = int(os.getenv("RECOMMENDATION_EFFECT_INTERVAL_SECONDS", "300"))
+RECOMMENDATION_EFFECT_INTERPRETATION_NOTE = (
+    "Изменение метрики наблюдалось после рекомендации, но причинно-следственная связь не доказана."
+)
 WATCHDOG_DEFAULT_TRAY_ID = "tray_1"
 WATCHDOG_DEFAULT_NORM_RANGES = {
     "air_temp": (18.0, 28.0),
@@ -285,7 +288,10 @@ CHAT_SYSTEM_PROMPT = (
     "При советах по pH, EC, поливу и температуре учитывай прошлые проблемы и внесённые улучшения, но текущие датчики и активная АгроТехКарта важнее прошлого опыта. "
     "Не рассказывай пользователю proposal_id, revision_id, source_revision_id и внутреннюю историю версий, если он прямо не спрашивает. "
     "Если пользователь просто здоровается или спрашивает не про ферму, не пересказывай прошлый опыт.\n"
-    "13. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
+    "13. Если backend передал recommendation effects или прошлый опыт рекомендаций, не делай жёстких причинно-следственных выводов. "
+    "Говори 'раньше после такой рекомендации наблюдалось...' или 'по прошлым данным эффект был неочевиден', а не 'совет помог' или 'совет улучшил показатель'. "
+    "Если действие оператора не подтверждено, прямо учитывай, что нельзя подтвердить выполнение совета.\n"
+    "14. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
     "Не придумывай количество включений устройств, pH, EC, аномалии, активную культуру или историю метрик. "
     "Если пользователь задаёт follow-up вопрос, используй историю диалога и вызывай подходящий инструмент. "
     "Если пользователь спрашивает про несколько устройств, запроси данные по каждому устройству. "
@@ -294,8 +300,8 @@ CHAT_SYSTEM_PROMPT = (
     "Не советуй добавлять щёлочь, кислоту или менять раствор без текущего значения pH. "
     "Для вопросов про конкретную культуру вызывай get_crop_card_tool. "
     "Для вопросов про текущее состояние фермы используй текущие метрики, активный цикл и, при необходимости, аномалии.\n"
-    "14. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
-    "15. Для конкретной культуры сначала используй get_crop_card_tool. "
+    "15. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
+    "16. Для конкретной культуры сначала используй get_crop_card_tool. "
     "Если tool вернул suitability_status='db_supported', отвечай по АгроТехКарте. "
     "Если suitability_status='compatible_not_in_db', можно дать только общую справку и обязательно сказать, что точной АгроТехКарты в БД нет. "
     "Если suitability_status='advanced_or_unsuitable', не рассказывай подробную агротехнику для этой установки; объясни, что культура может требовать другой гидропонной системы, большего объёма, опоры, опыления или другого формата выращивания. "
@@ -2524,6 +2530,12 @@ def normalize_cycle_ai_analysis_payload(payload: dict[str, Any]) -> dict[str, An
         raw_metric = item.get("metric_name")
         metric_name = str(raw_metric).strip().lower() if raw_metric is not None else None
         usefulness = str(item.get("usefulness") or "inconclusive").strip().lower()
+        operator_action_confirmed = item.get("operator_action_confirmed")
+        if operator_action_confirmed not in {True, False, None}:
+            operator_action_confirmed = None
+        evidence_level = str(item.get("evidence_level") or "observed_only").strip().lower()
+        if evidence_level not in {"observed_only", "operator_reported_followed", "insufficient"}:
+            evidence_level = "observed_only"
         recommendation_review.append(
             {
                 "metric_name": metric_name if metric_name in CYCLE_AI_ANALYSIS_METRICS else None,
@@ -2531,6 +2543,10 @@ def normalize_cycle_ai_analysis_payload(payload: dict[str, Any]) -> dict[str, An
                 "observed_effect": str(item.get("observed_effect") or "данных недостаточно").strip(),
                 "usefulness": usefulness if usefulness in CYCLE_AI_ANALYSIS_USEFULNESS else "inconclusive",
                 "comment": str(item.get("comment") or "").strip(),
+                "causality": "not_proven",
+                "operator_action_confirmed": operator_action_confirmed,
+                "evidence_level": evidence_level,
+                "interpretation_note": RECOMMENDATION_EFFECT_INTERPRETATION_NOTE,
             }
         )
 
@@ -2568,12 +2584,18 @@ def build_cycle_ai_analysis_prompt(report_payload: dict[str, Any]) -> str:
         "Нужно только определить проблемы, полезность сохранённых рекомендаций и потенциальные улучшения.\n"
         "Если данных недостаточно, прямо пиши 'данных недостаточно'.\n"
         "Не утверждай жёсткую причинно-следственную связь. Пиши 'после рекомендации наблюдалось...', а не 'рекомендация вызвала...'.\n"
+        "Для recommendation_review: не утверждай, что рекомендация вызвала изменение метрики. "
+        "Если есть совпадение по времени, называй это временной связью, а не доказанной причиной. "
+        "Если нет подтверждения действий оператора, пиши 'нельзя подтвердить, что совет был выполнен'. "
+        "Даже если usefulness='useful' или 'partially_useful', не формулируй 'точно сработала'. "
+        "Если в recommendation_effects указано causality='not_proven' или causality_not_proven=true, сохрани эту осторожность. "
+        "Не делай выводы только по одному замеру; при недостатке свежих данных ставь usefulness='inconclusive'.\n"
         "Верни валидный JSON без markdown и без текста вокруг.\n\n"
         "Строгая схема ответа:\n"
         "{\n"
         '  "summary": "...",\n'
         '  "main_findings": [{"area": "solution/light/watering/climate/sensor/general", "problem": "...", "evidence": ["..."], "confidence": "low/medium/high"}],\n'
-        '  "recommendation_review": [{"metric_name": "ph/ec/humidity/air_temp/water_temp/null", "recommendation_summary": "...", "observed_effect": "...", "usefulness": "useful/partially_useful/not_useful/harmful/inconclusive", "comment": "..."}],\n'
+        '  "recommendation_review": [{"metric_name": "ph/ec/humidity/air_temp/water_temp/null", "recommendation_summary": "...", "observed_effect": "После рекомендации наблюдалось..., но причинность не доказана", "usefulness": "useful/partially_useful/not_useful/harmful/inconclusive", "comment": "Нельзя подтвердить, что совет был выполнен, если нет данных оператора", "causality": "not_proven", "operator_action_confirmed": true/false/null, "evidence_level": "observed_only/operator_reported_followed/insufficient"}],\n'
         '  "potential_improvements": [{"target_section": "...", "suggested_change": "...", "reason": "...", "priority": "low/medium/high"}],\n'
         '  "should_propose_new_revision": false,\n'
         '  "revision_reason": "...",\n'
@@ -2808,6 +2830,8 @@ def build_agrotech_revision_proposal_prompt(
         "Это только proposal: НЕ создавай новую ревизию в БД, НЕ меняй active revision, НЕ пиши оператору кнопки принятия.\n"
         "Используй только source_revision, cycle_analysis_report.report_payload и cycle_ai_analysis ниже.\n"
         "Не придумывай факты, которых нет в отчёте или AI-анализе.\n"
+        "Если используешь recommendation_review или recommendation_effects, не пиши, что совет вызвал улучшение. "
+        "Формулируй осторожно: 'после рекомендации наблюдалось...', 'эффект нельзя подтвердить', 'причинность не доказана'.\n"
         "Не переписывай карту радикально. Улучшай в первую очередь инструкции, порядок действий и уточнения.\n"
         "Числовые нормы pH/EC/температуры/влажности меняй только при очень сильном обосновании в анализе.\n"
         "Если данных недостаточно, proposed_content должен быть близок к исходному, auto_apply_eligible=false.\n"
@@ -3005,13 +3029,36 @@ async def extract_recommendations_from_reply(
 def current_sensor_snapshot_for_recommendation() -> dict[str, Any]:
     records = get_recent_telemetry(30)
     snapshot = latest_metric_snapshot(records)
-    return {
+    raw_metrics = {
         "tray_id": snapshot.get("tray_id"),
         "air_temp": snapshot.get("air_temp"),
         "humidity": snapshot.get("humidity"),
         "water_temp": snapshot.get("water_temp"),
         "ph": snapshot.get("ph"),
         "ec": snapshot.get("ec"),
+    }
+    freshness = get_sensor_freshness_status_for_ai()
+    metrics_payload = metrics_for_ai_with_freshness(
+        {
+            "temperature": raw_metrics["air_temp"],
+            "humidity": raw_metrics["humidity"],
+            "water_temp": raw_metrics["water_temp"],
+            "ph": raw_metrics["ph"],
+            "ec": raw_metrics["ec"],
+        },
+        freshness,
+    )
+    current_metrics = metrics_payload["current"]
+    return {
+        "tray_id": raw_metrics["tray_id"],
+        "air_temp": current_metrics.get("temperature"),
+        "humidity": current_metrics.get("humidity"),
+        "water_temp": current_metrics.get("water_temp"),
+        "ph": current_metrics.get("ph"),
+        "ec": current_metrics.get("ec"),
+        "sensor_freshness": freshness,
+        "stale_last_known": metrics_payload["stale_last_known"],
+        "freshness_warning": metrics_payload["freshness_warning"],
     }
 
 
@@ -3125,6 +3172,46 @@ def combine_metric_effect_status(statuses: list[str]) -> str:
     return "inconclusive"
 
 
+def infer_operator_action_confirmation(cycle_result: dict[str, Any] | None) -> tuple[bool | None, str]:
+    if not isinstance(cycle_result, dict):
+        return None, "observed_only"
+    followed_ai_advice = str(cycle_result.get("followed_ai_advice") or "unknown").strip().lower()
+    if followed_ai_advice in {"yes", "partial"}:
+        return True, "operator_reported_followed"
+    if followed_ai_advice in {"no", "no_advice"}:
+        return False, "observed_only"
+    return None, "observed_only"
+
+
+def build_recommendation_effect_interpretation_payload(
+    *,
+    effect_status: str,
+    operator_action_confirmed: bool | None,
+    evidence_level: str,
+    metric_statuses: dict[str, str],
+    missing_metrics: list[str],
+) -> dict[str, Any]:
+    if effect_status == "inconclusive" or missing_metrics:
+        normalized_evidence_level = "insufficient"
+    elif evidence_level == "operator_reported_followed":
+        normalized_evidence_level = "operator_reported_followed"
+    else:
+        normalized_evidence_level = "observed_only"
+
+    return {
+        "interpretation_note": RECOMMENDATION_EFFECT_INTERPRETATION_NOTE,
+        "causality": "not_proven",
+        "causality_not_proven": True,
+        "operator_action_confirmed": operator_action_confirmed,
+        "operator_action_unknown": operator_action_confirmed is None,
+        "evidence_level": normalized_evidence_level,
+        "observed_after_recommendation": effect_status != "inconclusive",
+        "temporal_association": effect_status != "inconclusive",
+        "metric_statuses": metric_statuses,
+        "missing_or_stale_metrics": missing_metrics,
+    }
+
+
 def build_effect_summary(
     recommendation: dict[str, Any],
     metrics: list[str],
@@ -3146,7 +3233,10 @@ def build_effect_summary(
 
     window = recommendation.get("window_minutes")
     if not parts:
-        return f"After {window} minutes there was not enough telemetry to compare the recommendation effect."
+        return (
+            f"After {window} minutes there was not enough fresh telemetry to compare metric changes "
+            "after the recommendation. Causality is not proven."
+        )
 
     status_text = {
         "improved": "moved closer to the active norm",
@@ -3154,7 +3244,10 @@ def build_effect_summary(
         "worsened": "moved farther from the active norm",
         "inconclusive": "does not allow a confident conclusion",
     }.get(status, "does not allow a confident conclusion")
-    return f"After {window} minutes the metric changed: {', '.join(parts)}. This {status_text}."
+    return (
+        f"After {window} minutes, observed metric values changed: {', '.join(parts)}. "
+        f"The observation {status_text}. This is a temporal association only; causality is not proven."
+    )
 
 
 async def evaluate_recommendation_effect(recommendation: dict[str, Any]) -> dict[str, Any] | None:
@@ -3176,17 +3269,27 @@ async def evaluate_recommendation_effect(recommendation: dict[str, Any]) -> dict
     )
 
     delta_snapshot: dict[str, Any] = {}
+    metric_statuses: dict[str, str] = {}
+    missing_metrics: list[str] = []
     statuses: list[str] = []
     confidences: list[float] = []
+    observed_at = after_snapshot.get("observed_at") if isinstance(after_snapshot.get("observed_at"), dict) else {}
     for metric in metrics:
-        status, delta, confidence = classify_metric_effect(
-            metric,
-            before_snapshot.get(metric),
-            after_snapshot.get(metric),
-            norm_snapshot,
-        )
+        before_value = before_snapshot.get(metric)
+        after_value = after_snapshot.get(metric)
+        if not isinstance(before_value, (int, float)) or not isinstance(after_value, (int, float)) or metric not in observed_at:
+            status, delta, confidence = "inconclusive", None, 0.2
+            missing_metrics.append(metric)
+        else:
+            status, delta, confidence = classify_metric_effect(
+                metric,
+                before_value,
+                after_value,
+                norm_snapshot,
+            )
         statuses.append(status)
         confidences.append(confidence)
+        metric_statuses[metric] = status
         delta_snapshot[metric] = delta
 
     effect_status = combine_metric_effect_status(statuses)
@@ -3200,6 +3303,17 @@ async def evaluate_recommendation_effect(recommendation: dict[str, Any]) -> dict
         after_snapshot,
         delta_snapshot,
         effect_status,
+    )
+    cycle_result = await asyncio.to_thread(get_cycle_result, int(recommendation["cycle_id"]))
+    operator_action_confirmed, evidence_level = infer_operator_action_confirmation(cycle_result)
+    delta_snapshot.update(
+        build_recommendation_effect_interpretation_payload(
+            effect_status=effect_status,
+            operator_action_confirmed=operator_action_confirmed,
+            evidence_level=evidence_level,
+            metric_statuses=metric_statuses,
+            missing_metrics=missing_metrics,
+        )
     )
 
     return await asyncio.to_thread(
