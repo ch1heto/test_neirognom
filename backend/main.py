@@ -11,7 +11,7 @@ from typing import Any, Literal
 import httpx
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -2970,6 +2970,166 @@ async def run_agrotech_revision_proposal(cycle_id: int, force: bool = False) -> 
         raise HTTPException(status_code=502, detail={"error": str(exc), "proposal": failed}) from exc
 
 
+def learning_step(status: str, item: dict[str, Any] | None = None, error: str | None = None, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": status,
+        "id": item.get("id") if isinstance(item, dict) else None,
+        "error": error,
+    }
+    payload.update(extra)
+    return payload
+
+
+def auto_apply_step(status: str, result: dict[str, Any] | None = None, error: str | None = None) -> dict[str, Any]:
+    created_revision = result.get("created_revision") if isinstance(result, dict) else None
+    existing_revision = result.get("existing_revision") if isinstance(result, dict) else None
+    proposal = result.get("proposal") if isinstance(result, dict) else None
+    revision = created_revision if isinstance(created_revision, dict) else existing_revision
+    return {
+        "status": status,
+        "revision_id": revision.get("id") if isinstance(revision, dict) else (
+            proposal.get("applied_revision_id") if isinstance(proposal, dict) else None
+        ),
+        "proposal_id": proposal.get("id") if isinstance(proposal, dict) else None,
+        "reason": result.get("reason") if isinstance(result, dict) else None,
+        "error": error,
+    }
+
+
+def finalize_learning_pipeline_status(steps: dict[str, dict[str, Any]]) -> str:
+    if steps["analysis_report"]["status"] == "failed":
+        return "failed"
+    if steps["ai_analysis"]["status"] == "failed":
+        return "partial"
+    if steps["revision_proposal"]["status"] == "failed":
+        return "partial"
+    if steps["auto_apply"]["status"] in {"failed", "deferred"}:
+        return "partial"
+    return "completed"
+
+
+async def run_cycle_learning_pipeline(
+    cycle_id: int,
+    auto_apply: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    steps: dict[str, dict[str, Any]] = {
+        "analysis_report": learning_step("pending"),
+        "ai_analysis": learning_step("pending"),
+        "revision_proposal": learning_step("pending"),
+        "auto_apply": auto_apply_step("pending"),
+    }
+
+    try:
+        cycle = await asyncio.to_thread(get_cycle_with_result, cycle_id)
+        if cycle.get("status") != "finished" or not cycle.get("finished_at"):
+            reason = f"Growing cycle '{cycle_id}' is not finished; learning pipeline skipped."
+            print(f"[LEARNING PIPELINE] cycle {cycle_id}: failed - {reason}")
+            for step_name in steps:
+                steps[step_name]["status"] = "skipped"
+                steps[step_name]["error"] = reason
+            return {"cycle_id": cycle_id, "status": "failed", "steps": steps}
+    except Exception as exc:
+        reason = str(exc)
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: failed - {reason}")
+        for step_name in steps:
+            steps[step_name]["status"] = "skipped"
+            steps[step_name]["error"] = reason
+        return {"cycle_id": cycle_id, "status": "failed", "steps": steps}
+
+    try:
+        report = await asyncio.to_thread(get_cycle_analysis_report, cycle_id)
+        if report is None:
+            built_report = await asyncio.to_thread(build_cycle_analysis_report, cycle_id)
+            report = await asyncio.to_thread(
+                save_cycle_analysis_report,
+                cycle_id,
+                built_report["report_payload"],
+                built_report["summary_text"],
+            )
+            steps["analysis_report"] = learning_step("completed", report)
+        else:
+            steps["analysis_report"] = learning_step("existing", report)
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: analysis_report completed")
+    except Exception as exc:
+        steps["analysis_report"] = learning_step("failed", error=str(exc))
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: analysis_report failed - {exc}")
+        return {"cycle_id": cycle_id, "status": "failed", "steps": steps}
+
+    try:
+        analysis = await asyncio.to_thread(get_cycle_ai_analysis, cycle_id)
+        if analysis is not None and analysis.get("status") == "completed":
+            steps["ai_analysis"] = learning_step("existing", analysis)
+        else:
+            analysis = await run_cycle_ai_analysis(cycle_id)
+            steps["ai_analysis"] = learning_step("completed", analysis)
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: ai_analysis completed")
+    except Exception as exc:
+        steps["ai_analysis"] = learning_step("failed", error=str(exc))
+        steps["revision_proposal"] = learning_step("skipped", error="ai_analysis failed")
+        steps["auto_apply"] = auto_apply_step("skipped", error="ai_analysis failed")
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: ai_analysis failed - {exc}")
+        return {"cycle_id": cycle_id, "status": "partial", "steps": steps}
+
+    try:
+        proposal = await asyncio.to_thread(get_cycle_agrotech_revision_proposal, cycle_id)
+        if proposal is not None:
+            steps["revision_proposal"] = learning_step("existing", proposal)
+        else:
+            proposal = await run_agrotech_revision_proposal(cycle_id, force=force)
+            steps["revision_proposal"] = learning_step("completed", proposal)
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: revision_proposal completed")
+    except Exception as exc:
+        steps["revision_proposal"] = learning_step("failed", error=str(exc))
+        steps["auto_apply"] = auto_apply_step("skipped", error="revision_proposal failed")
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: revision_proposal failed - {exc}")
+        return {"cycle_id": cycle_id, "status": "partial", "steps": steps}
+
+    if not auto_apply:
+        steps["auto_apply"] = auto_apply_step("skipped", error=None)
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply skipped")
+        return {"cycle_id": cycle_id, "status": finalize_learning_pipeline_status(steps), "steps": steps}
+
+    try:
+        apply_result = await asyncio.to_thread(
+            apply_cycle_agrotech_revision_proposal,
+            cycle_id,
+            force,
+        )
+        apply_status = str(apply_result.get("status") or "")
+        if apply_status in {"auto_applied", "already_applied"}:
+            steps["auto_apply"] = auto_apply_step("applied", apply_result)
+            print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply applied")
+        elif apply_status == "auto_deferred":
+            steps["auto_apply"] = auto_apply_step("deferred", apply_result)
+            print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply deferred")
+        else:
+            steps["auto_apply"] = auto_apply_step("failed", apply_result, error=apply_status or "unknown apply status")
+            print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply failed")
+    except AgrotechRevisionProposalApplyError as exc:
+        steps["auto_apply"] = auto_apply_step("deferred", error=str(exc))
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply deferred - {exc}")
+    except AgrotechRevisionProposalNotFoundError as exc:
+        steps["auto_apply"] = auto_apply_step("failed", error=str(exc))
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply failed - {exc}")
+    except Exception as exc:
+        steps["auto_apply"] = auto_apply_step("failed", error=str(exc))
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: auto_apply failed - {exc}")
+
+    return {
+        "cycle_id": cycle_id,
+        "status": finalize_learning_pipeline_status(steps),
+        "steps": steps,
+    }
+
+
+async def run_cycle_learning_pipeline_background(cycle_id: int) -> None:
+    try:
+        await run_cycle_learning_pipeline(cycle_id, auto_apply=True, force=False)
+    except Exception as exc:
+        print(f"[LEARNING PIPELINE] cycle {cycle_id}: background failed - {exc}")
+
+
 async def extract_recommendations_from_reply(
     reply: str,
     user_message: str,
@@ -4033,7 +4193,10 @@ def api_start_growing_cycle(request: StartGrowingCycleRequest) -> dict[str, Any]
 
 
 @app.post("/api/cycles/end", response_model=FinishCycleResponse)
-def api_finish_growing_cycle(request: FinishCycleRequest) -> dict[str, Any]:
+def api_finish_growing_cycle(
+    request: FinishCycleRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
     try:
         result_payload = request.dict(
             exclude={"tray_id", "notes"},
@@ -4043,17 +4206,10 @@ def api_finish_growing_cycle(request: FinishCycleRequest) -> dict[str, Any]:
             result_payload=result_payload,
             notes=request.notes,
         )
-        try:
-            cycle_id = finished.get("cycle", {}).get("id")
-            if isinstance(cycle_id, int):
-                report = build_cycle_analysis_report(cycle_id)
-                save_cycle_analysis_report(
-                    cycle_id,
-                    report["report_payload"],
-                    report["summary_text"],
-                )
-        except Exception as exc:
-            print(f"[CYCLE_ANALYSIS] Failed to auto-build report after finish: {exc}")
+        cycle_id = finished.get("cycle", {}).get("id")
+        if isinstance(cycle_id, int):
+            background_tasks.add_task(run_cycle_learning_pipeline_background, cycle_id)
+            print(f"[LEARNING PIPELINE] cycle {cycle_id}: scheduled after cycle finish")
         return finished
     except NoActiveGrowingCycleError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
@@ -4130,6 +4286,15 @@ async def api_run_agrotech_revision_proposal(
     force: bool = Query(default=False),
 ) -> dict[str, Any]:
     return await run_agrotech_revision_proposal(cycle_id, force=force)
+
+
+@app.post("/api/cycles/{cycle_id}/learning-pipeline")
+async def api_run_cycle_learning_pipeline(
+    cycle_id: int,
+    auto_apply: bool = Query(default=True),
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    return await run_cycle_learning_pipeline(cycle_id, auto_apply=auto_apply, force=force)
 
 
 @app.get("/api/cycles/{cycle_id}/agrotech-revision-proposal")
