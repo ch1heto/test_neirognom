@@ -251,7 +251,8 @@ CHAT_SYSTEM_PROMPT = (
     "1. Режим молчания о цифрах: НИКОГДА не перечисляй и не упоминай текущие показатели датчиков, "
     "если пользователь прямо не спросил ('как показатели?', 'всё ли в норме?'). Для обычных бесед используй эти данные только в уме.\n"
     "2. Если backend передал активный цикл, всегда оценивай ферму относительно активной культуры, версии АгроТехКарты и дня цикла. "
-    "Не выбирай культуру по догадке из сообщения пользователя, если активный цикл есть.\n"
+    "Не выбирай культуру по догадке из сообщения пользователя, если активный цикл есть. "
+    "Если пользователь спрашивает, какая версия АгроТехКарты используется, ответь только active version_label из активного цикла и не уходи в общую оценку фермы.\n"
     "3. Если пользователь спрашивает 'Всё ли нормально на ферме?', оценивай текущие датчики относительно норм активной АгроТехКарты. "
     "Используй нормы из активного цикла как приоритетные.\n"
     "4. Если активного цикла нет, честно скажи, что цикл не запущен, и предложи запустить цикл или уточнить культуру. "
@@ -271,7 +272,13 @@ CHAT_SYSTEM_PROMPT = (
     "10. Если пользователь задаёт follow-up вопрос с местоимениями вроде 'он', 'она', 'сколько раз', "
     "'когда последний раз', используй расширенный контекст фермы, который backend добавил на основе недавней темы диалога. "
     "Не говори, что точных данных нет, если в расширенном контексте есть counts/history из device_events.\n"
-    "11. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
+    "11. Если backend передал блок 'Прошлый опыт культуры', используй его как дополнительный источник фактов только для активной культуры. "
+    "Не смешивай опыт разных культур. Не утверждай, что новая версия АгроТехКарты эффективнее, если завершённых циклов на ней ещё нет или данных недостаточно. "
+    "Не делай жёсткие причинно-следственные выводы: формулируй осторожно, через 'раньше наблюдалось', 'в прошлых циклах было видно'. "
+    "При советах по pH, EC, поливу и температуре учитывай прошлые проблемы и внесённые улучшения, но текущие датчики и активная АгроТехКарта важнее прошлого опыта. "
+    "Не рассказывай пользователю proposal_id, revision_id, source_revision_id и внутреннюю историю версий, если он прямо не спрашивает. "
+    "Если пользователь просто здоровается или спрашивает не про ферму, не пересказывай прошлый опыт.\n"
+    "12. Если вопрос требует фактов из БД фермы, вызывай доступные инструменты. "
     "Не придумывай количество включений устройств, pH, EC, аномалии, активную культуру или историю метрик. "
     "Если пользователь задаёт follow-up вопрос, используй историю диалога и вызывай подходящий инструмент. "
     "Если пользователь спрашивает про несколько устройств, запроси данные по каждому устройству. "
@@ -280,8 +287,8 @@ CHAT_SYSTEM_PROMPT = (
     "Не советуй добавлять щёлочь, кислоту или менять раствор без текущего значения pH. "
     "Для вопросов про конкретную культуру вызывай get_crop_card_tool. "
     "Для вопросов про текущее состояние фермы используй текущие метрики, активный цикл и, при необходимости, аномалии.\n"
-    "12. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
-    "13. Для конкретной культуры сначала используй get_crop_card_tool. "
+    "13. Не используй повреждённый символ �. Если нужно переформулировать слово, напиши его обычными русскими буквами.\n"
+    "14. Для конкретной культуры сначала используй get_crop_card_tool. "
     "Если tool вернул suitability_status='db_supported', отвечай по АгроТехКарте. "
     "Если suitability_status='compatible_not_in_db', можно дать только общую справку и обязательно сказать, что точной АгроТехКарты в БД нет. "
     "Если suitability_status='advanced_or_unsuitable', не рассказывай подробную агротехнику для этой установки; объясни, что культура может требовать другой гидропонной системы, большего объёма, опоры, опыления или другого формата выращивания. "
@@ -1805,6 +1812,179 @@ def format_active_cycle_for_prompt(tray_id: str = "tray_1") -> str:
     return "\n".join(lines)
 
 
+def build_crop_learning_context_for_ai(crop_slug: str) -> str:
+    try:
+        history = get_crop_learning_history(crop_slug)
+    except Exception:
+        return "Прошлый опыт культуры: прошлого опыта пока недостаточно."
+
+    crop = history.get("crop") if isinstance(history, dict) else {}
+    versions = history.get("versions") if isinstance(history, dict) else []
+    if not isinstance(crop, dict) or not isinstance(versions, list) or not versions:
+        return "Прошлый опыт культуры: прошлого опыта пока недостаточно."
+
+    active_revision_id = history.get("active_revision_id")
+    active_version = next(
+        (version for version in versions if version.get("revision_id") == active_revision_id),
+        None,
+    )
+    if active_version is None:
+        active_version = next((version for version in versions if version.get("is_active")), None)
+
+    active_label = active_version.get("version_label") if isinstance(active_version, dict) else None
+    crop_name = crop.get("name_ru") or crop.get("slug") or crop_slug
+    lines = [
+        "Прошлый опыт культуры:",
+        f"- культура: {crop_name} ({crop.get('slug') or crop_slug});",
+        f"- активная версия АгроТехКарты: {active_label or 'не указана'};",
+        "- используй этот блок только для этой культуры; текущие датчики и активная АгроТехКарта важнее прошлого опыта;",
+    ]
+
+    recent_versions = versions[-3:]
+    for version in recent_versions:
+        version_label = version.get("version_label") or "версия без номера"
+        effectiveness = version.get("effectiveness") if isinstance(version.get("effectiveness"), dict) else {}
+        finished_cycles = int(effectiveness.get("finished_cycles") or 0)
+        has_enough_data = bool(effectiveness.get("has_enough_data"))
+        created_from = version.get("created_from") if isinstance(version.get("created_from"), dict) else None
+        if created_from:
+            source_cycle_id = created_from.get("source_cycle_id")
+            source_revision_id = created_from.get("source_revision_id")
+            source_version = next(
+                (
+                    item.get("version_label")
+                    for item in versions
+                    if item.get("revision_id") == source_revision_id
+                ),
+                None,
+            )
+            reason = created_from.get("ai_reasoning_short") or version.get("change_reason_short")
+            source_part = f" на {source_version}" if source_version else ""
+            lines.append(
+                f"- {version_label} создана после цикла #{source_cycle_id}{source_part}: "
+                f"{reason or 'причина не указана'}"
+            )
+        else:
+            lines.append(f"- {version_label}: завершённых циклов на версии: {finished_cycles}.")
+
+        if not has_enough_data:
+            summary = effectiveness.get("summary") or "данных мало для оценки эффективности."
+            lines.append(f"- {version_label}: {summary}")
+
+    finished_cycle_notes: list[str] = []
+    for version in reversed(versions):
+        version_label = version.get("version_label") or "версия без номера"
+        cycles = version.get("cycles_on_this_revision")
+        if not isinstance(cycles, list):
+            continue
+        for cycle in reversed(cycles):
+            if cycle.get("status") != "finished":
+                continue
+            findings = cycle.get("main_findings_short")
+            if isinstance(findings, list):
+                for finding in findings[:3]:
+                    if not isinstance(finding, dict):
+                        continue
+                    problem = str(finding.get("problem") or "").strip()
+                    area = str(finding.get("area") or "general").strip()
+                    if problem:
+                        finished_cycle_notes.append(
+                            f"{version_label}, цикл #{cycle.get('cycle_id')}: {area}: {problem}"
+                        )
+            elif cycle.get("ai_analysis_summary"):
+                finished_cycle_notes.append(
+                    f"{version_label}, цикл #{cycle.get('cycle_id')}: {cycle.get('ai_analysis_summary')}"
+                )
+            if len(finished_cycle_notes) >= 5:
+                break
+        if len(finished_cycle_notes) >= 5:
+            break
+
+    if finished_cycle_notes:
+        lines.append("- главные проблемы прошлых завершённых циклов:")
+        lines.extend(f"  - {note}" for note in finished_cycle_notes[:5])
+    else:
+        lines.append("- прошлых завершённых циклов с выводами пока недостаточно.")
+
+    latest_created_from = None
+    if isinstance(active_version, dict):
+        latest_created_from = active_version.get("created_from")
+    if not isinstance(latest_created_from, dict):
+        latest_created_from = next(
+            (
+                version.get("created_from")
+                for version in reversed(versions)
+                if isinstance(version.get("created_from"), dict)
+            ),
+            None,
+        )
+
+    top_changes = latest_created_from.get("top_changes") if isinstance(latest_created_from, dict) else []
+    if isinstance(top_changes, list) and top_changes:
+        lines.append("- изменения, внесённые в последнюю карту:")
+        for change in top_changes[:4]:
+            if not isinstance(change, dict):
+                continue
+            section = change.get("section") or "раздел"
+            reason = change.get("reason") or "причина не указана"
+            new_value = change.get("new_value")
+            if new_value:
+                lines.append(f"  - {section}: {new_value} ({reason})")
+            else:
+                lines.append(f"  - {section}: {reason}")
+
+    try:
+        active_card = get_crop_agrotech_card_from_db(crop_slug)
+    except Exception:
+        active_card = None
+    card_sections = active_card.get("sections") if isinstance(active_card, dict) else []
+    card_solution_lines: list[str] = []
+    if isinstance(card_sections, list):
+        for section in card_sections:
+            if not isinstance(section, dict):
+                continue
+            title = str(section.get("section_title") or "")
+            content = str(section.get("content") or "")
+            if title not in {
+                "Рекомендации по уходу",
+                "Правила алертов",
+                "Как должен отвечать AI-советник",
+                "Выбранные диапазоны и обоснование",
+            }:
+                continue
+            for raw_line in content.splitlines():
+                line = raw_line.strip().lstrip("-").strip()
+                if not line:
+                    continue
+                lowered = line.lower()
+                if not any(keyword in lowered for keyword in ("ph", "ec", "раствор", "измер", "перемеш")):
+                    continue
+                short_line = line[:220].rstrip()
+                if short_line and short_line not in card_solution_lines:
+                    card_solution_lines.append(short_line)
+                if len(card_solution_lines) >= 4:
+                    break
+            if len(card_solution_lines) >= 4:
+                break
+    if card_solution_lines:
+        lines.append("- инструкции активной карты по прошлым pH/EC-проблемам:")
+        lines.extend(f"  - {line}" for line in card_solution_lines)
+
+    if isinstance(active_version, dict):
+        effectiveness = active_version.get("effectiveness") if isinstance(active_version.get("effectiveness"), dict) else {}
+        if not effectiveness.get("has_enough_data"):
+            lines.append(
+                f"- На {active_label or 'активной версии'} пока недостаточно завершённых циклов; "
+                "нельзя утверждать, что она эффективнее предыдущих версий."
+            )
+
+    lines.append(
+        "- Не пересказывай пользователю историю версий и номера внутренних сущностей, "
+        "если он прямо не спрашивает."
+    )
+    return "\n".join(lines)
+
+
 def detect_farm_question_topics(message: str) -> set[str]:
     text = str(message or "").lower().replace("ё", "е")
     topic_keywords = {
@@ -3047,7 +3227,11 @@ def build_crop_context_for_prompt(message: str, messages: list | None = None, tr
     ])
 
 
-def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None) -> str:
+def build_chat_prompt(
+    message: str,
+    history: list[dict[str, str]] | None = None,
+    learning_context: str | None = None,
+) -> str:
     translated_data_string = format_latest_data_for_prompt()
     farm_facts_context = build_farm_facts_context_for_prompt(message, "tray_1", messages=history)
     crop_context = build_crop_context_for_prompt(message, messages=history, tray_id="tray_1")
@@ -3065,6 +3249,8 @@ def build_chat_prompt(message: str, history: list[dict[str, str]] | None = None)
         prompt_parts.append(farm_facts_context)
     if crop_context:
         prompt_parts.append(crop_context)
+    if learning_context:
+        prompt_parts.append(learning_context)
 
     if history:
         history_lines: list[str] = []
@@ -3706,11 +3892,16 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
         "Анализирую смысл сообщения",
         "Определяю, какие данные нужны для ответа",
     ]
-    enriched_prompt = build_chat_prompt(user_prompt, history)
     analysis_steps.append("Добавляю актуальные показатели фермы в контекст")
     active_cycle = await asyncio.to_thread(get_active_cycle_ai_context, "tray_1")
+    learning_context = ""
     if active_cycle:
         analysis_steps.append("Добавляю активный цикл выращивания в контекст ИИ")
+        crop_slug = str(active_cycle.get("crop_slug") or "").strip()
+        if crop_slug:
+            learning_context = await asyncio.to_thread(build_crop_learning_context_for_ai, crop_slug)
+            if learning_context:
+                analysis_steps.append("Добавляю прошлый опыт культуры в контекст ИИ")
     else:
         detected_crops = detect_crops_in_message(user_prompt)
         crop_rules_context = build_crop_rules_context(detected_crops)
@@ -3719,9 +3910,14 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
             analysis_steps.append("Нашёл упоминания культур в запросе")
         if crop_rules_context:
             analysis_steps.append("Загружаю АгроТехКарты культур из БД")
-            enriched_prompt = f"{crop_rules_context}\n\n{enriched_prompt}"
         if unsupported_crop_context:
             analysis_steps.append("Проверяю ограничения по неподходящим культурам")
+
+    enriched_prompt = build_chat_prompt(user_prompt, history, learning_context=learning_context)
+    if not active_cycle:
+        if crop_rules_context:
+            enriched_prompt = f"{crop_rules_context}\n\n{enriched_prompt}"
+        if unsupported_crop_context:
             enriched_prompt = f"{unsupported_crop_context}\n\n{enriched_prompt}"
 
     try:
