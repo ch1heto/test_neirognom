@@ -1876,6 +1876,87 @@ def ensure_ph_target_settings_schema(cursor) -> None:
     )
 
 
+def ensure_ph_dosing_events_schema(cursor) -> None:
+    ensure_growing_cycles_schema(cursor)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ph_dosing_events (
+            id BIGSERIAL PRIMARY KEY,
+            tray_id TEXT NOT NULL,
+            cycle_id BIGINT,
+            status TEXT NOT NULL,
+            action TEXT NOT NULL DEFAULT 'none',
+            pump_id TEXT,
+            reason TEXT,
+            current_ph DOUBLE PRECISION,
+            target_ph DOUBLE PRECISION,
+            tolerance DOUBLE PRECISION,
+            target_min DOUBLE PRECISION,
+            target_max DOUBLE PRECISION,
+            duration_ms INTEGER,
+            mqtt_topic TEXT,
+            mqtt_payload JSONB,
+            safety_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS tray_id TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS status TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS action TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS pump_id TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS reason TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS current_ph DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS target_ph DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS tolerance DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS target_min DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS target_max DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS duration_ms INTEGER")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS mqtt_topic TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS mqtt_payload JSONB")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS safety_reason TEXT")
+    cursor.execute("ALTER TABLE ph_dosing_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    cursor.execute("UPDATE ph_dosing_events SET action = 'none' WHERE action IS NULL")
+    cursor.execute("UPDATE ph_dosing_events SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("ALTER TABLE ph_dosing_events ALTER COLUMN action SET DEFAULT 'none'")
+    cursor.execute("ALTER TABLE ph_dosing_events ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ph_dosing_events_tray_created_at
+        ON ph_dosing_events(tray_id, created_at DESC)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ph_dosing_events_cycle_created_at
+        ON ph_dosing_events(cycle_id, created_at DESC)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ph_dosing_events_status_created_at
+        ON ph_dosing_events(status, created_at DESC)
+        """
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "ph_dosing_events",
+        "fk_ph_dosing_events_tray_id_trays",
+        "tray_id",
+        "trays",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "ph_dosing_events",
+        "fk_ph_dosing_events_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+
+
 def validate_ph_target_settings_payload(
     target_ph: Any,
     tolerance: Any,
@@ -2033,6 +2114,337 @@ def upsert_current_ph_target_settings(
                 ),
             )
             return row_to_ph_target_settings(cycle_row, cursor.fetchone())
+
+
+def get_ph_dosing_controller_states() -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_target_settings_schema(cursor)
+            cursor.execute(
+                """
+                SELECT
+                    growing_cycles.id AS cycle_id,
+                    growing_cycles.tray_id,
+                    ph_target_settings.target_ph,
+                    ph_target_settings.tolerance,
+                    ph_target_settings.autodosing_enabled,
+                    ph_target_settings.source,
+                    ph_target_settings.updated_at AS settings_updated_at
+                FROM growing_cycles
+                JOIN ph_target_settings
+                  ON ph_target_settings.cycle_id = growing_cycles.id
+                 AND ph_target_settings.tray_id = growing_cycles.tray_id
+                WHERE growing_cycles.status = 'active'
+                ORDER BY growing_cycles.started_at DESC, growing_cycles.id DESC
+                """
+            )
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "cycle_id": row["cycle_id"],
+            "tray_id": row["tray_id"],
+            "target_ph": row["target_ph"],
+            "tolerance": row["tolerance"],
+            "autodosing_enabled": bool(row["autodosing_enabled"]),
+            "source": row["source"],
+            "settings_updated_at": format_timestamp(row["settings_updated_at"]),
+        }
+        for row in rows
+    ]
+
+
+def get_latest_water_ph(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any] | None:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    telemetry_readings.id,
+                    telemetry_readings.tray_id,
+                    telemetry_readings.topic,
+                    telemetry_values.value,
+                    telemetry_readings.recorded_at
+                FROM telemetry_values
+                JOIN telemetry_readings
+                  ON telemetry_readings.id = telemetry_values.reading_id
+                JOIN catalog_items AS metrics
+                  ON metrics.id = telemetry_values.metric_id
+                 AND metrics.category = 'metric'
+                 AND metrics.code = 'ph'
+                LEFT JOIN catalog_items AS sensor_types
+                  ON sensor_types.id = telemetry_readings.sensor_type_id
+                 AND sensor_types.category = 'sensor_type'
+                WHERE telemetry_readings.tray_id = %s
+                  AND (
+                      sensor_types.code = 'water'
+                      OR telemetry_readings.topic = %s
+                      OR telemetry_readings.topic LIKE %s
+                  )
+                ORDER BY telemetry_readings.recorded_at DESC, telemetry_readings.id DESC
+                LIMIT 1
+                """,
+                (normalized_tray_id, WATER_TOPIC, "%/water"),
+            )
+            row = cursor.fetchone()
+
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "tray_id": row["tray_id"],
+        "topic": row["topic"],
+        "ph": row["value"],
+        "recorded_at": row["recorded_at"],
+        "recorded_at_text": format_timestamp(row["recorded_at"]),
+    }
+
+
+def get_ph_dosing_hourly_usage(
+    tray_id: str = DEFAULT_TRAY_ID,
+    cycle_id: int | None = None,
+) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
+            cursor.execute(
+                """
+                SELECT
+                    (
+                        SELECT COUNT(*)::INTEGER
+                        FROM ph_dosing_events
+                        WHERE tray_id = %s
+                          AND (%s::BIGINT IS NULL OR cycle_id = %s)
+                          AND status = 'executed'
+                          AND action = 'dose'
+                          AND created_at >= now() - interval '1 hour'
+                    ) AS dose_count,
+                    (
+                        SELECT COALESCE(SUM(duration_ms), 0)::INTEGER
+                        FROM ph_dosing_events
+                        WHERE tray_id = %s
+                          AND (%s::BIGINT IS NULL OR cycle_id = %s)
+                          AND status = 'executed'
+                          AND action = 'dose'
+                          AND created_at >= now() - interval '1 hour'
+                    ) AS total_duration_ms,
+                    (
+                        SELECT MAX(created_at)
+                        FROM ph_dosing_events
+                        WHERE tray_id = %s
+                          AND (%s::BIGINT IS NULL OR cycle_id = %s)
+                          AND status = 'executed'
+                          AND action = 'dose'
+                    ) AS last_executed_at
+                """,
+                (
+                    normalized_tray_id,
+                    cycle_id,
+                    cycle_id,
+                    normalized_tray_id,
+                    cycle_id,
+                    cycle_id,
+                    normalized_tray_id,
+                    cycle_id,
+                    cycle_id,
+                ),
+            )
+            row = cursor.fetchone()
+
+    return {
+        "dose_count": int(row["dose_count"] or 0) if row else 0,
+        "total_duration_ms": int(row["total_duration_ms"] or 0) if row else 0,
+        "last_executed_at": row["last_executed_at"] if row else None,
+    }
+
+
+def row_to_ph_dosing_event(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "tray_id": row["tray_id"],
+        "cycle_id": row["cycle_id"],
+        "status": row["status"],
+        "action": row["action"],
+        "pump_id": row["pump_id"],
+        "reason": row["reason"],
+        "current_ph": row["current_ph"],
+        "target_ph": row["target_ph"],
+        "tolerance": row["tolerance"],
+        "target_min": row["target_min"],
+        "target_max": row["target_max"],
+        "duration_ms": row["duration_ms"],
+        "mqtt_topic": row["mqtt_topic"],
+        "mqtt_payload": row["mqtt_payload"],
+        "safety_reason": row["safety_reason"],
+        "created_at": format_timestamp(row["created_at"]),
+    }
+
+
+def has_recent_ph_dosing_event(
+    *,
+    tray_id: str,
+    cycle_id: int | None,
+    status: str,
+    pump_id: str | None = None,
+    reason: str | None = None,
+    safety_reason: str | None = None,
+    seconds: int = 120,
+) -> bool:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    normalized_seconds = max(1, int(seconds))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
+            cursor.execute(
+                """
+                SELECT 1
+                FROM ph_dosing_events
+                WHERE tray_id = %s
+                  AND cycle_id IS NOT DISTINCT FROM %s
+                  AND status IS NOT DISTINCT FROM %s
+                  AND pump_id IS NOT DISTINCT FROM %s
+                  AND reason IS NOT DISTINCT FROM %s
+                  AND safety_reason IS NOT DISTINCT FROM %s
+                  AND created_at >= now() - (%s * interval '1 second')
+                LIMIT 1
+                """,
+                (
+                    normalized_tray_id,
+                    cycle_id,
+                    status,
+                    pump_id,
+                    reason,
+                    safety_reason,
+                    normalized_seconds,
+                ),
+            )
+            return cursor.fetchone() is not None
+
+
+def save_ph_dosing_event(
+    *,
+    tray_id: str,
+    cycle_id: int | None,
+    status: str,
+    action: str = "none",
+    pump_id: str | None = None,
+    reason: str | None = None,
+    current_ph: Any = None,
+    target_ph: Any = None,
+    tolerance: Any = None,
+    target_min: Any = None,
+    target_max: Any = None,
+    duration_ms: int | None = None,
+    mqtt_topic: str | None = None,
+    mqtt_payload: dict[str, Any] | None = None,
+    safety_reason: str | None = None,
+) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
+            cursor.execute(
+                """
+                INSERT INTO ph_dosing_events (
+                    tray_id,
+                    cycle_id,
+                    status,
+                    action,
+                    pump_id,
+                    reason,
+                    current_ph,
+                    target_ph,
+                    tolerance,
+                    target_min,
+                    target_max,
+                    duration_ms,
+                    mqtt_topic,
+                    mqtt_payload,
+                    safety_reason,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                RETURNING
+                    id,
+                    tray_id,
+                    cycle_id,
+                    status,
+                    action,
+                    pump_id,
+                    reason,
+                    current_ph,
+                    target_ph,
+                    tolerance,
+                    target_min,
+                    target_max,
+                    duration_ms,
+                    mqtt_topic,
+                    mqtt_payload,
+                    safety_reason,
+                    created_at
+                """,
+                (
+                    normalized_tray_id,
+                    cycle_id,
+                    status,
+                    action,
+                    pump_id,
+                    reason,
+                    number_or_none(current_ph),
+                    number_or_none(target_ph),
+                    number_or_none(tolerance),
+                    number_or_none(target_min),
+                    number_or_none(target_max),
+                    duration_ms,
+                    mqtt_topic,
+                    Jsonb(mqtt_payload) if mqtt_payload is not None else None,
+                    safety_reason,
+                ),
+            )
+            return row_to_ph_dosing_event(cursor.fetchone())
+
+
+def get_recent_ph_dosing_events(
+    tray_id: str = DEFAULT_TRAY_ID,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    normalized_limit = max(1, min(int(limit), 200))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    tray_id,
+                    cycle_id,
+                    status,
+                    action,
+                    pump_id,
+                    reason,
+                    current_ph,
+                    target_ph,
+                    tolerance,
+                    target_min,
+                    target_max,
+                    duration_ms,
+                    mqtt_topic,
+                    mqtt_payload,
+                    safety_reason,
+                    created_at
+                FROM ph_dosing_events
+                WHERE tray_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (normalized_tray_id, normalized_limit),
+            )
+            rows = cursor.fetchall()
+
+    return [row_to_ph_dosing_event(row) for row in rows]
 
 
 def ensure_anomaly_event_refs_schema(cursor) -> None:
@@ -5604,6 +6016,7 @@ def init_db() -> None:
             drop_agrotech_legacy_columns(cursor)
             ensure_growing_cycles_schema(cursor)
             ensure_ph_target_settings_schema(cursor)
+            ensure_ph_dosing_events_schema(cursor)
             ensure_anomaly_event_refs_schema(cursor)
             backfill_anomaly_event_refs(cursor)
             drop_anomaly_legacy_columns(cursor)
@@ -6967,6 +7380,7 @@ def get_recent_system_feed_events(limit: int = 15) -> list[dict[str, Any]]:
     normalized_limit = max(1, min(int(limit), 100))
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
             cursor.execute(
                 """
                 SELECT *
@@ -6977,6 +7391,8 @@ def get_recent_system_feed_events(limit: int = 15) -> list[dict[str, Any]]:
                         NULL::TEXT AS device_id,
                         event_types.code AS event_type,
                         NULL::TEXT AS command,
+                        NULL::TEXT AS pump_id,
+                        NULL::TEXT AS safety_reason,
                         COALESCE(severities.code, 'warning') AS severity,
                         anomaly_events.message,
                         anomaly_events.created_at
@@ -6996,6 +7412,8 @@ def get_recent_system_feed_events(limit: int = 15) -> list[dict[str, Any]]:
                         device_events.device_id,
                         event_types.code AS event_type,
                         device_events.command,
+                        NULL::TEXT AS pump_id,
+                        NULL::TEXT AS safety_reason,
                         'info' AS severity,
                         NULL::TEXT AS message,
                         device_events.created_at
@@ -7003,6 +7421,24 @@ def get_recent_system_feed_events(limit: int = 15) -> list[dict[str, Any]]:
                     LEFT JOIN catalog_items AS event_types
                       ON event_types.id = device_events.event_type_id
                      AND event_types.category = 'event_type'
+
+                    UNION ALL
+
+                    SELECT
+                        'ph_dosing' AS feed_type,
+                        ph_dosing_events.id,
+                        ph_dosing_events.pump_id AS device_id,
+                        COALESCE(ph_dosing_events.reason, ph_dosing_events.safety_reason) AS event_type,
+                        ph_dosing_events.status AS command,
+                        ph_dosing_events.pump_id,
+                        ph_dosing_events.safety_reason,
+                        CASE
+                            WHEN ph_dosing_events.status = 'executed' THEN 'info'
+                            ELSE 'warning'
+                        END AS severity,
+                        NULL::TEXT AS message,
+                        ph_dosing_events.created_at
+                    FROM ph_dosing_events
                 ) AS feed
                 ORDER BY created_at DESC, id DESC
                 LIMIT %s
@@ -7018,6 +7454,8 @@ def get_recent_system_feed_events(limit: int = 15) -> list[dict[str, Any]]:
             "device_id": row["device_id"],
             "event_type": row["event_type"],
             "command": row["command"],
+            "pump_id": row["pump_id"],
+            "safety_reason": row["safety_reason"],
             "severity": row["severity"],
             "message": row["message"],
             "created_at": format_timestamp(row["created_at"]),

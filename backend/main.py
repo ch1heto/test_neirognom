@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import json
+import math
 import os
 import re
 from contextlib import asynccontextmanager, suppress
@@ -47,11 +48,16 @@ from db import (
     get_database_model_summary,
     get_agrotech_revision_proposal,
     get_cycle_agrotech_revision_proposal,
+    has_recent_ph_dosing_event,
+    get_latest_water_ph,
     get_hourly_history,
     get_last_climate_records,
     get_last_water_records,
+    get_ph_dosing_controller_states,
+    get_ph_dosing_hourly_usage,
     get_recent_anomaly_events,
     get_recent_device_events,
+    get_recent_ph_dosing_events,
     get_recent_ai_logs,
     get_recent_ai_recommendations,
     get_recent_hourly_summary,
@@ -75,6 +81,7 @@ from db import (
     save_anomaly_event,
     save_cycle_result,
     save_device_event,
+    save_ph_dosing_event,
     save_recommendation_effect,
     save_telemetry,
     start_growing_cycle,
@@ -114,6 +121,28 @@ def parse_int_list_env(name: str, default: list[int]) -> list[int]:
     return sorted(set(values)) or default
 
 
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def parse_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
 KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
@@ -123,6 +152,18 @@ HOURLY_AGGREGATION_INTERVAL_SECONDS = 300
 RAW_RETENTION_HOURS = 24
 ANOMALY_EVENT_COOLDOWN_MINUTES = 5
 SENSOR_STALE_SECONDS = 60
+PH_DOSING_INTERVAL_SECONDS = parse_positive_int_env("PH_DOSING_INTERVAL_SECONDS", 30)
+PH_DOSING_DURATION_MS = parse_positive_int_env("PH_DOSING_DURATION_MS", 500)
+PH_DOSING_COOLDOWN_SECONDS = parse_positive_int_env("PH_DOSING_COOLDOWN_SECONDS", 180)
+PH_DOSING_MIXING_DELAY_SECONDS = parse_positive_int_env("PH_DOSING_MIXING_DELAY_SECONDS", 180)
+PH_DOSING_MAX_DOSES_PER_HOUR = parse_positive_int_env("PH_DOSING_MAX_DOSES_PER_HOUR", 6)
+PH_DOSING_MAX_DURATION_MS_PER_HOUR = parse_positive_int_env("PH_DOSING_MAX_DURATION_MS_PER_HOUR", 6000)
+PH_DOSING_MIN_SENSOR_PH = parse_float_env("PH_DOSING_MIN_SENSOR_PH", 3.0)
+PH_DOSING_MAX_SENSOR_PH = parse_float_env("PH_DOSING_MAX_SENSOR_PH", 10.0)
+PH_DOSING_BLOCKED_LOG_COOLDOWN_SECONDS = parse_positive_int_env(
+    "PH_DOSING_BLOCKED_LOG_COOLDOWN_SECONDS",
+    120,
+)
 PREDICTIVE_WATCHDOG_INTERVAL_SECONDS = 600
 PREDICTIVE_HISTORY_HOURS = 8
 PREDICTIVE_HORIZON_HOURS = 4
@@ -271,6 +312,18 @@ SYSTEM_FEED_DEVICE_TEXTS = {
     ("light", "manual_off"): "Освещение выключено",
     ("fan", "manual_on"): "Вентиляция включена",
     ("fan", "manual_off"): "Вентиляция выключена",
+}
+SYSTEM_FEED_PH_DOSING_TEXTS = {
+    ("executed", "ph_down", "ph_above_target"): "pH выше целевого диапазона, выполнена микродоза pH Down",
+    ("executed", "ph_up", "ph_below_target"): "pH ниже целевого диапазона, выполнена микродоза pH Up",
+    ("blocked", None, "stale_water_telemetry"): "pH-дозирование заблокировано: данные pH устарели",
+    ("blocked", None, "cooldown"): "pH-дозирование отложено: идёт пауза после предыдущей дозы",
+    ("blocked", None, "mixing_delay"): "pH-дозирование отложено: идёт пауза после предыдущей дозы",
+    ("blocked", None, "cooldown_mixing"): "pH-дозирование отложено: идёт пауза после предыдущей дозы",
+    ("blocked", None, "hourly_dose_limit"): "pH-дозирование заблокировано: достигнут лимит доз за час",
+    ("blocked", None, "hourly_duration_limit"): "pH-дозирование заблокировано: достигнут лимит дозирования за час",
+    ("failed", None, "mqtt_not_connected"): "Не удалось отправить команду pH-дозирования",
+    ("failed", None, "mqtt_publish_failed"): "Не удалось отправить команду pH-дозирования",
 }
 ADVISOR_HISTORY_HOURS = 24
 AI_CONTEXT_NORM_KEYS = (
@@ -1221,6 +1274,16 @@ def format_system_feed_item(row: dict[str, Any]) -> dict[str, Any]:
     elif feed_type == "device":
         device_key = system_feed_device_key(row.get("device_id"))
         text = SYSTEM_FEED_DEVICE_TEXTS.get((device_key, event_type), "Событие устройства")
+    elif feed_type == "ph_dosing":
+        status = str(row.get("command") or "")
+        pump_id = str(row.get("pump_id") or row.get("device_id") or "")
+        safety_reason = str(row.get("safety_reason") or event_type or "")
+        text = (
+            SYSTEM_FEED_PH_DOSING_TEXTS.get((status, pump_id, event_type))
+            or SYSTEM_FEED_PH_DOSING_TEXTS.get((status, None, safety_reason))
+            or SYSTEM_FEED_PH_DOSING_TEXTS.get((status, None, event_type))
+            or "Событие pH-дозирования"
+        )
     else:
         text = "Системное событие"
 
@@ -4202,6 +4265,363 @@ async def recommendation_effect_worker() -> None:
         await asyncio.sleep(RECOMMENDATION_EFFECT_INTERVAL_SECONDS)
 
 
+def ph_dosing_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def ph_dosing_seconds_since(timestamp: Any) -> float | None:
+    if not isinstance(timestamp, datetime):
+        return None
+    if timestamp.tzinfo is not None and timestamp.utcoffset() is not None:
+        now = datetime.now(timestamp.tzinfo)
+    else:
+        now = datetime.now()
+    return max(0.0, (now - timestamp).total_seconds())
+
+
+async def log_ph_dosing_event(**event: Any) -> None:
+    try:
+        await asyncio.to_thread(save_ph_dosing_event, **event)
+    except Exception as exc:
+        print(f"[PH_DOSING] Failed to save dosing event: {exc}")
+
+
+async def log_ph_dosing_blocked(
+    *,
+    state: dict[str, Any],
+    safety_reason: str,
+    current_ph: float | None = None,
+    target_ph: float | None = None,
+    tolerance: float | None = None,
+    target_min: float | None = None,
+    target_max: float | None = None,
+    pump_id: str | None = None,
+    reason: str | None = None,
+) -> None:
+    tray_id = str(state.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID)
+    cycle_id = state.get("cycle_id")
+    try:
+        has_recent = await asyncio.to_thread(
+            has_recent_ph_dosing_event,
+            tray_id=tray_id,
+            cycle_id=cycle_id,
+            status="blocked",
+            pump_id=pump_id,
+            reason=reason,
+            safety_reason=safety_reason,
+            seconds=PH_DOSING_BLOCKED_LOG_COOLDOWN_SECONDS,
+        )
+    except Exception as exc:
+        print(f"[PH_DOSING] Failed to check blocked event cooldown: {exc}")
+        has_recent = False
+
+    if has_recent:
+        return
+
+    await log_ph_dosing_event(
+        tray_id=tray_id,
+        cycle_id=cycle_id,
+        status="blocked",
+        action="none",
+        pump_id=pump_id,
+        reason=reason,
+        current_ph=current_ph,
+        target_ph=target_ph,
+        tolerance=tolerance,
+        target_min=target_min,
+        target_max=target_max,
+        safety_reason=safety_reason,
+    )
+
+
+def build_ph_dosing_payload(
+    *,
+    tray_id: str,
+    cycle_id: int,
+    pump_id: str,
+    reason: str,
+    target_ph: float,
+    tolerance: float,
+    target_min: float,
+    target_max: float,
+    current_ph: float,
+) -> dict[str, Any]:
+    return {
+        "device_type": "pump",
+        "pump_id": pump_id,
+        "action": "dose",
+        "duration_ms": PH_DOSING_DURATION_MS,
+        "reason": reason,
+        "tray_id": tray_id,
+        "cycle_id": cycle_id,
+        "target_ph": target_ph,
+        "tolerance": tolerance,
+        "target_min": target_min,
+        "target_max": target_max,
+        "current_ph": current_ph,
+    }
+
+
+async def publish_ph_dosing_command(
+    mqtt_client: mqtt.Client,
+    *,
+    state: dict[str, Any],
+    pump_id: str,
+    reason: str,
+    current_ph: float,
+    target_ph: float,
+    tolerance: float,
+    target_min: float,
+    target_max: float,
+) -> None:
+    tray_id = str(state.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID)
+    cycle_id = int(state["cycle_id"])
+    topic = f"farm/{tray_id}/commands/pump"
+    payload = build_ph_dosing_payload(
+        tray_id=tray_id,
+        cycle_id=cycle_id,
+        pump_id=pump_id,
+        reason=reason,
+        target_ph=target_ph,
+        tolerance=tolerance,
+        target_min=target_min,
+        target_max=target_max,
+        current_ph=current_ph,
+    )
+
+    if mqtt_client is None or not mqtt_client.is_connected():
+        await log_ph_dosing_event(
+            tray_id=tray_id,
+            cycle_id=cycle_id,
+            status="failed",
+            action="dose",
+            pump_id=pump_id,
+            reason=reason,
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+            duration_ms=PH_DOSING_DURATION_MS,
+            mqtt_topic=topic,
+            mqtt_payload=payload,
+            safety_reason="mqtt_not_connected",
+        )
+        return
+
+    try:
+        message_info = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False))
+        publish_rc = getattr(message_info, "rc", mqtt.MQTT_ERR_SUCCESS)
+    except Exception as exc:
+        print(f"[PH_DOSING] MQTT publish failed: {exc}")
+        publish_rc = mqtt.MQTT_ERR_NO_CONN
+
+    if publish_rc != mqtt.MQTT_ERR_SUCCESS:
+        await log_ph_dosing_event(
+            tray_id=tray_id,
+            cycle_id=cycle_id,
+            status="failed",
+            action="dose",
+            pump_id=pump_id,
+            reason=reason,
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+            duration_ms=PH_DOSING_DURATION_MS,
+            mqtt_topic=topic,
+            mqtt_payload=payload,
+            safety_reason="mqtt_publish_failed",
+        )
+        return
+
+    await log_ph_dosing_event(
+        tray_id=tray_id,
+        cycle_id=cycle_id,
+        status="executed",
+        action="dose",
+        pump_id=pump_id,
+        reason=reason,
+        current_ph=current_ph,
+        target_ph=target_ph,
+        tolerance=tolerance,
+        target_min=target_min,
+        target_max=target_max,
+        duration_ms=PH_DOSING_DURATION_MS,
+        mqtt_topic=topic,
+        mqtt_payload=payload,
+    )
+    print(f"[PH_DOSING] Sent {pump_id} dose for {tray_id}: pH={current_ph}")
+
+
+async def evaluate_ph_dosing_state(mqtt_client: mqtt.Client, state: dict[str, Any]) -> None:
+    if not state.get("autodosing_enabled"):
+        return
+
+    target_ph = ph_dosing_number(state.get("target_ph"))
+    tolerance = ph_dosing_number(state.get("tolerance"))
+    if target_ph is None or tolerance is None or tolerance <= 0:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="invalid_target_settings",
+            target_ph=target_ph,
+            tolerance=tolerance,
+        )
+        return
+
+    target_min = round(target_ph - tolerance, 3)
+    target_max = round(target_ph + tolerance, 3)
+    tray_id = str(state.get("tray_id") or WATCHDOG_DEFAULT_TRAY_ID)
+    latest_ph = await asyncio.to_thread(get_latest_water_ph, tray_id)
+    current_ph = ph_dosing_number(latest_ph.get("ph") if latest_ph else None)
+    telemetry_age = sensor_record_age_seconds(latest_ph) if latest_ph else None
+
+    if latest_ph is None or telemetry_age is None or telemetry_age > SENSOR_STALE_SECONDS:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="stale_water_telemetry",
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+        )
+        return
+
+    if current_ph is None:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="missing_ph",
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+        )
+        return
+
+    if current_ph < PH_DOSING_MIN_SENSOR_PH or current_ph > PH_DOSING_MAX_SENSOR_PH:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="sensor_ph_out_of_range",
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+        )
+        return
+
+    if current_ph > target_max:
+        pump_id = "ph_down"
+        reason = "ph_above_target"
+    elif current_ph < target_min:
+        pump_id = "ph_up"
+        reason = "ph_below_target"
+    else:
+        return
+
+    usage = await asyncio.to_thread(
+        get_ph_dosing_hourly_usage,
+        tray_id,
+        state.get("cycle_id"),
+    )
+    elapsed_since_last_dose = ph_dosing_seconds_since(usage.get("last_executed_at"))
+    cooldown_active = (
+        elapsed_since_last_dose is not None
+        and elapsed_since_last_dose < PH_DOSING_COOLDOWN_SECONDS
+    )
+    mixing_active = (
+        elapsed_since_last_dose is not None
+        and elapsed_since_last_dose < PH_DOSING_MIXING_DELAY_SECONDS
+    )
+    if cooldown_active or mixing_active:
+        if cooldown_active and mixing_active:
+            safety_reason = "cooldown_mixing"
+        elif cooldown_active:
+            safety_reason = "cooldown"
+        else:
+            safety_reason = "mixing_delay"
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason=safety_reason,
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+            pump_id=pump_id,
+            reason=reason,
+        )
+        return
+
+    if int(usage.get("dose_count") or 0) >= PH_DOSING_MAX_DOSES_PER_HOUR:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="hourly_dose_limit",
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+            pump_id=pump_id,
+            reason=reason,
+        )
+        return
+
+    total_duration_ms = int(usage.get("total_duration_ms") or 0)
+    if total_duration_ms + PH_DOSING_DURATION_MS > PH_DOSING_MAX_DURATION_MS_PER_HOUR:
+        await log_ph_dosing_blocked(
+            state=state,
+            safety_reason="hourly_duration_limit",
+            current_ph=current_ph,
+            target_ph=target_ph,
+            tolerance=tolerance,
+            target_min=target_min,
+            target_max=target_max,
+            pump_id=pump_id,
+            reason=reason,
+        )
+        return
+
+    await publish_ph_dosing_command(
+        mqtt_client,
+        state=state,
+        pump_id=pump_id,
+        reason=reason,
+        current_ph=current_ph,
+        target_ph=target_ph,
+        tolerance=tolerance,
+        target_min=target_min,
+        target_max=target_max,
+    )
+
+
+async def ph_dosing_controller_worker(mqtt_client: mqtt.Client) -> None:
+    print(
+        "[PH_DOSING] Controller started: "
+        f"interval={PH_DOSING_INTERVAL_SECONDS}s, duration={PH_DOSING_DURATION_MS}ms"
+    )
+
+    while True:
+        try:
+            states = await asyncio.to_thread(get_ph_dosing_controller_states)
+            for state in states:
+                await evaluate_ph_dosing_state(mqtt_client, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[PH_DOSING] Controller error: {exc}")
+
+        await asyncio.sleep(PH_DOSING_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -4216,14 +4636,18 @@ async def lifespan(app: FastAPI):
     aggregation_task = asyncio.create_task(hourly_aggregation_worker())
     predictive_task = asyncio.create_task(predictive_watchdog_worker())
     recommendation_effect_task = asyncio.create_task(recommendation_effect_worker())
+    ph_dosing_task = asyncio.create_task(ph_dosing_controller_worker(mqtt_client))
 
     try:
         yield
     finally:
+        ph_dosing_task.cancel()
         recommendation_effect_task.cancel()
         predictive_task.cancel()
         aggregation_task.cancel()
         watchdog_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ph_dosing_task
         with suppress(asyncio.CancelledError):
             await recommendation_effect_task
         with suppress(asyncio.CancelledError):
@@ -4519,6 +4943,14 @@ def api_upsert_current_ph_target_settings(request: PhTargetSettingsRequest) -> d
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
     except InvalidPhTargetSettingsError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+
+@app.get("/api/ph-dosing/events")
+def api_get_ph_dosing_events(
+    tray_id: str = Query(default="tray_1"),
+    limit: int = Query(default=20, ge=1, le=200),
+) -> list[dict[str, Any]]:
+    return get_recent_ph_dosing_events(tray_id=tray_id, limit=limit)
 
 
 @app.post("/api/cycles/start")
