@@ -41,6 +41,11 @@ const API_BASE_URL =
 const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 const DEFAULT_TRAY_ID = 'tray_1'
+const PH_TARGET_INITIAL_FORM = {
+  targetPh: '',
+  tolerance: '0.1',
+  autodosingEnabled: false,
+}
 
 const FINISH_CYCLE_INITIAL_FORM = {
   harvest_status: 'suitable',
@@ -298,6 +303,10 @@ function formatMetricValue(value, digits) {
   if (value === null || value === undefined) return null
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : null
+}
+
+function formatPhRangeValue(value) {
+  return Number.isFinite(value) ? value.toFixed(1) : null
 }
 
 function getCurrentCycleNorms(currentCycle) {
@@ -833,6 +842,12 @@ export default function App() {
   const [isFinishCycleModalOpen, setIsFinishCycleModalOpen] = useState(false)
   const [finishCycleForm, setFinishCycleForm] = useState(createInitialFinishCycleForm)
   const [finishCycleError, setFinishCycleError] = useState('')
+  const [phTargetForm, setPhTargetForm] = useState(PH_TARGET_INITIAL_FORM)
+  const [phTargetLoading, setPhTargetLoading] = useState(false)
+  const [phTargetSaving, setPhTargetSaving] = useState(false)
+  const [phTargetMessage, setPhTargetMessage] = useState('')
+  const [phTargetError, setPhTargetError] = useState('')
+  const [phTargetConfigured, setPhTargetConfigured] = useState(false)
 
   const pushThought = () => undefined
 
@@ -922,6 +937,40 @@ export default function App() {
     return data
   }
 
+  const applyPhTargetSettings = (settings) => {
+    const isConfigured = Boolean(settings?.is_configured)
+    setPhTargetConfigured(isConfigured)
+    setPhTargetForm({
+      targetPh: settings?.is_configured && settings.target_ph !== null && settings.target_ph !== undefined
+        ? String(settings.target_ph)
+        : '',
+      tolerance: settings?.is_configured && settings.tolerance !== null && settings.tolerance !== undefined
+        ? String(settings.tolerance)
+        : PH_TARGET_INITIAL_FORM.tolerance,
+      autodosingEnabled: Boolean(settings?.autodosing_enabled),
+    })
+  }
+
+  const loadPhTargetSettings = async () => {
+    setPhTargetLoading(true)
+    setPhTargetError('')
+    setPhTargetMessage('')
+    try {
+      const settings = await requestJson(`/api/ph-target-settings/current?tray_id=${DEFAULT_TRAY_ID}`)
+      applyPhTargetSettings(settings)
+      return settings
+    } catch (error) {
+      console.error('Failed to load pH target settings', error)
+      applyPhTargetSettings(null)
+      if (error.status !== 404) {
+        setPhTargetError('Не удалось загрузить целевой pH.')
+      }
+      return null
+    } finally {
+      setPhTargetLoading(false)
+    }
+  }
+
   const loadCrops = async () => {
     setCropsLoading(true)
     setCropsError('')
@@ -980,6 +1029,20 @@ export default function App() {
       isMounted = false
     }
   }, [])
+
+  useEffect(() => {
+    if (!currentCycle) {
+      setPhTargetForm(PH_TARGET_INITIAL_FORM)
+      setPhTargetLoading(false)
+      setPhTargetSaving(false)
+      setPhTargetMessage('')
+      setPhTargetError('')
+      setPhTargetConfigured(false)
+      return
+    }
+
+    loadPhTargetSettings()
+  }, [currentCycle?.id])
 
   useEffect(() => {
     if (!isLedPlaying) return undefined
@@ -1068,6 +1131,37 @@ export default function App() {
     [crops, selectedCropSlug],
   )
 
+  const phTargetRange = useMemo(() => {
+    if (!currentCycle) return null
+    const target = Number(phTargetForm.targetPh)
+    const tolerance = Number(phTargetForm.tolerance)
+    if (
+      !Number.isFinite(target)
+      || target < 3.5
+      || target > 9.0
+      || !Number.isFinite(tolerance)
+      || tolerance < 0.1
+      || tolerance > 0.5
+    ) return null
+    return {
+      min: target - tolerance,
+      max: target + tolerance,
+    }
+  }, [currentCycle, phTargetForm.targetPh, phTargetForm.tolerance])
+
+  const isPhTargetValid = useMemo(() => {
+    const target = Number(phTargetForm.targetPh)
+    const tolerance = Number(phTargetForm.tolerance)
+    return (
+      Number.isFinite(target)
+      && target >= 3.5
+      && target <= 9.0
+      && Number.isFinite(tolerance)
+      && tolerance >= 0.1
+      && tolerance <= 0.5
+    )
+  }, [phTargetForm.targetPh, phTargetForm.tolerance])
+
   const manualDevices = useMemo(
     () => [
       {
@@ -1136,6 +1230,58 @@ export default function App() {
         },
       }))
       pushThought(`Не удалось отправить команду на ${deviceLabel}.`)
+    }
+  }
+
+  const handlePhTargetFieldChange = (field) => (event) => {
+    const value = event.target.value
+    setPhTargetMessage('')
+    setPhTargetError('')
+    setPhTargetForm((prev) => ({
+      ...prev,
+      [field]: value,
+    }))
+  }
+
+  const handleSavePhTarget = async () => {
+    if (!currentCycle || phTargetSaving) return
+
+    const target = Number(phTargetForm.targetPh)
+    const tolerance = Number(phTargetForm.tolerance)
+    if (
+      !Number.isFinite(target)
+      || target < 3.5
+      || target > 9.0
+      || !Number.isFinite(tolerance)
+      || tolerance < 0.1
+      || tolerance > 0.5
+    ) {
+      setPhTargetMessage('')
+      setPhTargetError('Проверьте целевой pH и допуск.')
+      return
+    }
+
+    setPhTargetSaving(true)
+    setPhTargetMessage('')
+    setPhTargetError('')
+    try {
+      const settings = await requestJson('/api/ph-target-settings/current', {
+        method: 'PUT',
+        body: JSON.stringify({
+          tray_id: DEFAULT_TRAY_ID,
+          target_ph: target,
+          tolerance,
+          autodosing_enabled: true,
+          source: 'manual',
+        }),
+      })
+      applyPhTargetSettings(settings)
+      setPhTargetMessage('Целевой pH сохранён.')
+    } catch (error) {
+      console.error('Failed to save pH target settings', error)
+      setPhTargetError('Не удалось сохранить целевой pH.')
+    } finally {
+      setPhTargetSaving(false)
     }
   }
 
@@ -1533,9 +1679,112 @@ export default function App() {
     </div>
   )
 
+  const renderPhTargetSettings = () => {
+    const isDisabled = !currentCycle || phTargetLoading || phTargetSaving
+    const rangeMin = phTargetRange ? formatPhRangeValue(phTargetRange.min) : null
+    const rangeMax = phTargetRange ? formatPhRangeValue(phTargetRange.max) : null
+    const canSave = Boolean(currentCycle) && isPhTargetValid && !phTargetLoading && !phTargetSaving
+    const subtitle = currentCycle
+      ? 'Система будет поддерживать это значение в текущем цикле'
+      : 'Запустите цикл, чтобы задать целевой pH'
+    const controlStatus = !currentCycle
+      ? { text: 'pH-контроль: недоступен', className: 'border-white/8 bg-white/[0.035] text-white/42' }
+      : phTargetConfigured
+        ? { text: 'pH-контроль: активен', className: 'border-emerald-300/14 bg-emerald-300/[0.07] text-emerald-300' }
+        : isPhTargetValid
+          ? { text: 'pH-контроль: активен после сохранения', className: 'border-violet-300/16 bg-violet-300/[0.07] text-violet-200' }
+          : { text: 'pH-контроль: не настроен', className: 'border-white/8 bg-white/[0.04] text-white/52' }
+
+    return (
+      <GlassCard
+        padded={false}
+        className={`rounded-[22px] ${
+          currentCycle
+            ? 'border-violet-400/14 bg-violet-500/[0.014] shadow-[0_0_18px_rgba(168,85,247,0.06)]'
+            : 'border-white/8 bg-white/[0.015] opacity-80 shadow-none'
+        }`}
+      >
+        <div className="grid min-w-0 items-end gap-3 p-3 md:grid-cols-2 xl:grid-cols-[210px_150px_140px_150px_230px_auto]">
+          <div className="min-w-0 pb-1">
+            <div className="text-[17px] font-semibold tracking-tight text-white">Целевой pH раствора</div>
+            <p className="mt-0.5 truncate text-[12px] text-white/48">{subtitle}</p>
+          </div>
+
+          <label className="min-w-0">
+            <span className="text-[11px] font-semibold text-white/64">Целевой pH</span>
+            <div className="mt-1 flex h-10 items-center rounded-[12px] border border-white/10 bg-white/[0.04] px-3 focus-within:border-violet-300/35">
+              <input
+                type="number"
+                min="3.5"
+                max="9"
+                step="0.1"
+                inputMode="decimal"
+                value={phTargetForm.targetPh}
+                onChange={handlePhTargetFieldChange('targetPh')}
+                disabled={isDisabled}
+                placeholder={currentCycle ? '5.9' : ''}
+                className="min-w-0 flex-1 bg-transparent text-[15px] font-semibold text-white outline-none placeholder:text-white/24 disabled:cursor-not-allowed"
+              />
+              <span className="ml-2 shrink-0 text-xs text-white/38">pH</span>
+            </div>
+          </label>
+
+          <label className="min-w-0">
+            <span className="text-[11px] font-semibold text-white/64">Допуск ±</span>
+            <div className="mt-1 flex h-10 items-center rounded-[12px] border border-white/10 bg-white/[0.04] px-3 focus-within:border-violet-300/35">
+              <input
+                type="number"
+                min="0.1"
+                max="0.5"
+                step="0.1"
+                inputMode="decimal"
+                value={phTargetForm.tolerance}
+                onChange={handlePhTargetFieldChange('tolerance')}
+                disabled={isDisabled}
+                placeholder={currentCycle ? '0.1' : ''}
+                className="min-w-0 flex-1 bg-transparent text-[15px] font-semibold text-white outline-none placeholder:text-white/24 disabled:cursor-not-allowed"
+              />
+              <span className="ml-2 shrink-0 text-xs text-white/38">pH</span>
+            </div>
+          </label>
+
+          <div className="flex h-10 min-w-0 items-center gap-2 rounded-[12px] border border-cyan-300/10 bg-cyan-300/[0.04] px-3">
+            <DropletIcon className="h-4 w-4 shrink-0 text-sky-300" />
+            <div className="min-w-0 text-[12px] leading-tight">
+              <span className="text-white/45">Диапазон: </span>
+              <span className="font-semibold text-emerald-300">
+                {rangeMin !== null && rangeMax !== null ? `${rangeMin}–${rangeMax}` : '—'}
+              </span>
+            </div>
+          </div>
+
+          <div className={`flex h-10 min-w-0 items-center rounded-[12px] border px-3 text-[12px] font-semibold leading-tight ${controlStatus.className}`}>
+            <span className="truncate">{controlStatus.text}</span>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleSavePhTarget}
+            disabled={!canSave}
+            className="h-10 whitespace-nowrap rounded-[12px] border border-violet-200/30 bg-gradient-to-r from-violet-500 to-fuchsia-600 px-4 text-[13px] font-semibold text-white shadow-[0_0_20px_rgba(168,85,247,0.22)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:border-white/8 disabled:bg-none disabled:bg-white/[0.04] disabled:text-white/36 disabled:shadow-none md:col-span-2 xl:col-span-1"
+          >
+            {phTargetSaving ? 'Сохранение...' : 'Сохранить'}
+          </button>
+
+          {phTargetMessage || phTargetError ? (
+            <div className="text-[11px] leading-tight md:col-span-2 xl:col-span-6">
+              {phTargetMessage ? <span className="font-semibold text-emerald-300">{phTargetMessage}</span> : null}
+              {phTargetError ? <span className="font-semibold text-rose-300">{phTargetError}</span> : null}
+            </div>
+          ) : null}
+        </div>
+      </GlassCard>
+    )
+  }
+
   const renderManual = () => (
-    <div className="grid min-w-0 max-w-full gap-4 min-[1700px]:h-full min-[1700px]:min-h-0 min-[1700px]:grid-rows-[auto_minmax(0,1fr)]">
-      <GlassCard className="rounded-[28px]">
+    <div className="custom-scrollbar flex min-w-0 max-w-full flex-col gap-3 min-[1700px]:h-full min-[1700px]:min-h-0 min-[1700px]:overflow-y-auto min-[1700px]:pr-1">
+      <GlassCard className="shrink-0 rounded-[28px]">
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-[22px] font-semibold tracking-tight md:text-[24px]">Устройства</div>
@@ -1561,6 +1810,12 @@ export default function App() {
         </div>
       </GlassCard>
 
+      <div className="shrink-0">
+        {renderPhTargetSettings()}
+      </div>
+
+      <div className="min-h-[300px] shrink-0">
+
       <LedTimeline
         stages={ledStages}
         activeIndex={activeLedStage}
@@ -1572,7 +1827,8 @@ export default function App() {
         compact
       />
     </div>
-  )
+  </div>
+)
 
   return (
     <div className="farm-shell relative min-h-screen overflow-x-hidden px-3 py-3 md:px-4 md:py-4 lg:px-6 lg:py-6 min-[1700px]:h-screen min-[1700px]:overflow-hidden">
