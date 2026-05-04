@@ -25,6 +25,7 @@ from db import (
     GrowingCycleNotFinishedError,
     GrowingCycleNotFoundError,
     InvalidCycleResultError,
+    InvalidPhTargetSettingsError,
     NoActiveGrowingCycleError,
     aggregate_completed_hours,
     apply_agrotech_revision_proposal,
@@ -39,6 +40,7 @@ from db import (
     get_available_crops,
     get_cycle_advisor_reports,
     get_current_growing_cycle,
+    get_current_ph_target_settings,
     get_cycle_result,
     get_crop_agrotech_card_from_db,
     get_crop_learning_history,
@@ -77,6 +79,7 @@ from db import (
     save_telemetry,
     start_growing_cycle,
     update_device_status,
+    upsert_current_ph_target_settings,
 )
 from tools import get_current_metrics
 
@@ -4261,6 +4264,14 @@ class StartGrowingCycleRequest(BaseModel):
     notes: str | None = None
 
 
+class PhTargetSettingsRequest(BaseModel):
+    tray_id: str = "tray_1"
+    target_ph: float
+    tolerance: float
+    autodosing_enabled: bool = False
+    source: str = "manual"
+
+
 class EndGrowingCycleRequest(BaseModel):
     tray_id: str = "tray_1"
     notes: str | None = None
@@ -4482,6 +4493,32 @@ def api_get_current_growing_cycle_health(
     tray_id: str = Query(default="tray_1"),
 ) -> dict[str, Any]:
     return build_current_cycle_health(tray_id)
+
+
+@app.get("/api/ph-target-settings/current")
+def api_get_current_ph_target_settings(
+    tray_id: str = Query(default="tray_1"),
+) -> dict[str, Any]:
+    try:
+        return get_current_ph_target_settings(tray_id)
+    except NoActiveGrowingCycleError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+
+@app.put("/api/ph-target-settings/current")
+def api_upsert_current_ph_target_settings(request: PhTargetSettingsRequest) -> dict[str, Any]:
+    try:
+        return upsert_current_ph_target_settings(
+            tray_id=request.tray_id,
+            target_ph=request.target_ph,
+            tolerance=request.tolerance,
+            autodosing_enabled=request.autodosing_enabled,
+            source=request.source,
+        )
+    except NoActiveGrowingCycleError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except InvalidPhTargetSettingsError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
 
 @app.post("/api/cycles/start")

@@ -111,6 +111,11 @@ VALID_PROBLEM_PHASES = {
 }
 VALID_FOLLOWED_AI_ADVICE = {"yes", "partial", "no", "no_advice", "unknown"}
 VALID_AI_ADVICE_HELPFULNESS = {"yes", "partial", "no", "worse", "unknown"}
+VALID_PH_TARGET_SOURCES = {
+    "manual",
+    "agrotech_card_default",
+    "ai_suggested_user_confirmed",
+}
 RECOMMENDATION_EFFECT_INTERPRETATION_NOTE = (
     "Изменение метрики наблюдалось после рекомендации, но причинно-следственная связь не доказана."
 )
@@ -145,6 +150,10 @@ class GrowingCycleNotFinishedError(ValueError):
 
 
 class InvalidCycleResultError(ValueError):
+    pass
+
+
+class InvalidPhTargetSettingsError(ValueError):
     pass
 
 
@@ -1796,6 +1805,234 @@ def get_current_cycle_id_for_tray(tray_id: str = DEFAULT_TRAY_ID) -> int | None:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             return get_active_cycle_id_for_tray(cursor, tray_id)
+
+
+def ensure_ph_target_settings_schema(cursor) -> None:
+    ensure_growing_cycles_schema(cursor)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ph_target_settings (
+            id BIGSERIAL PRIMARY KEY,
+            tray_id TEXT NOT NULL,
+            cycle_id BIGINT NOT NULL,
+            target_ph DOUBLE PRECISION NOT NULL,
+            tolerance DOUBLE PRECISION NOT NULL,
+            autodosing_enabled BOOLEAN NOT NULL DEFAULT false,
+            source TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS tray_id TEXT")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS cycle_id BIGINT")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS target_ph DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS tolerance DOUBLE PRECISION")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS autodosing_enabled BOOLEAN")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS source TEXT")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+    cursor.execute("ALTER TABLE ph_target_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ")
+    cursor.execute("UPDATE ph_target_settings SET autodosing_enabled = false WHERE autodosing_enabled IS NULL")
+    cursor.execute("UPDATE ph_target_settings SET created_at = now() WHERE created_at IS NULL")
+    cursor.execute("UPDATE ph_target_settings SET updated_at = now() WHERE updated_at IS NULL")
+    cursor.execute("ALTER TABLE ph_target_settings ALTER COLUMN autodosing_enabled SET DEFAULT false")
+    cursor.execute("ALTER TABLE ph_target_settings ALTER COLUMN created_at SET DEFAULT now()")
+    cursor.execute("ALTER TABLE ph_target_settings ALTER COLUMN updated_at SET DEFAULT now()")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ph_target_settings_cycle_tray
+        ON ph_target_settings(cycle_id, tray_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ph_target_settings_tray_updated
+        ON ph_target_settings(tray_id, updated_at DESC)
+        """
+    )
+    if not constraint_exists(cursor, "ph_target_settings", "chk_ph_target_settings_source"):
+        cursor.execute(
+            """
+            ALTER TABLE ph_target_settings
+            ADD CONSTRAINT chk_ph_target_settings_source
+            CHECK (source IN ('manual', 'agrotech_card_default', 'ai_suggested_user_confirmed'))
+            """
+        )
+    add_foreign_key_if_missing(
+        cursor,
+        "ph_target_settings",
+        "fk_ph_target_settings_tray_id_trays",
+        "tray_id",
+        "trays",
+        "id",
+    )
+    add_foreign_key_if_missing(
+        cursor,
+        "ph_target_settings",
+        "fk_ph_target_settings_cycle_id_growing_cycles",
+        "cycle_id",
+        "growing_cycles",
+        "id",
+    )
+
+
+def validate_ph_target_settings_payload(
+    target_ph: Any,
+    tolerance: Any,
+    autodosing_enabled: Any,
+    source: Any,
+) -> tuple[float, float, bool, str]:
+    if isinstance(target_ph, bool):
+        raise InvalidPhTargetSettingsError("target_ph must be a number from 3.5 to 9.0")
+    try:
+        target_ph_value = float(target_ph)
+    except (TypeError, ValueError) as exc:
+        raise InvalidPhTargetSettingsError("target_ph must be a number from 3.5 to 9.0") from exc
+    if target_ph_value < 3.5 or target_ph_value > 9.0:
+        raise InvalidPhTargetSettingsError("target_ph must be between 3.5 and 9.0")
+
+    if isinstance(tolerance, bool):
+        raise InvalidPhTargetSettingsError("tolerance must be a number from 0.05 to 1.0")
+    try:
+        tolerance_value = float(tolerance)
+    except (TypeError, ValueError) as exc:
+        raise InvalidPhTargetSettingsError("tolerance must be a number from 0.05 to 1.0") from exc
+    if tolerance_value < 0.05 or tolerance_value > 1.0:
+        raise InvalidPhTargetSettingsError("tolerance must be between 0.05 and 1.0")
+
+    if not isinstance(autodosing_enabled, bool):
+        raise InvalidPhTargetSettingsError("autodosing_enabled must be boolean")
+
+    source_value = str(source or "").strip()
+    if source_value not in VALID_PH_TARGET_SOURCES:
+        allowed = ", ".join(sorted(VALID_PH_TARGET_SOURCES))
+        raise InvalidPhTargetSettingsError(f"source must be one of: {allowed}")
+
+    return target_ph_value, tolerance_value, autodosing_enabled, source_value
+
+
+def row_to_ph_target_settings(
+    cycle_row: dict[str, Any],
+    settings_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    target_ph = settings_row["target_ph"] if settings_row else None
+    tolerance = settings_row["tolerance"] if settings_row else None
+    target_min = round(target_ph - tolerance, 3) if target_ph is not None and tolerance is not None else None
+    target_max = round(target_ph + tolerance, 3) if target_ph is not None and tolerance is not None else None
+    return {
+        "tray_id": cycle_row["tray_id"],
+        "cycle_id": cycle_row["id"],
+        "crop_slug": cycle_row["crop_slug"],
+        "crop_name_ru": cycle_row["crop_name_ru"],
+        "target_ph": target_ph,
+        "tolerance": tolerance,
+        "target_min": target_min,
+        "target_max": target_max,
+        "autodosing_enabled": bool(settings_row["autodosing_enabled"]) if settings_row else False,
+        "source": settings_row["source"] if settings_row else None,
+        "is_configured": settings_row is not None,
+        "created_at": format_timestamp(settings_row["created_at"]) if settings_row else None,
+        "updated_at": format_timestamp(settings_row["updated_at"]) if settings_row else None,
+    }
+
+
+def get_current_ph_target_settings(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_target_settings_schema(cursor)
+            cycle_row = _get_current_growing_cycle(cursor, normalized_tray_id)
+            if cycle_row is None:
+                raise NoActiveGrowingCycleError(
+                    f"Active growing cycle is not running for tray '{normalized_tray_id}'"
+                )
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    tray_id,
+                    cycle_id,
+                    target_ph,
+                    tolerance,
+                    autodosing_enabled,
+                    source,
+                    created_at,
+                    updated_at
+                FROM ph_target_settings
+                WHERE cycle_id = %s
+                  AND tray_id = %s
+                LIMIT 1
+                """,
+                (cycle_row["id"], normalized_tray_id),
+            )
+            return row_to_ph_target_settings(cycle_row, cursor.fetchone())
+
+
+def upsert_current_ph_target_settings(
+    tray_id: str = DEFAULT_TRAY_ID,
+    target_ph: Any = None,
+    tolerance: Any = None,
+    autodosing_enabled: Any = False,
+    source: Any = "manual",
+) -> dict[str, Any]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    target_ph_value, tolerance_value, autodosing_value, source_value = validate_ph_target_settings_payload(
+        target_ph,
+        tolerance,
+        autodosing_enabled,
+        source,
+    )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_target_settings_schema(cursor)
+            cycle_row = _get_current_growing_cycle(cursor, normalized_tray_id)
+            if cycle_row is None:
+                raise NoActiveGrowingCycleError(
+                    f"Active growing cycle is not running for tray '{normalized_tray_id}'"
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO ph_target_settings (
+                    tray_id,
+                    cycle_id,
+                    target_ph,
+                    tolerance,
+                    autodosing_enabled,
+                    source,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (cycle_id, tray_id) DO UPDATE SET
+                    target_ph = EXCLUDED.target_ph,
+                    tolerance = EXCLUDED.tolerance,
+                    autodosing_enabled = EXCLUDED.autodosing_enabled,
+                    source = EXCLUDED.source,
+                    updated_at = now()
+                RETURNING
+                    id,
+                    tray_id,
+                    cycle_id,
+                    target_ph,
+                    tolerance,
+                    autodosing_enabled,
+                    source,
+                    created_at,
+                    updated_at
+                """,
+                (
+                    normalized_tray_id,
+                    cycle_row["id"],
+                    target_ph_value,
+                    tolerance_value,
+                    autodosing_value,
+                    source_value,
+                ),
+            )
+            return row_to_ph_target_settings(cycle_row, cursor.fetchone())
 
 
 def ensure_anomaly_event_refs_schema(cursor) -> None:
@@ -5366,6 +5603,7 @@ def init_db() -> None:
             backfill_card_sections(cursor)
             drop_agrotech_legacy_columns(cursor)
             ensure_growing_cycles_schema(cursor)
+            ensure_ph_target_settings_schema(cursor)
             ensure_anomaly_event_refs_schema(cursor)
             backfill_anomaly_event_refs(cursor)
             drop_anomaly_legacy_columns(cursor)
