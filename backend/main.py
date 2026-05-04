@@ -168,6 +168,38 @@ WATCHDOG_METRIC_CONFIG = {
         "high_event_type": "ec_high",
     },
 }
+HEALTH_METRIC_CONFIG = {
+    "air_temp": {
+        "label": "Температура воздуха",
+        "unit": "°C",
+        "sensor_type": "climate",
+        "critical_delta": 5.0,
+    },
+    "humidity": {
+        "label": "Влажность",
+        "unit": "%",
+        "sensor_type": "climate",
+        "critical_delta": 20.0,
+    },
+    "water_temp": {
+        "label": "Температура воды",
+        "unit": "°C",
+        "sensor_type": "water",
+        "critical_delta": 5.0,
+    },
+    "ph": {
+        "label": "pH",
+        "unit": None,
+        "sensor_type": "water",
+        "critical_delta": 0.5,
+    },
+    "ec": {
+        "label": "EC",
+        "unit": "mS/cm",
+        "sensor_type": "water",
+        "critical_delta": 0.4,
+    },
+}
 PREDICTIVE_METRIC_CONFIG = {
     "air_temp": {
         "sensor_type": "climate",
@@ -715,8 +747,271 @@ def sensor_record_age_seconds(record: dict[str, Any] | None) -> float | None:
     if not isinstance(recorded_at, datetime):
         return None
 
-    now = datetime.now(recorded_at.tzinfo) if recorded_at.tzinfo else datetime.now()
+    if recorded_at.tzinfo is not None and recorded_at.utcoffset() is not None:
+        now = datetime.now(recorded_at.tzinfo)
+    else:
+        now = datetime.now()
     return max(0.0, (now - recorded_at).total_seconds())
+
+
+def health_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool) or isinstance(value, str):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def health_timestamp(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def health_latest_record(records: list[dict[str, Any]], tray_id: str) -> dict[str, Any] | None:
+    tray_records = [
+        record
+        for record in records
+        if get_record_tray_id(record) in {tray_id, "unknown"}
+    ]
+    if not tray_records:
+        return None
+    return sorted_watchdog_records(tray_records)[-1]
+
+
+def health_latest_metric_value(
+    records: list[dict[str, Any]],
+    tray_id: str,
+    metric_key: str,
+) -> tuple[float | None, str | None]:
+    for record in reversed(sorted_watchdog_records(records)):
+        if get_record_tray_id(record) not in {tray_id, "unknown"}:
+            continue
+        payload = record.get("parsed_payload")
+        if not isinstance(payload, dict):
+            continue
+        raw_value = payload.get(metric_key)
+        if metric_key == "ph":
+            raw_value = payload.get("ph", payload.get("pH"))
+        elif metric_key == "ec":
+            raw_value = payload.get("ec", payload.get("EC"))
+        value = health_number(raw_value)
+        if value is not None:
+            return value, health_timestamp(record.get("recorded_at") or record.get("timestamp"))
+    return None, None
+
+
+def health_norm_range(norms: Any, metric_key: str) -> dict[str, float | None] | None:
+    if not isinstance(norms, dict):
+        return None
+    raw_norm = norms.get(metric_key)
+    if not isinstance(raw_norm, dict):
+        return None
+    min_value = health_number(raw_norm.get("min"))
+    max_value = health_number(raw_norm.get("max"))
+    if min_value is None or max_value is None or min_value > max_value:
+        return None
+    return {"min": min_value, "max": max_value}
+
+
+def health_metric_message(
+    label: str,
+    status: str,
+    direction: Literal["low", "high"] | None = None,
+) -> str:
+    if status == "normal":
+        return f"{label} в норме"
+    if status == "missing":
+        return f"{label}: нет данных"
+    if status == "stale":
+        return f"{label}: данные устарели"
+    if status == "no_norm":
+        return f"{label}: нет числовой нормы"
+    if direction == "low":
+        return f"{label} ниже нормы"
+    if direction == "high":
+        return f"{label} выше нормы"
+    return f"{label}: есть отклонение"
+
+
+def evaluate_health_metric(
+    *,
+    metric_key: str,
+    value: float | None,
+    norm: dict[str, float | None] | None,
+    group_is_stale: bool,
+    updated_at: str | None,
+) -> dict[str, Any]:
+    config = HEALTH_METRIC_CONFIG[metric_key]
+    label = str(config["label"])
+
+    if group_is_stale:
+        status = "stale"
+        message = health_metric_message(label, status)
+    elif value is None:
+        status = "missing"
+        message = health_metric_message(label, status)
+    elif norm is None:
+        status = "no_norm"
+        message = health_metric_message(label, status)
+    else:
+        min_norm = norm.get("min")
+        max_norm = norm.get("max")
+        direction: Literal["low", "high"] | None = None
+        delta = 0.0
+        if min_norm is not None and value < min_norm:
+            direction = "low"
+            delta = min_norm - value
+        elif max_norm is not None and value > max_norm:
+            direction = "high"
+            delta = value - max_norm
+
+        if direction is None:
+            status = "normal"
+        elif delta > float(config["critical_delta"]):
+            status = "critical"
+        else:
+            status = "warning"
+        message = health_metric_message(label, status, direction)
+
+    result = {
+        "key": metric_key,
+        "label": label,
+        "value": value,
+        "unit": config["unit"],
+        "norm": norm,
+        "status": status,
+        "message": message,
+    }
+    if updated_at is not None:
+        result["updated_at"] = updated_at
+    return result
+
+
+def build_health_summary(status: str, warnings: list[str], critical: list[str], unknowns: list[str]) -> str:
+    if status == "normal":
+        return "Все доступные показатели свежие и находятся в пределах норм активной АгроТехКарты."
+    if status == "critical":
+        return f"{critical[0]}. Требуется проверка показателей." if critical else "Есть критические отклонения."
+    if status == "unknown":
+        return f"{unknowns[0]}. Невозможно честно оценить текущее состояние." if unknowns else "Недостаточно данных для оценки состояния."
+    if warnings:
+        return f"{warnings[0]}. Остальные доступные показатели без критических отклонений."
+    return "Есть отклонения от норм активной АгроТехКарты."
+
+
+def build_current_cycle_health(tray_id: str = "tray_1") -> dict[str, Any]:
+    cycle = get_current_growing_cycle(tray_id)
+    checked_at = datetime.now().astimezone().isoformat()
+
+    if cycle is None:
+        return {
+            "tray_id": tray_id,
+            "status": "unknown",
+            "status_label": "цикл не запущен",
+            "summary": "Активный цикл выращивания не запущен.",
+            "checked_at": checked_at,
+            "metrics": {},
+            "missing_metrics": [],
+            "stale_metrics": [],
+            "warnings": [],
+            "critical": [],
+        }
+
+    climate_records = get_last_climate_records(30)
+    water_records = get_last_water_records(30)
+    climate_latest = health_latest_record(climate_records, tray_id)
+    water_latest = health_latest_record(water_records, tray_id)
+    climate_age = sensor_record_age_seconds(climate_latest)
+    water_age = sensor_record_age_seconds(water_latest)
+    group_status = {
+        "climate": {
+            "records": climate_records,
+            "updated_at": health_timestamp(
+                climate_latest.get("recorded_at") if climate_latest else None
+            ),
+            "is_stale": climate_latest is None or climate_age is None or climate_age > SENSOR_STALE_SECONDS,
+        },
+        "water": {
+            "records": water_records,
+            "updated_at": health_timestamp(
+                water_latest.get("recorded_at") if water_latest else None
+            ),
+            "is_stale": water_latest is None or water_age is None or water_age > SENSOR_STALE_SECONDS,
+        },
+    }
+
+    metrics: dict[str, Any] = {}
+    missing_metrics: list[str] = []
+    stale_metrics: list[str] = []
+    warnings: list[str] = []
+    critical: list[str] = []
+    unknowns: list[str] = []
+    norms = cycle.get("norms") if isinstance(cycle.get("norms"), dict) else {}
+
+    for metric_key, config in HEALTH_METRIC_CONFIG.items():
+        sensor_type = str(config["sensor_type"])
+        records = group_status[sensor_type]["records"]
+        value, metric_updated_at = health_latest_metric_value(records, tray_id, metric_key)
+        updated_at = metric_updated_at or group_status[sensor_type]["updated_at"]
+        metric = evaluate_health_metric(
+            metric_key=metric_key,
+            value=value,
+            norm=health_norm_range(norms, metric_key),
+            group_is_stale=bool(group_status[sensor_type]["is_stale"]),
+            updated_at=updated_at,
+        )
+        metrics[metric_key] = metric
+
+        metric_status = metric["status"]
+        if metric_status == "missing":
+            missing_metrics.append(metric_key)
+            unknowns.append(metric["message"])
+        elif metric_status == "stale":
+            stale_metrics.append(metric_key)
+            unknowns.append(metric["message"])
+        elif metric_status == "no_norm":
+            unknowns.append(metric["message"])
+        elif metric_status == "warning":
+            warnings.append(metric["message"])
+        elif metric_status == "critical":
+            critical.append(metric["message"])
+
+    if critical:
+        status = "critical"
+        status_label = "критическое отклонение"
+    elif unknowns:
+        status = "unknown"
+        status_label = "недостаточно данных"
+    elif warnings:
+        status = "warning"
+        status_label = "есть отклонения"
+    else:
+        status = "normal"
+        status_label = "в норме"
+
+    return {
+        "tray_id": cycle.get("tray_id") or tray_id,
+        "cycle_id": cycle.get("id"),
+        "crop_slug": cycle.get("crop_slug"),
+        "crop_name_ru": cycle.get("crop_name_ru"),
+        "card_revision_id": cycle.get("card_revision_id"),
+        "version_label": cycle.get("version_label"),
+        "status": status,
+        "status_label": status_label,
+        "summary": build_health_summary(status, warnings, critical, unknowns),
+        "checked_at": checked_at,
+        "metrics": metrics,
+        "missing_metrics": missing_metrics,
+        "stale_metrics": stale_metrics,
+        "warnings": warnings,
+        "critical": critical,
+    }
 
 
 def append_stale_sensor_event(
@@ -2031,10 +2326,18 @@ def build_crop_learning_context_for_ai(crop_slug: str) -> str:
     return "\n".join(lines)
 
 
-def sensor_record_age_seconds(recorded_at: Any) -> int | None:
+def sensor_record_age_seconds(record_or_recorded_at: Any) -> int | None:
+    if isinstance(record_or_recorded_at, dict):
+        recorded_at = record_or_recorded_at.get("recorded_at")
+    else:
+        recorded_at = record_or_recorded_at
     if not isinstance(recorded_at, datetime):
         return None
-    now = datetime.now(recorded_at.tzinfo) if recorded_at.tzinfo else datetime.now()
+
+    if recorded_at.tzinfo is not None and recorded_at.utcoffset() is not None:
+        now = datetime.now(recorded_at.tzinfo)
+    else:
+        now = datetime.now()
     return max(0, int((now - recorded_at).total_seconds()))
 
 
@@ -4172,6 +4475,13 @@ def api_get_current_growing_cycle(
     tray_id: str = Query(default="tray_1"),
 ) -> dict[str, Any] | None:
     return get_current_growing_cycle(tray_id)
+
+
+@app.get("/api/cycles/current/health")
+def api_get_current_growing_cycle_health(
+    tray_id: str = Query(default="tray_1"),
+) -> dict[str, Any]:
+    return build_current_cycle_health(tray_id)
 
 
 @app.post("/api/cycles/start")
