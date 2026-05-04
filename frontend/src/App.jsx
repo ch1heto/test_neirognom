@@ -300,6 +300,109 @@ function formatMetricValue(value, digits) {
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : null
 }
 
+function getCurrentCycleNorms(currentCycle) {
+  if (!currentCycle || typeof currentCycle !== 'object') return null
+
+  const candidates = [
+    currentCycle.norms,
+    currentCycle.agrotech_card?.norms,
+    currentCycle.agrotechCard?.norms,
+    currentCycle.revision?.norms,
+    currentCycle.active_revision?.norms,
+    currentCycle.activeRevision?.norms,
+    currentCycle.card_revision?.norms,
+    currentCycle.cardRevision?.norms,
+  ]
+
+  return candidates.find((value) => value && typeof value === 'object' && !Array.isArray(value)) || null
+}
+
+function parseNormRange(value) {
+  if (Array.isArray(value) && value.length >= 2) {
+    const min = toNumberOrNull(value[0])
+    const max = toNumberOrNull(value[1])
+    return min !== null && max !== null ? { min, max } : null
+  }
+
+  if (!value || typeof value !== 'object') return null
+
+  const rangeKeys = [
+    ['min', 'max'],
+    ['low', 'high'],
+    ['from', 'to'],
+    ['target_min', 'target_max'],
+    ['optimal_min', 'optimal_max'],
+    ['lower', 'upper'],
+  ]
+
+  for (const [minKey, maxKey] of rangeKeys) {
+    const min = toNumberOrNull(value[minKey])
+    const max = toNumberOrNull(value[maxKey])
+    if (min !== null && max !== null) {
+      return { min, max }
+    }
+  }
+
+  return null
+}
+
+function findNormRange(norms, aliases) {
+  if (!norms || typeof norms !== 'object') return null
+
+  const entriesByLowerKey = Object.fromEntries(
+    Object.entries(norms).map(([key, value]) => [key.toLowerCase(), value]),
+  )
+
+  for (const alias of aliases) {
+    const directValue = norms[alias]
+    const lowerValue = entriesByLowerKey[alias.toLowerCase()]
+    const range = parseNormRange(directValue ?? lowerValue)
+    if (range) return range
+  }
+
+  return null
+}
+
+function formatNumberForNorm(value) {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)))
+}
+
+function formatMetricNorm(currentCycle, norms, aliases, unit) {
+  if (!currentCycle) return 'цикл не запущен'
+
+  const range = findNormRange(norms, aliases)
+  if (!range) return 'норма не задана'
+
+  return `${formatNumberForNorm(range.min)} – ${formatNumberForNorm(range.max)}${unit ? ` ${unit}` : ''}`
+}
+
+function buildMetricNormLabels(currentCycle) {
+  const norms = getCurrentCycleNorms(currentCycle)
+
+  return {
+    waterTemp: formatMetricNorm(
+      currentCycle,
+      norms,
+      ['water_temp', 'waterTemp', 'solution_temperature', 'solutionTemperature'],
+      '°C',
+    ),
+    airHumidity: formatMetricNorm(
+      currentCycle,
+      norms,
+      ['humidity', 'air_humidity', 'airHumidity'],
+      '%',
+    ),
+    airTemp: formatMetricNorm(
+      currentCycle,
+      norms,
+      ['air_temp', 'airTemp', 'temperature'],
+      '°C',
+    ),
+    ph: formatMetricNorm(currentCycle, norms, ['ph', 'pH'], ''),
+    ec: formatMetricNorm(currentCycle, norms, ['ec', 'EC'], 'mS/cm'),
+  }
+}
+
 function buildChatHistory(messages, userMessage) {
   return [...messages, userMessage].map((message) => ({
     role: message.from === 'assistant' ? 'assistant' : 'user',
@@ -904,13 +1007,18 @@ export default function App() {
     }
   }, [isLedPlaying])
 
+  const metricNormLabels = useMemo(
+    () => buildMetricNormLabels(currentCycle),
+    [currentCycle],
+  )
+
   const metricsList = useMemo(
     () => [
       {
         title: 'Температура воды',
         value: formatMetricValue(metrics.waterTemp, 1),
         unit: '°C',
-        norm: '18 – 22 °C',
+        norm: metricNormLabels.waterTemp,
         color: '#2CB4FF',
         values: sparklineSeries.waterTemp,
         icon: <DropletIcon className="h-6 w-6" />,
@@ -919,7 +1027,7 @@ export default function App() {
         title: 'Влажность воздуха',
         value: formatMetricValue(metrics.airHumidity, 1),
         unit: '%',
-        norm: '52 – 60 %',
+        norm: metricNormLabels.airHumidity,
         color: '#71F16A',
         values: sparklineSeries.airHumidity,
         icon: <HumidityIcon className="h-6 w-6" />,
@@ -928,7 +1036,7 @@ export default function App() {
         title: 'Температура воздуха',
         value: formatMetricValue(metrics.airTemp, 1),
         unit: '°C',
-        norm: '20 – 25 °C',
+        norm: metricNormLabels.airTemp,
         color: '#C668FF',
         values: sparklineSeries.airTemp,
         icon: <ThermometerIcon className="h-6 w-6" />,
@@ -937,7 +1045,7 @@ export default function App() {
         title: 'pH',
         value: formatMetricValue(metrics.ph, 1),
         unit: '',
-        norm: '5.8 – 6.5',
+        norm: metricNormLabels.ph,
         color: '#7DD3FC',
         values: sparklineSeries.ph,
         icon: <PhIcon className="h-6 w-6" />,
@@ -946,13 +1054,13 @@ export default function App() {
         title: 'EC',
         value: formatMetricValue(metrics.ec, 2),
         unit: 'mS/cm',
-        norm: '1.2 – 1.6 mS/cm',
+        norm: metricNormLabels.ec,
         color: '#F7C948',
         values: sparklineSeries.ec,
         icon: <EcIcon className="h-6 w-6" />,
       },
     ],
-    [metrics],
+    [metrics, metricNormLabels],
   )
 
   const selectedCrop = useMemo(
@@ -1294,7 +1402,7 @@ export default function App() {
                     Активный цикл
                   </div>
                   <div className="mt-6 max-w-full truncate text-[30px] font-semibold leading-tight text-white">{activeCropName}</div>
-                  <p className="mt-2 text-sm text-white/58">Статус: active / в норме</p>
+                  <p className="mt-2 text-sm text-white/58">Статус: активный цикл</p>
                 </div>
                 <button
                   type="button"
@@ -1339,7 +1447,7 @@ export default function App() {
                     <div className="min-w-0 max-w-full truncate text-[24px] font-semibold leading-tight text-white md:text-[28px]">{activeCropName}</div>
                     {isActive ? (
                       <span className="rounded-full border border-emerald-300/25 bg-emerald-300/10 px-3 py-1 text-sm text-emerald-200">
-                        в норме
+                        активный цикл
                       </span>
                     ) : null}
                   </div>

@@ -4945,6 +4945,7 @@ def row_to_growing_cycle(row: dict[str, Any] | None) -> dict[str, Any] | None:
             row["finished_at"],
             row["status"],
         ),
+        "norms": row.get("norms") or {},
     }
 
 
@@ -5055,7 +5056,13 @@ def get_available_crops() -> list[dict[str, Any]]:
 def get_current_growing_cycle(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any] | None:
     with get_connection() as connection:
         with connection.cursor() as cursor:
-            return row_to_growing_cycle(_get_current_growing_cycle(cursor, tray_id))
+            row = _get_current_growing_cycle(cursor, tray_id)
+            if row is None:
+                return None
+
+            row = dict(row)
+            row["norms"] = get_revision_norms(cursor, row.get("card_revision_id"))
+            return row_to_growing_cycle(row)
 
 
 def get_active_cycle_ai_context(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any] | None:
