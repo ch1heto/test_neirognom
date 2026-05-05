@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ChatPanel from './components/ChatPanel'
 import DeviceCard from './components/DeviceCard'
 import GlassCard from './components/GlassCard'
@@ -12,6 +12,7 @@ import {
   sparklineSeries,
 } from './data/mock'
 import {
+  BrainIcon,
   DropletIcon,
   EcIcon,
   FanIcon,
@@ -46,6 +47,18 @@ const PH_TARGET_INITIAL_FORM = {
   tolerance: '0.1',
   autodosingEnabled: false,
 }
+const LEARNING_STEPS = [
+  { key: 'questionnaire_saved', label: 'Опросник сохранён' },
+  { key: 'telemetry_collected', label: 'Телеметрия собрана' },
+  { key: 'ph_dosing_collected', label: 'События pH-дозирования учтены' },
+  { key: 'alerts_collected', label: 'Алерты EC / pH / температуры учтены' },
+  { key: 'ai_analysis', label: 'AI-анализ выполняется' },
+  { key: 'proposal_created', label: 'Предложение новой АгроТехКарты' },
+  { key: 'new_version_saved', label: 'Новая версия' },
+]
+const LEARNING_STEP_KEYS = LEARNING_STEPS.map((step) => step.key)
+const LEARNING_POLL_INTERVAL_MS = 4000
+const LEARNING_VISUAL_STEP_MS = 750
 
 const FINISH_CYCLE_INITIAL_FORM = {
   harvest_status: 'suitable',
@@ -409,6 +422,56 @@ function buildMetricNormLabels(currentCycle) {
     ),
     ph: formatMetricNorm(currentCycle, norms, ['ph', 'pH'], ''),
     ec: formatMetricNorm(currentCycle, norms, ['ec', 'EC'], 'mS/cm'),
+  }
+}
+
+function getLearningStepIndex(stepKey) {
+  return LEARNING_STEP_KEYS.indexOf(stepKey)
+}
+
+function getVisualLearningStepIndex(status) {
+  if (!status) return -1
+  if (status.status === 'completed') return LEARNING_STEP_KEYS.length
+  const currentIndex = getLearningStepIndex(status.current_step)
+  if (currentIndex >= 0) return currentIndex
+  const completedSteps = Array.isArray(status.completed_steps) ? status.completed_steps : []
+  return completedSteps.reduce((maxIndex, stepKey) => {
+    const stepIndex = getLearningStepIndex(stepKey)
+    return stepIndex > maxIndex ? stepIndex : maxIndex
+  }, -1)
+}
+
+function getLearningTargetStepIndex(status) {
+  if (!status) return -1
+  if (status.status === 'completed') return LEARNING_STEP_KEYS.length
+  const currentIndex = getLearningStepIndex(status.current_step)
+  if (currentIndex >= 0) return currentIndex
+  const completedSteps = Array.isArray(status.completed_steps) ? status.completed_steps : []
+  const maxCompletedIndex = completedSteps.reduce((maxIndex, stepKey) => {
+    const stepIndex = getLearningStepIndex(stepKey)
+    return stepIndex > maxIndex ? stepIndex : maxIndex
+  }, -1)
+  return Math.min(maxCompletedIndex + 1, LEARNING_STEP_KEYS.length - 1)
+}
+
+function buildVisualLearningStatus(baseStatus, currentIndex, statusOverride = 'running') {
+  if (!baseStatus) return null
+  const normalizedIndex = Math.max(0, Math.min(currentIndex, LEARNING_STEP_KEYS.length - 1))
+  return {
+    ...baseStatus,
+    status: statusOverride,
+    current_step: LEARNING_STEP_KEYS[normalizedIndex],
+    completed_steps: LEARNING_STEP_KEYS.slice(0, normalizedIndex),
+  }
+}
+
+function buildFinalVisualLearningStatus(baseStatus) {
+  if (!baseStatus) return null
+  return {
+    ...baseStatus,
+    status: baseStatus.status,
+    current_step: baseStatus.status === 'completed' ? null : baseStatus.current_step,
+    completed_steps: baseStatus.status === 'completed' ? [...LEARNING_STEP_KEYS] : baseStatus.completed_steps || [],
   }
 }
 
@@ -815,6 +878,166 @@ function FinishCycleModal({
   )
 }
 
+function LearningStepMarker({ status, index }) {
+  if (status === 'error') {
+    return (
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-rose-300/55 bg-rose-400/18 text-[11px] font-bold text-rose-100 shadow-[0_0_14px_rgba(251,113,133,0.24)]">
+        !
+      </span>
+    )
+  }
+
+  if (status === 'done') {
+    return (
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-emerald-300/45 bg-emerald-300/18 text-[11px] font-bold text-emerald-200 shadow-[0_0_14px_rgba(52,211,153,0.18)]">
+        ✓
+      </span>
+    )
+  }
+
+  if (status === 'running') {
+    return (
+      <span className="relative flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-indigo-200/70 bg-indigo-500/25 text-[11px] font-bold text-indigo-100 shadow-[0_0_18px_rgba(99,102,241,0.55)]">
+        <span className="absolute inset-[-4px] rounded-full border border-violet-300/25" />
+        {index + 1}
+      </span>
+    )
+  }
+
+  return (
+    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/18 bg-white/[0.025] text-[11px] font-semibold text-white/38">
+      {index + 1}
+    </span>
+  )
+}
+
+function LearningWidget({
+  isOpen,
+  learningStatus,
+  loadError,
+  onToggle,
+  onClose,
+  onExpand,
+}) {
+  const status = loadError ? 'failed' : learningStatus?.status || 'idle'
+  const outcome = learningStatus?.outcome || null
+  const completedSteps = new Set(learningStatus?.completed_steps || [])
+  const currentStep = learningStatus?.current_step
+  const steps = LEARNING_STEPS.map((step) => {
+    const label = step.key === 'new_version_saved' && status === 'completed'
+      ? outcome === 'no_new_revision'
+        ? 'Новая версия не требуется'
+        : 'Новая версия сохранена'
+      : step.label
+    return {
+      ...step,
+      label,
+      status: status === 'completed' || completedSteps.has(step.key)
+        ? 'done'
+        : status === 'failed' && currentStep === step.key
+          ? 'error'
+          : currentStep === step.key
+            ? 'running'
+            : 'pending',
+    }
+  })
+  const isHighlighted = ['running', 'completed'].includes(status)
+  const badge = status === 'completed'
+    ? outcome === 'no_new_revision'
+      ? 'Анализ завершён'
+      : 'Обучение завершено'
+    : status === 'failed'
+      ? 'Ошибка анализа'
+      : status === 'running'
+        ? 'Выполняется'
+        : 'Этапы анализа'
+  const badgeClassName = status === 'completed'
+    ? 'border-emerald-300/20 bg-emerald-300/10 text-emerald-200'
+    : status === 'failed'
+      ? 'border-rose-300/24 bg-rose-400/10 text-rose-100'
+      : status === 'running'
+        ? 'border-indigo-300/24 bg-indigo-400/10 text-indigo-100'
+        : 'border-white/10 bg-white/[0.055] text-white/56'
+  const orbClassName = status === 'completed'
+    ? 'border-emerald-200/45 bg-emerald-400/20 text-emerald-100 shadow-[0_0_24px_rgba(52,211,153,0.34)] hover:bg-emerald-400/28'
+    : status === 'failed'
+      ? 'border-rose-200/40 bg-rose-400/16 text-rose-100 shadow-[0_0_20px_rgba(251,113,133,0.24)] hover:bg-rose-400/22'
+      : isHighlighted
+        ? 'border-indigo-200/55 bg-indigo-500/25 text-indigo-100 shadow-[0_0_24px_rgba(99,102,241,0.45)] hover:bg-indigo-500/32'
+        : 'border-white/10 bg-white/[0.045] text-white/48 shadow-[0_0_18px_rgba(148,163,184,0.08)] hover:border-white/18 hover:text-white/70'
+  const footerText = loadError
+    ? 'Не удалось загрузить статус обучения'
+    : status === 'completed'
+      ? outcome === 'no_new_revision'
+        ? 'Анализ завершён. АгроТехКарта не изменена.'
+        : `Новая версия готова: ${learningStatus?.new_version_label || 'ожидает подтверждения'}`
+      : status === 'failed'
+        ? learningStatus?.error || 'Анализ остановился с ошибкой. Можно выбрать другую культуру или повторить позже.'
+        : status === 'running'
+          ? 'Новый цикл этой культуры будет доступен после завершения анализа.'
+          : 'Обучение станет доступно после завершения цикла.'
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-label="Открыть обучение АгроТехКарты"
+        className={`relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full border transition ${orbClassName}`}
+      >
+        {isHighlighted ? <span className="absolute inset-[-5px] rounded-full border border-violet-300/18" /> : null}
+        <BrainIcon className="relative h-5 w-5" />
+      </button>
+
+      {isOpen ? (
+        <div className="absolute left-2 right-2 top-[64px] z-30 max-w-[calc(100vw-32px)] rounded-[24px] border border-white/10 bg-slate-950/80 p-4 shadow-[0_18px_50px_rgba(0,0,0,0.38),0_0_32px_rgba(99,102,241,0.16)] backdrop-blur-xl sm:left-auto sm:right-4 sm:top-[56px] sm:w-[340px]">
+          <div className="flex min-w-0 items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="truncate text-[15px] font-semibold text-white">Обучение АгроТехКарты</div>
+              <div className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${badgeClassName}`}>
+                {badge}
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                onClick={onExpand}
+                aria-label="Развернуть обучение АгроТехКарты"
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-sm font-semibold text-white/58 transition hover:bg-white/[0.08] hover:text-white"
+              >
+                ↗
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Свернуть обучение АгроТехКарты"
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-sm font-semibold text-white/58 transition hover:bg-white/[0.08] hover:text-white"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-2.5">
+            {steps.map((step, index) => (
+              <div key={step.key} className="flex min-w-0 items-center gap-2.5">
+                <LearningStepMarker status={step.status} index={index} />
+                <span className={`min-w-0 flex-1 text-[12px] leading-snug ${step.status === 'pending' ? 'text-white/46' : step.status === 'error' ? 'text-rose-100' : 'text-white/82'}`}>
+                  {step.label}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 rounded-[16px] border border-white/8 bg-white/[0.035] px-3 py-2.5 text-[11px] leading-snug text-white/52">
+            {footerText}
+          </div>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 export default function App() {
   const [mode, setMode] = useState('monitoring')
   const [metrics, setMetrics] = useState(initialMetrics)
@@ -837,6 +1060,14 @@ export default function App() {
   const [cropsLoading, setCropsLoading] = useState(true)
   const [cropsError, setCropsError] = useState('')
   const [currentCycle, setCurrentCycle] = useState(null)
+  const [lastFinishedCycle, setLastFinishedCycle] = useState(null)
+  const [learningStatus, setLearningStatus] = useState(null)
+  const [learningTargetStatus, setLearningTargetStatus] = useState(null)
+  const [visualLearningStatus, setVisualLearningStatus] = useState(null)
+  const [learningStatusError, setLearningStatusError] = useState('')
+  const [learningWidgetOpen, setLearningWidgetOpen] = useState(false)
+  const [learningModalOpen, setLearningModalOpen] = useState(false)
+  const learningVisualTimerRef = useRef(null)
   const [isCycleLoading, setIsCycleLoading] = useState(false)
   const [cycleError, setCycleError] = useState('')
   const [isFinishCycleModalOpen, setIsFinishCycleModalOpen] = useState(false)
@@ -971,6 +1202,38 @@ export default function App() {
     }
   }
 
+  const loadLearningStatus = useCallback(async (cycleId) => {
+    if (!cycleId) return null
+    try {
+      const status = await requestJson(`/api/cycles/${cycleId}/learning-status`)
+      setLearningStatus(status)
+      setLearningTargetStatus(status)
+      setLearningStatusError('')
+      return status
+    } catch (error) {
+      console.error('Failed to load learning status', error)
+      setLearningStatusError('Не удалось загрузить статус обучения')
+      return null
+    }
+  }, [])
+
+  const triggerLearningPipeline = (cycleId) => {
+    if (!cycleId) return
+    void requestJson(`/api/cycles/${cycleId}/learning-pipeline`, {
+      method: 'POST',
+    })
+      .then((pipelineResult) => {
+        if (pipelineResult?.status === 'failed') {
+          setLearningStatusError('Не удалось запустить анализ обучения')
+        }
+        void loadLearningStatus(cycleId)
+      })
+      .catch((error) => {
+        console.error('Failed to trigger learning pipeline', error)
+        setLearningStatusError('Не удалось запустить анализ обучения')
+      })
+  }
+
   const loadCrops = async () => {
     setCropsLoading(true)
     setCropsError('')
@@ -1043,6 +1306,100 @@ export default function App() {
 
     loadPhTargetSettings()
   }, [currentCycle?.id])
+
+  useEffect(() => {
+    const cycleId = lastFinishedCycle?.id
+    if (!cycleId) {
+      setLearningStatus(null)
+      setLearningTargetStatus(null)
+      setVisualLearningStatus(null)
+      setLearningStatusError('')
+      return undefined
+    }
+
+    let isMounted = true
+    const pollLearningStatus = async () => {
+      const status = await loadLearningStatus(cycleId)
+      if (!isMounted) return null
+      return status
+    }
+
+    void pollLearningStatus()
+
+    if (['completed', 'failed'].includes(learningStatus?.status)) {
+      return () => {
+        isMounted = false
+      }
+    }
+
+    const learningPoller = setInterval(() => {
+      void pollLearningStatus()
+    }, LEARNING_POLL_INTERVAL_MS)
+
+    return () => {
+      isMounted = false
+      clearInterval(learningPoller)
+    }
+  }, [lastFinishedCycle?.id, learningStatus?.status, loadLearningStatus])
+
+  useEffect(() => {
+    if (learningVisualTimerRef.current) {
+      clearTimeout(learningVisualTimerRef.current)
+      learningVisualTimerRef.current = null
+    }
+
+    if (!lastFinishedCycle?.id || !learningTargetStatus) {
+      return undefined
+    }
+
+    const visualIndex = getVisualLearningStepIndex(visualLearningStatus)
+    const targetIndex = getLearningTargetStepIndex(learningTargetStatus)
+    const lastStepIndex = LEARNING_STEP_KEYS.length - 1
+
+    const scheduleVisualUpdate = (nextStatus) => {
+      learningVisualTimerRef.current = setTimeout(() => {
+        setVisualLearningStatus(nextStatus)
+        learningVisualTimerRef.current = null
+      }, LEARNING_VISUAL_STEP_MS)
+    }
+
+    if (!visualLearningStatus) {
+      setVisualLearningStatus(buildVisualLearningStatus(learningTargetStatus, 0))
+      return undefined
+    }
+
+    if (learningTargetStatus.status === 'completed') {
+      if (visualIndex < lastStepIndex) {
+        scheduleVisualUpdate(buildVisualLearningStatus(learningTargetStatus, visualIndex + 1))
+      } else if (visualLearningStatus.status !== 'completed') {
+        scheduleVisualUpdate(buildFinalVisualLearningStatus(learningTargetStatus))
+      }
+    } else if (learningTargetStatus.status === 'failed') {
+      const failedIndex = targetIndex >= 0 ? targetIndex : 0
+      if (visualIndex < failedIndex) {
+        scheduleVisualUpdate(buildVisualLearningStatus(learningTargetStatus, visualIndex + 1))
+      } else if (visualLearningStatus.status !== 'failed') {
+        scheduleVisualUpdate(buildVisualLearningStatus(learningTargetStatus, failedIndex, 'failed'))
+      }
+    } else if (learningTargetStatus.status === 'running') {
+      if (visualIndex < targetIndex) {
+        scheduleVisualUpdate(buildVisualLearningStatus(learningTargetStatus, visualIndex + 1))
+      }
+    } else if (learningTargetStatus.status === 'idle' && visualLearningStatus.status !== 'idle') {
+      setVisualLearningStatus(learningTargetStatus)
+    }
+
+    return () => {
+      if (learningVisualTimerRef.current) {
+        clearTimeout(learningVisualTimerRef.current)
+        learningVisualTimerRef.current = null
+      }
+    }
+  }, [
+    lastFinishedCycle?.id,
+    learningTargetStatus,
+    visualLearningStatus,
+  ])
 
   useEffect(() => {
     if (!isLedPlaying) return undefined
@@ -1129,6 +1486,13 @@ export default function App() {
   const selectedCrop = useMemo(
     () => crops.find((crop) => crop.slug === selectedCropSlug) || crops[0] || null,
     [crops, selectedCropSlug],
+  )
+  const currentLearningStatus = learningStatus?.status || (lastFinishedCycle ? 'running' : 'idle')
+  const isSelectedCropLearningBlocked = Boolean(
+    lastFinishedCycle &&
+    selectedCropSlug &&
+    selectedCropSlug === lastFinishedCycle.crop_slug &&
+    !['completed', 'failed'].includes(currentLearningStatus),
   )
 
   const phTargetRange = useMemo(() => {
@@ -1299,6 +1663,10 @@ export default function App() {
       setCycleError('Выберите культуру из базы данных перед стартом цикла.')
       return
     }
+    if (isSelectedCropLearningBlocked) {
+      setCycleError('Для этой культуры ещё обновляется АгроТехКарта после предыдущего цикла.')
+      return
+    }
 
     setIsCycleLoading(true)
     setCycleError('')
@@ -1364,7 +1732,7 @@ export default function App() {
     setCycleError('')
     setFinishCycleError('')
     try {
-      await requestJson('/api/cycles/end', {
+      const finished = await requestJson('/api/cycles/end', {
         method: 'POST',
         body: JSON.stringify({
           tray_id: currentCycle.tray_id || DEFAULT_TRAY_ID,
@@ -1383,7 +1751,33 @@ export default function App() {
       })
       setIsFinishCycleModalOpen(false)
       setFinishCycleForm(createInitialFinishCycleForm())
+      const finishedCycle = finished?.cycle || currentCycle
+      setLastFinishedCycle(finishedCycle)
+      const initialLearningStatus = {
+        cycle_id: finishedCycle?.id,
+        tray_id: finishedCycle?.tray_id || DEFAULT_TRAY_ID,
+        crop_slug: finishedCycle?.crop_slug,
+        crop_name_ru: finishedCycle?.crop_name_ru,
+        status: 'running',
+        current_step: 'questionnaire_saved',
+        completed_steps: [],
+        old_version_label: finishedCycle?.version_label || null,
+        new_version_label: null,
+        proposal_id: null,
+        outcome: null,
+        message: null,
+        started_at: new Date().toISOString(),
+        finished_at: null,
+        error: null,
+      }
+      setLearningStatus(initialLearningStatus)
+      setLearningTargetStatus(initialLearningStatus)
+      setVisualLearningStatus(initialLearningStatus)
+      setLearningStatusError('')
+      setLearningWidgetOpen(true)
       setCurrentCycle(null)
+      triggerLearningPipeline(finishedCycle?.id)
+      void loadLearningStatus(finishedCycle?.id)
       await loadCurrentCycle()
       pushThought('Цикл выращивания завершён. Итоговый опросник сохранён.')
     } catch (error) {
@@ -1483,7 +1877,7 @@ export default function App() {
     const activeVersion = currentCycle?.version_label || selectedCrop?.version_label || 'v1.0'
     const isActive = Boolean(currentCycle)
     const previewVisual = getCropVisual(currentCycle?.crop_slug || selectedCrop?.slug)
-    const canStartCycle = !isCycleLoading && !cropsLoading && !cropsError && Boolean(selectedCropSlug) && Boolean(selectedCrop)
+    const canStartCycle = !isCycleLoading && !cropsLoading && !cropsError && Boolean(selectedCropSlug) && Boolean(selectedCrop) && !isSelectedCropLearningBlocked
 
     return (
       <GlassCard className="flex min-h-0 max-w-full flex-col rounded-[28px] min-[1700px]:h-full min-[1700px]:overflow-hidden">
@@ -1561,13 +1955,23 @@ export default function App() {
             </div>
           )}
 
-          <div className="min-w-0 max-w-full rounded-[26px] border border-white/8 bg-white/[0.035] p-4 sm:p-5">
+          <div className="relative min-w-0 max-w-full overflow-visible rounded-[26px] border border-white/8 bg-white/[0.035] p-4 sm:p-5">
             <div className="flex min-h-[260px] flex-col min-[1700px]:h-full min-[1700px]:min-h-0">
-              <div>
-                <div className="text-lg font-semibold text-white">{isActive ? 'Параметры цикла' : 'Предпросмотр цикла'}</div>
-                <p className="mt-1 text-sm text-white/58">
-                  {isActive ? 'Цикл выполняется по активной агротехкарте.' : 'Проверьте параметры и подтвердите запуск.'}
-                </p>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-lg font-semibold text-white">{isActive ? 'Параметры цикла' : 'Предпросмотр цикла'}</div>
+                  <p className="mt-1 text-sm text-white/58">
+                    {isActive ? 'Цикл выполняется по активной агротехкарте.' : 'Проверьте параметры и подтвердите запуск.'}
+                  </p>
+                </div>
+                <LearningWidget
+                  isOpen={learningWidgetOpen}
+                  learningStatus={lastFinishedCycle ? visualLearningStatus : null}
+                  loadError={learningStatusError}
+                  onToggle={() => setLearningWidgetOpen((prev) => !prev)}
+                  onClose={() => setLearningWidgetOpen(false)}
+                  onExpand={() => setLearningModalOpen(true)}
+                />
               </div>
 
               <div className="mt-5 grid min-w-0 flex-1 items-center gap-5 md:grid-cols-[112px_minmax(0,1fr)]">
@@ -1612,6 +2016,12 @@ export default function App() {
                   </div>
                 </div>
               </div>
+
+              {!isActive && isSelectedCropLearningBlocked ? (
+                <div className="mt-3 rounded-[18px] border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-snug text-amber-100">
+                  Для этой культуры ещё обновляется АгроТехКарта после предыдущего цикла.
+                </div>
+              ) : null}
 
               <div className="mt-4 grid min-w-0 gap-3 md:grid-cols-[minmax(0,1fr)_140px]">
                 {!isActive ? (
@@ -1866,6 +2276,29 @@ export default function App() {
           onClose={handleCloseFinishCycleModal}
           onSubmit={handleSubmitFinishCycle}
         />
+      ) : null}
+      {learningModalOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/62 px-3 py-4 backdrop-blur-md">
+          <div className="absolute inset-0" onClick={() => setLearningModalOpen(false)} />
+          <div className="relative z-10 w-full max-w-md rounded-[28px] border border-white/10 bg-slate-950/90 p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xl font-semibold text-white">Обучение АгроТехКарты</div>
+                <p className="mt-2 text-sm leading-relaxed text-white/62">
+                  Подробный результат обучения будет добавлен следующим этапом.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLearningModalOpen(false)}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.045] text-xl text-white/70 transition hover:bg-white/[0.08]"
+                aria-label="Закрыть"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   )

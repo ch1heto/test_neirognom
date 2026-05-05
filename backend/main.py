@@ -3148,6 +3148,16 @@ async def run_cycle_ai_analysis(cycle_id: int) -> dict[str, Any]:
 
 AGROTECH_PROPOSAL_PROMPT_VERSION = "agrotech_revision_proposal_v1"
 AGROTECH_PROPOSAL_PRIORITIES = {"low", "medium", "high"}
+LEARNING_PIPELINE_RUNNING_CYCLES: set[int] = set()
+LEARNING_STATUS_STEP_ORDER = (
+    "questionnaire_saved",
+    "telemetry_collected",
+    "ph_dosing_collected",
+    "alerts_collected",
+    "ai_analysis",
+    "proposal_created",
+    "new_version_saved",
+)
 
 
 def parse_agrotech_revision_proposal_json(raw_text: str) -> dict[str, Any]:
@@ -3470,6 +3480,206 @@ def finalize_learning_pipeline_status(steps: dict[str, dict[str, Any]]) -> str:
     return "completed"
 
 
+def format_learning_version_label(major: Any, minor: Any) -> str | None:
+    if major is None or minor is None:
+        return None
+    try:
+        return f"v{int(major)}.{int(minor)}"
+    except (TypeError, ValueError):
+        return None
+
+
+def get_learning_status_error(
+    analysis: dict[str, Any] | None,
+    proposal: dict[str, Any] | None,
+) -> str | None:
+    if isinstance(analysis, dict) and analysis.get("status") == "failed":
+        raw_response = analysis.get("raw_response") if isinstance(analysis.get("raw_response"), dict) else {}
+        return str(raw_response.get("error") or analysis.get("summary") or "AI-анализ завершился ошибкой")
+    if isinstance(proposal, dict) and proposal.get("status") == "failed":
+        safety_notes = proposal.get("safety_notes") if isinstance(proposal.get("safety_notes"), list) else []
+        return str(proposal.get("apply_error") or "; ".join(map(str, safety_notes)) or "Не удалось подготовить proposal")
+    return None
+
+
+def proposal_ai_declined_new_revision(
+    analysis: dict[str, Any] | None,
+    proposal: dict[str, Any],
+) -> bool:
+    raw_response = proposal.get("raw_response") if isinstance(proposal.get("raw_response"), dict) else {}
+    raw_analysis = raw_response.get("analysis") if isinstance(raw_response.get("analysis"), dict) else {}
+    if raw_analysis.get("should_propose_new_revision") is False:
+        return True
+    return isinstance(analysis, dict) and analysis.get("should_propose_new_revision") is False
+
+
+def is_no_new_revision_outcome(
+    analysis: dict[str, Any] | None,
+    proposal: dict[str, Any],
+) -> bool:
+    return (
+        proposal.get("status") == "auto_deferred"
+        or proposal.get("auto_apply_eligible") is False
+        or proposal_ai_declined_new_revision(analysis, proposal)
+    )
+
+
+def build_cycle_learning_status(cycle_id: int) -> dict[str, Any]:
+    cycle = get_cycle_with_result(cycle_id)
+    proposal: dict[str, Any] | None = None
+    analysis: dict[str, Any] | None = None
+    report: dict[str, Any] | None = None
+    completed_steps: list[str] = []
+
+    status = "idle"
+    current_step: str | None = None
+    error: str | None = None
+    old_version_label = cycle.get("version_label")
+    new_version_label: str | None = None
+    proposal_id: int | None = None
+    started_at = cycle.get("finished_at") or cycle.get("started_at")
+    finished_at: str | None = None
+    outcome: str | None = None
+    message: str | None = None
+
+    if cycle.get("status") != "finished" or not cycle.get("finished_at"):
+        return {
+            "cycle_id": cycle.get("id") or cycle_id,
+            "tray_id": cycle.get("tray_id"),
+            "crop_slug": cycle.get("crop_slug"),
+            "crop_name_ru": cycle.get("crop_name_ru"),
+            "status": status,
+            "current_step": current_step,
+            "completed_steps": completed_steps,
+            "old_version_label": old_version_label,
+            "new_version_label": new_version_label,
+            "proposal_id": proposal_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "outcome": outcome,
+            "message": message,
+            "error": error,
+        }
+
+    status = "running"
+    if cycle.get("result"):
+        completed_steps.append("questionnaire_saved")
+        completed_steps.extend(["telemetry_collected", "ph_dosing_collected", "alerts_collected"])
+    else:
+        current_step = "questionnaire_saved"
+
+    try:
+        report = get_cycle_analysis_report(cycle_id)
+    except Exception as exc:
+        print(f"[LEARNING STATUS] cycle {cycle_id}: analysis report unavailable - {exc}")
+        report = None
+
+    if report is not None:
+        for step in ("telemetry_collected", "ph_dosing_collected", "alerts_collected"):
+            if step not in completed_steps:
+                completed_steps.append(step)
+
+    try:
+        analysis = get_cycle_ai_analysis(cycle_id)
+    except Exception as exc:
+        print(f"[LEARNING STATUS] cycle {cycle_id}: ai analysis unavailable - {exc}")
+        analysis = None
+
+    if analysis is None:
+        current_step = current_step or "ai_analysis"
+    elif analysis.get("status") == "failed":
+        status = "failed"
+        current_step = "ai_analysis"
+        error = get_learning_status_error(analysis, None)
+    else:
+        completed_steps.append("ai_analysis")
+
+    if status != "failed":
+        try:
+            proposal = get_cycle_agrotech_revision_proposal(cycle_id)
+        except Exception as exc:
+            print(f"[LEARNING STATUS] cycle {cycle_id}: proposal unavailable - {exc}")
+            proposal = None
+
+        if proposal is None:
+            current_step = current_step or "proposal_created"
+        elif proposal.get("status") == "failed":
+            status = "failed"
+            current_step = "proposal_created"
+            proposal_id = proposal.get("id")
+            error = get_learning_status_error(analysis, proposal)
+        else:
+            completed_steps.append("proposal_created")
+            proposal_id = proposal.get("id")
+            if proposal.get("applied_revision_id"):
+                completed_steps.append("new_version_saved")
+                new_version_label = format_learning_version_label(
+                    proposal.get("proposed_version_major"),
+                    proposal.get("proposed_version_minor"),
+                )
+                status = "completed"
+                outcome = "new_revision_saved"
+                current_step = None
+                finished_at = proposal.get("applied_at") or proposal.get("updated_at")
+            elif proposal.get("apply_error") and proposal.get("status") != "auto_deferred":
+                status = "failed"
+                outcome = "apply_failed"
+                current_step = "new_version_saved"
+                error = str(proposal.get("apply_error"))
+            elif is_no_new_revision_outcome(analysis, proposal):
+                completed_steps.append("new_version_saved")
+                status = "completed"
+                outcome = "no_new_revision"
+                current_step = None
+                finished_at = proposal.get("updated_at")
+                message = (
+                    "AI-анализ завершён. Новая версия АгроТехКарты не создана: "
+                    "изменений недостаточно или новая ревизия не требуется."
+                )
+            else:
+                current_step = current_step or "new_version_saved"
+
+    if cycle_id in LEARNING_PIPELINE_RUNNING_CYCLES and status not in {"completed", "failed"}:
+        status = "running"
+
+    completed_steps = [
+        step for step in LEARNING_STATUS_STEP_ORDER
+        if step in set(completed_steps)
+    ]
+
+    return {
+        "cycle_id": cycle.get("id") or cycle_id,
+        "tray_id": cycle.get("tray_id"),
+        "crop_slug": cycle.get("crop_slug"),
+        "crop_name_ru": cycle.get("crop_name_ru"),
+        "status": status,
+        "current_step": current_step,
+        "completed_steps": completed_steps,
+        "old_version_label": old_version_label,
+        "new_version_label": new_version_label,
+        "proposal_id": proposal_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "outcome": outcome,
+        "message": message,
+        "error": error,
+    }
+
+
+async def run_cycle_learning_pipeline_once(
+    cycle_id: int,
+    auto_apply: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    if cycle_id in LEARNING_PIPELINE_RUNNING_CYCLES:
+        return build_cycle_learning_status(cycle_id)
+    LEARNING_PIPELINE_RUNNING_CYCLES.add(cycle_id)
+    try:
+        return await run_cycle_learning_pipeline(cycle_id, auto_apply=auto_apply, force=force)
+    finally:
+        LEARNING_PIPELINE_RUNNING_CYCLES.discard(cycle_id)
+
+
 async def run_cycle_learning_pipeline(
     cycle_id: int,
     auto_apply: bool = True,
@@ -3587,7 +3797,7 @@ async def run_cycle_learning_pipeline(
 
 async def run_cycle_learning_pipeline_background(cycle_id: int) -> None:
     try:
-        await run_cycle_learning_pipeline(cycle_id, auto_apply=True, force=False)
+        await run_cycle_learning_pipeline_once(cycle_id, auto_apply=True, force=False)
     except Exception as exc:
         print(f"[LEARNING PIPELINE] cycle {cycle_id}: background failed - {exc}")
 
@@ -5168,7 +5378,15 @@ async def api_run_cycle_learning_pipeline(
     auto_apply: bool = Query(default=True),
     force: bool = Query(default=False),
 ) -> dict[str, Any]:
-    return await run_cycle_learning_pipeline(cycle_id, auto_apply=auto_apply, force=force)
+    return await run_cycle_learning_pipeline_once(cycle_id, auto_apply=auto_apply, force=force)
+
+
+@app.get("/api/cycles/{cycle_id}/learning-status")
+def api_get_cycle_learning_status(cycle_id: int) -> dict[str, Any]:
+    try:
+        return build_cycle_learning_status(cycle_id)
+    except GrowingCycleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
 
 
 @app.get("/api/cycles/{cycle_id}/agrotech-revision-proposal")
