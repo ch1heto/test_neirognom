@@ -395,7 +395,21 @@ CHAT_SYSTEM_PROMPT = (
     "Если suitability_status='advanced_or_unsuitable', не рассказывай подробную агротехнику для этой установки; объясни, что культура может требовать другой гидропонной системы, большего объёма, опоры, опыления или другого формата выращивания. "
     "Если suitability_status='unknown', не придумывай пригодность культуры и предложи выбрать из supported_crops. "
     "Для текущей установки приоритетные культуры: зелень, травы, микрозелень и компактные листовые культуры. "
-    "Не представляй плодоносящие крупные культуры как подходящие для маленьких стаканчиков, если они не поддерживаются БД."
+    "Не представляй плодоносящие крупные культуры как подходящие для маленьких стаканчиков, если они не поддерживаются БД.\n"
+    "17. pH-настройки и автодозирование: Обязан различать три разных смысла pH. "
+    "'Текущий pH' — это значение датчика воды. "
+    "'Норма pH' — это диапазон из активной АгроТехКарты. "
+    "'Целевой pH', 'pH который пользователь выставил', 'pH в настройках', 'настройки pH' — это ph_target_settings.target_ph. "
+    "Если пользователь спрашивает про pH, который он выставил, целевой pH, настройки pH, pH-контроль или дозаторы, отвечай по ph_target_settings, а не по текущему датчику и не по норме АгроТехКарты. "
+    "Если ph_target_settings есть, говори: 'Сейчас в настройках сохранён целевой pH X с допуском ±Y, диапазон удержания A–B.' "
+    "Если autodosing_enabled=true, добавь: 'pH-контроль активен, backend-контроллер будет использовать ph_up/ph_down с защитными паузами.' "
+    "Если autodosing_enabled=false, добавь: 'pH-контроль сохранён, но автодозирование выключено.' "
+    "Не говори, что пользователь выставил текущий pH датчика: это разные вещи. "
+    "Если текущий pH датчика есть и он выше или ниже пользовательского диапазона target_ph ± tolerance, можно сказать, что текущий pH датчика Z выше/ниже целевого диапазона, поэтому контроллер может выполнить микродозу pH Down/pH Up с учётом cooldown/mixing delay. "
+    "Не обещай, что насос уже сработал, если в recent ph_dosing_events нет события со status=executed. "
+    "Если пользователь спрашивает, поменялся ли pH, который он выставил, отвечай про сохранённый target_ph и updated_at, а не про current_ph датчика. "
+    "Если пользователь спрашивает, какой pH лучше выставить, можно использовать активную АгроТехКарту и текущий pH, но отдельно скажи, какой целевой pH уже сохранён в настройках, если настройка существует. "
+    "LLM не управляет насосами и не имеет права включать дозаторы. LLM только объясняет состояние и советует. Управление насосами выполняет backend pH auto-dosing controller по сохранённым настройкам и safety-ограничениям."
 )
 
 CROP_ALIASES: dict[str, tuple[str, ...]] = {
@@ -2216,6 +2230,85 @@ def format_active_cycle_for_prompt(tray_id: str = "tray_1") -> str:
         lines.append("нормы выращивания: в БД не найдены")
 
     lines.append("Правило: Используй эти нормы как приоритетные при оценке состояния фермы.")
+    return "\n".join(lines)
+
+
+def format_ph_context_value(value: Any) -> str:
+    if value is None:
+        return "не указано"
+    return str(value)
+
+
+def format_ph_dosing_event_for_prompt(event: dict[str, Any]) -> str:
+    fields = [
+        ("status", event.get("status")),
+        ("pump_id", event.get("pump_id")),
+        ("reason", event.get("reason")),
+        ("current_ph", event.get("current_ph")),
+        ("target_ph", event.get("target_ph")),
+        ("target_min", event.get("target_min")),
+        ("target_max", event.get("target_max")),
+        ("duration_ms", event.get("duration_ms")),
+        ("safety_reason", event.get("safety_reason")),
+        ("created_at", event.get("created_at")),
+    ]
+    return "; ".join(f"{key}={format_ph_context_value(value)}" for key, value in fields)
+
+
+def build_ph_target_settings_context_for_prompt(tray_id: str = "tray_1") -> str:
+    lines = ["Контекст pH target settings:"]
+    settings: dict[str, Any] | None = None
+
+    try:
+        settings = get_current_ph_target_settings(tray_id)
+    except NoActiveGrowingCycleError:
+        lines.append("- активный цикл: не запущен")
+        lines.append("- Целевой pH пользователя не задан. pH-контроль не настроен.")
+    except Exception as exc:
+        print(f"[AI_PH_CONTEXT] ph target settings unavailable for prompt: {exc}")
+        lines.append("- данные ph_target_settings недоступны")
+
+    if settings:
+        if settings.get("is_configured"):
+            lines.extend([
+                "- ph_target_settings сохранены:",
+                f"  target_ph={format_ph_context_value(settings.get('target_ph'))}",
+                f"  tolerance=±{format_ph_context_value(settings.get('tolerance'))}",
+                f"  target_min={format_ph_context_value(settings.get('target_min'))}",
+                f"  target_max={format_ph_context_value(settings.get('target_max'))}",
+                f"  autodosing_enabled={bool(settings.get('autodosing_enabled'))}",
+                f"  source={format_ph_context_value(settings.get('source'))}",
+                f"  updated_at={format_ph_context_value(settings.get('updated_at'))}",
+                f"  crop_name_ru={format_ph_context_value(settings.get('crop_name_ru'))}",
+                f"  cycle_id={format_ph_context_value(settings.get('cycle_id'))}",
+                f"  tray_id={format_ph_context_value(settings.get('tray_id'))}",
+                "- это целевой pH контроллера, не текущий pH датчика и не норма АгроТехКарты",
+            ])
+            if settings.get("autodosing_enabled"):
+                lines.append("- статус pH-контроля: активен; backend-контроллер использует ph_up/ph_down с safety-паузами")
+            else:
+                lines.append("- статус pH-контроля: настройки сохранены, автодозирование выключено")
+        else:
+            lines.extend([
+                "- Целевой pH пользователя не задан. pH-контроль не настроен.",
+                f"- crop_name_ru={format_ph_context_value(settings.get('crop_name_ru'))}",
+                f"- cycle_id={format_ph_context_value(settings.get('cycle_id'))}",
+                f"- tray_id={format_ph_context_value(settings.get('tray_id'))}",
+            ])
+
+    try:
+        events = get_recent_ph_dosing_events(tray_id=tray_id, limit=5)
+    except Exception as exc:
+        print(f"[AI_PH_CONTEXT] recent ph dosing events unavailable for prompt: {exc}")
+        events = []
+
+    if events:
+        lines.append("Последние события pH-дозирования, новые сверху:")
+        lines.extend(f"- {format_ph_dosing_event_for_prompt(event)}" for event in events[:5])
+        lines.append("- насос уже сработал только если status=executed")
+    else:
+        lines.append("- последние события pH-дозирования: нет")
+
     return "\n".join(lines)
 
 
@@ -4092,6 +4185,7 @@ def build_chat_prompt(
         sensor_freshness=sensor_freshness_for_prompt,
     )
     crop_context = build_crop_context_for_prompt(message, messages=history, tray_id="tray_1")
+    ph_target_settings_context = build_ph_target_settings_context_for_prompt("tray_1")
     if stale_sensor_context:
         translated_data_string += (
             ". Внимание: часть показаний может быть устаревшей; смотри блок "
@@ -4103,6 +4197,7 @@ def build_chat_prompt(
     prompt_parts.extend([
         f"Данные датчиков: {translated_data_string}",
         format_active_cycle_for_prompt("tray_1"),
+        ph_target_settings_context,
         (
             "Политика культур текущей фермы:\n"
             "- точные рекомендации даются по культурам из БД АгроТехКарт;\n"
@@ -5184,6 +5279,7 @@ async def chat_with_ai(request: ChatRequest) -> dict[str, Any]:
     learning_context = ""
     if active_cycle:
         analysis_steps.append("Добавляю активный цикл выращивания в контекст ИИ")
+        analysis_steps.append("Добавляю сохранённые настройки целевого pH и последние события pH-дозирования")
         crop_slug = str(active_cycle.get("crop_slug") or "").strip()
         if crop_slug:
             learning_context = await asyncio.to_thread(build_crop_learning_context_for_ai, crop_slug)
