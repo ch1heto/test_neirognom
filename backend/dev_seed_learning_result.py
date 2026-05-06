@@ -270,7 +270,7 @@ def fetch_learning_result_preview(cycle_id: int) -> dict[str, Any] | None:
         return None
 
 
-def create_demo_learning_result(crop_slug: str) -> dict[str, Any]:
+def create_demo_learning_result(crop_slug: str, *, include_preview: bool = True) -> dict[str, Any]:
     active_revision = get_active_card_revision(crop_slug)
     if active_revision is None:
         raise DemoSeedError(f"Active AgroTechCard revision for crop '{crop_slug}' was not found.")
@@ -364,7 +364,7 @@ def create_demo_learning_result(crop_slug: str) -> dict[str, Any]:
     applied_proposal = apply_result.get("proposal") or proposal
     created_revision = apply_result.get("created_revision") or apply_result.get("existing_revision")
 
-    preview = fetch_learning_result_preview(cycle_id)
+    preview = fetch_learning_result_preview(cycle_id) if include_preview else None
     if preview is None:
         preview = {
             "has_changes": bool(applied_proposal.get("applied_revision_id")),

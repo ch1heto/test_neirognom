@@ -42,6 +42,13 @@ const API_BASE_URL =
 const TELEMETRY_POLL_INTERVAL_MS = 2000
 const LOGS_POLL_INTERVAL_MS = 5000
 const DEFAULT_TRAY_ID = 'tray_1'
+const DEV_FEATURES_ENABLED = import.meta.env.VITE_DEV_FEATURES_ENABLED === 'true'
+const DEMO_CROP_FALLBACK = [
+  { slug: 'mint', name_ru: 'Мята' },
+  { slug: 'arugula', name_ru: 'Руккола' },
+  { slug: 'basil', name_ru: 'Базилик' },
+  { slug: 'cilantro', name_ru: 'Кинза' },
+]
 const PH_TARGET_INITIAL_FORM = {
   targetPh: '',
   tolerance: '0.1',
@@ -59,7 +66,6 @@ const LEARNING_STEPS = [
 const LEARNING_STEP_KEYS = LEARNING_STEPS.map((step) => step.key)
 const LEARNING_POLL_INTERVAL_MS = 4000
 const LEARNING_VISUAL_STEP_MS = 750
-const DEV_LEARNING_RESULT_CYCLE_ID = 23
 
 const FINISH_CYCLE_INITIAL_FORM = {
   harvest_status: 'suitable',
@@ -1353,6 +1359,9 @@ export default function App() {
   const [isLedPlaying, setIsLedPlaying] = useState(false)
   const [crops, setCrops] = useState([])
   const [selectedCropSlug, setSelectedCropSlug] = useState('')
+  const [selectedDemoCropSlug, setSelectedDemoCropSlug] = useState('mint')
+  const [demoLearningLoading, setDemoLearningLoading] = useState(false)
+  const [demoLearningError, setDemoLearningError] = useState('')
   const [cropsLoading, setCropsLoading] = useState(true)
   const [cropsError, setCropsError] = useState('')
   const [currentCycle, setCurrentCycle] = useState(null)
@@ -1533,20 +1542,6 @@ export default function App() {
     }
   }, [])
 
-  useEffect(() => {
-    if (!DEV_LEARNING_RESULT_CYCLE_ID) return undefined
-
-    let isMounted = true
-    void loadLearningResult(DEV_LEARNING_RESULT_CYCLE_ID).then((result) => {
-      if (!isMounted || !result) return
-      setLearningWidgetOpen(true)
-    })
-
-    return () => {
-      isMounted = false
-    }
-  }, [loadLearningResult])
-
   const triggerLearningPipeline = (cycleId) => {
     if (!cycleId) return
     void requestJson(`/api/cycles/${cycleId}/learning-pipeline`, {
@@ -1588,6 +1583,67 @@ export default function App() {
       return null
     } finally {
       setCropsLoading(false)
+    }
+  }
+
+  const demoCropOptions = useMemo(
+    () => (crops.length > 0 ? crops : DEMO_CROP_FALLBACK),
+    [crops],
+  )
+
+  useEffect(() => {
+    if (!DEV_FEATURES_ENABLED) return
+
+    setSelectedDemoCropSlug((prev) => (
+      demoCropOptions.some((crop) => crop.slug === prev)
+        ? prev
+        : demoCropOptions[0]?.slug || 'mint'
+    ))
+  }, [demoCropOptions])
+
+  const handleCreateDemoLearningResult = async () => {
+    if (!DEV_FEATURES_ENABLED || demoLearningLoading) return
+
+    const cropSlug = selectedDemoCropSlug || demoCropOptions[0]?.slug || 'mint'
+    setDemoLearningLoading(true)
+    setDemoLearningError('')
+    try {
+      const response = await requestJson(
+        `/api/dev/learning-result-demo?crop_slug=${encodeURIComponent(cropSlug)}`,
+        { method: 'POST' },
+      )
+      const cycleId = response?.cycle_id
+      let result = response?.learning_result && typeof response.learning_result === 'object'
+        ? response.learning_result
+        : null
+
+      if (!result && cycleId) {
+        result = await loadLearningResult(cycleId)
+      }
+      if (!result) {
+        throw new Error('Empty demo learning result')
+      }
+
+      if (cycleId) {
+        learningResultInitialCycleRef.current = cycleId
+        learningResultFinalCycleRef.current = cycleId
+        setLastFinishedCycle({
+          id: cycleId,
+          crop_slug: response?.crop_slug || result.crop_slug || cropSlug,
+        })
+      }
+      setLearningResult(result)
+      setLearningResultError('')
+      setLearningStatus(null)
+      setLearningTargetStatus(null)
+      setVisualLearningStatus(null)
+      setLearningWidgetOpen(true)
+      setMode('monitoring')
+    } catch (error) {
+      console.error('Failed to create demo learning result', error)
+      setDemoLearningError(getErrorMessage(error, 'DEMO недоступен'))
+    } finally {
+      setDemoLearningLoading(false)
     }
   }
 
@@ -2601,6 +2657,38 @@ export default function App() {
   </div>
 )
 
+  const headerDevControls = DEV_FEATURES_ENABLED ? (
+    <div className="flex shrink-0 items-center gap-2">
+      <select
+        value={selectedDemoCropSlug}
+        onChange={(event) => {
+          setSelectedDemoCropSlug(event.target.value)
+          setDemoLearningError('')
+        }}
+        className="h-8 w-[124px] rounded-xl border border-white/10 bg-white/[0.04] px-2 text-xs font-medium text-white/82 outline-none transition hover:bg-white/[0.07] focus:border-emerald-300/40 focus:bg-slate-900/70"
+      >
+        {demoCropOptions.map((crop) => (
+          <option key={crop.slug} value={crop.slug} className="bg-slate-950 text-white">
+            {crop.name_ru || crop.slug}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={handleCreateDemoLearningResult}
+        disabled={demoLearningLoading}
+        className="h-8 w-[72px] rounded-xl border border-violet-200/20 bg-gradient-to-r from-violet-500/70 to-emerald-400/55 px-2 text-xs font-semibold text-white shadow-[0_0_18px_rgba(139,92,246,0.18)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {demoLearningLoading ? '...' : 'DEMO'}
+      </button>
+      {demoLearningError ? (
+        <span className="max-w-[120px] truncate text-[11px] font-medium text-rose-200/90" title={demoLearningError}>
+          {demoLearningError}
+        </span>
+      ) : null}
+    </div>
+  ) : null
+
   return (
     <div className="farm-shell relative min-h-screen overflow-x-hidden px-3 py-3 md:px-4 md:py-4 lg:px-6 lg:py-6 min-[1700px]:h-screen min-[1700px]:overflow-hidden">
       <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4 min-[1700px]:h-full">
@@ -2609,6 +2697,7 @@ export default function App() {
           setMode={setMode}
           currentTime={currentTime}
           currentDate={currentDate}
+          devControls={headerDevControls}
         />
 
         <main className="grid min-w-0 gap-4 min-[1700px]:min-h-0 min-[1700px]:flex-1 min-[1700px]:grid-cols-[minmax(0,1fr)_340px] min-[1900px]:grid-cols-[minmax(0,1fr)_360px]">

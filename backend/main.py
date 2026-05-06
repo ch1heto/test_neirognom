@@ -98,6 +98,7 @@ BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 SENSORS_TOPIC = "farm/+/sensors/#"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
+DEV_FEATURES_ENABLED = os.getenv("DEV_FEATURES_ENABLED") == "true"
 client = AsyncOpenAI(
     api_key=POLZA_API_KEY,
     base_url="https://polza.ai/api/v1"
@@ -5531,6 +5532,40 @@ def api_get_crop_learning_history(crop_slug: str) -> dict[str, Any]:
         return get_crop_learning_history(crop_slug)
     except CropNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+
+@app.post("/api/dev/learning-result-demo")
+def api_create_dev_learning_result_demo(
+    crop_slug: str = Query(default="mint"),
+) -> dict[str, Any]:
+    if not DEV_FEATURES_ENABLED:
+        raise HTTPException(status_code=404, detail={"error": "Not found"})
+
+    try:
+        from dev_seed_learning_result import DemoSeedError, create_demo_learning_result
+
+        seed_result = create_demo_learning_result(crop_slug, include_preview=False)
+        cycle_id = int(seed_result["cycle_id"])
+        learning_result = build_cycle_learning_result(cycle_id)
+    except DemoSeedError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    except (CropNotFoundError, ActiveCardRevisionNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    except ActiveCardRevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+    changes = learning_result.get("changes")
+    changes_count = len(changes) if isinstance(changes, list) else 0
+    return {
+        "cycle_id": cycle_id,
+        "crop_slug": seed_result.get("crop_slug") or learning_result.get("crop_slug") or crop_slug,
+        "crop_name_ru": seed_result.get("crop_name_ru") or learning_result.get("crop_name_ru"),
+        "proposal_id": seed_result.get("proposal_id") or learning_result.get("proposal_id"),
+        "has_changes": learning_result.get("has_changes"),
+        "can_open_details": learning_result.get("can_open_details"),
+        "changes_count": changes_count,
+        "learning_result": learning_result,
+    }
 
 
 @app.get("/api/cycles/current")
