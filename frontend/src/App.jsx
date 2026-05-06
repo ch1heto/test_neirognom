@@ -59,6 +59,7 @@ const LEARNING_STEPS = [
 const LEARNING_STEP_KEYS = LEARNING_STEPS.map((step) => step.key)
 const LEARNING_POLL_INTERVAL_MS = 4000
 const LEARNING_VISUAL_STEP_MS = 750
+const DEV_LEARNING_RESULT_CYCLE_ID = 23
 
 const FINISH_CYCLE_INITIAL_FORM = {
   harvest_status: 'suitable',
@@ -914,16 +915,20 @@ function LearningStepMarker({ status, index }) {
 function LearningWidget({
   isOpen,
   learningStatus,
+  learningResult,
+  learningResultError,
   loadError,
   onToggle,
   onClose,
   onExpand,
 }) {
-  const status = loadError ? 'failed' : learningStatus?.status || 'idle'
-  const outcome = learningStatus?.outcome || null
+  const effectiveStatus = learningResult?.status || learningStatus?.status
+  const effectiveOutcome = learningResult?.outcome || learningStatus?.outcome
+  const status = loadError && !learningResult ? 'failed' : effectiveStatus || 'idle'
+  const outcome = effectiveOutcome || null
   const completedSteps = new Set(learningStatus?.completed_steps || [])
   const currentStep = learningStatus?.current_step
-  const steps = LEARNING_STEPS.map((step) => {
+  const fallbackSteps = LEARNING_STEPS.map((step) => {
     const label = step.key === 'new_version_saved' && status === 'completed'
       ? outcome === 'no_new_revision'
         ? 'Новая версия не требуется'
@@ -941,6 +946,27 @@ function LearningWidget({
             : 'pending',
     }
   })
+  const learningResultSteps = Array.isArray(learningResult?.steps) && learningResult.steps.length > 0
+    ? learningResult.steps
+    : null
+  let firstResultRunningStepUsed = false
+  const steps = learningResultSteps
+    ? learningResultSteps.map((step, index) => {
+      const isDone = Boolean(step?.done)
+      const isRunning = !isDone && status === 'running' && !firstResultRunningStepUsed
+      if (isRunning) {
+        firstResultRunningStepUsed = true
+      }
+      return {
+        key: step?.key || `learning-result-step-${index}`,
+        label: step?.label || '',
+        status: isDone ? 'done' : isRunning ? 'running' : 'pending',
+      }
+    })
+    : fallbackSteps
+  const canExpand = learningResult
+    ? Boolean(learningResult.has_changes && learningResult.can_open_details)
+    : effectiveStatus === 'completed' && effectiveOutcome !== 'no_new_revision'
   const isHighlighted = ['running', 'completed'].includes(status)
   const badge = status === 'completed'
     ? outcome === 'no_new_revision'
@@ -965,7 +991,7 @@ function LearningWidget({
       : isHighlighted
         ? 'border-indigo-200/55 bg-indigo-500/25 text-indigo-100 shadow-[0_0_24px_rgba(99,102,241,0.45)] hover:bg-indigo-500/32'
         : 'border-white/10 bg-white/[0.045] text-white/48 shadow-[0_0_18px_rgba(148,163,184,0.08)] hover:border-white/18 hover:text-white/70'
-  const footerText = loadError
+  const fallbackFooterText = loadError
     ? 'Не удалось загрузить статус обучения'
     : status === 'completed'
       ? outcome === 'no_new_revision'
@@ -1001,9 +1027,18 @@ function LearningWidget({
             <div className="flex shrink-0 items-center gap-1.5">
               <button
                 type="button"
-                onClick={onExpand}
+                disabled={!canExpand}
+                aria-disabled={!canExpand}
+                onClick={() => {
+                  if (!canExpand) return
+                  onExpand()
+                }}
                 aria-label="Развернуть обучение АгроТехКарты"
-                className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-sm font-semibold text-white/58 transition hover:bg-white/[0.08] hover:text-white"
+                className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-sm font-semibold text-white/58 transition ${
+                  canExpand
+                    ? 'hover:bg-white/[0.08] hover:text-white'
+                    : 'opacity-40 cursor-not-allowed pointer-events-auto'
+                }`}
               >
                 ↗
               </button>
@@ -1030,11 +1065,272 @@ function LearningWidget({
           </div>
 
           <div className="mt-4 rounded-[16px] border border-white/8 bg-white/[0.035] px-3 py-2.5 text-[11px] leading-snug text-white/52">
-            {footerText}
+            {learningResult?.message || fallbackFooterText}
           </div>
         </div>
       ) : null}
     </>
+  )
+}
+
+function formatLearningNumber(value) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return '—'
+  const rounded = parsed.toFixed(1)
+  return rounded.endsWith('.0') ? rounded.slice(0, -2) : rounded
+}
+
+function getLearningMetricValue(metric, key) {
+  return formatLearningNumber(metric?.[key])
+}
+
+function getVersionText(versionFrom, versionTo) {
+  return versionFrom && versionTo ? `${versionFrom} → ${versionTo}` : 'Версия обновлена'
+}
+
+function getLearningText(value, fallback = '—') {
+  return typeof value === 'string' && value.trim() ? value : fallback
+}
+
+function LearningEvidenceCard({ title, metric, accent = 'cyan', icon }) {
+  const accentClassName = {
+    cyan: 'border-cyan-300/18 bg-cyan-400/10 text-cyan-200',
+    amber: 'border-amber-300/18 bg-amber-300/10 text-amber-200',
+    violet: 'border-violet-300/18 bg-violet-400/10 text-violet-200',
+    emerald: 'border-emerald-300/18 bg-emerald-400/10 text-emerald-200',
+  }[accent] || 'border-cyan-300/18 bg-cyan-400/10 text-cyan-200'
+
+  return (
+    <div className="min-w-0 rounded-[18px] border border-white/10 bg-white/[0.035] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] border text-[13px] font-bold ${accentClassName}`}>
+          {icon}
+        </span>
+        <div className="min-w-0 truncate text-[14px] font-semibold text-white/88">{title}</div>
+      </div>
+      <div className="mt-4 grid grid-cols-3 gap-2">
+        {[
+          ['мин', getLearningMetricValue(metric, 'min')],
+          ['средн.', getLearningMetricValue(metric, 'avg')],
+          ['макс.', getLearningMetricValue(metric, 'max')],
+        ].map(([label, value]) => (
+          <div key={label} className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/38">{label}</div>
+            <div className="mt-1 truncate text-[20px] font-semibold text-white">{value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function LearningEvidenceCounter({ title, value, suffix, accent = 'cyan', icon }) {
+  const accentClassName = {
+    cyan: 'border-cyan-300/18 bg-cyan-400/10 text-cyan-200',
+    amber: 'border-amber-300/18 bg-amber-300/10 text-amber-200',
+    violet: 'border-violet-300/18 bg-violet-400/10 text-violet-200',
+    emerald: 'border-emerald-300/18 bg-emerald-400/10 text-emerald-200',
+  }[accent] || 'border-cyan-300/18 bg-cyan-400/10 text-cyan-200'
+  const safeValue = value === null || value === undefined || value === '' ? '0' : String(value)
+
+  return (
+    <div className="flex min-w-0 items-center gap-2 rounded-[14px] border border-white/8 bg-white/[0.03] px-2.5 py-2.5">
+      <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] border text-[15px] font-bold ${accentClassName}`}>
+        {icon}
+      </span>
+      <div className="min-w-0 text-[12px] leading-snug">
+        <div className="truncate font-semibold text-white/78">{title}</div>
+        <div className="truncate text-white/58">
+          <span className="font-semibold text-white">{safeValue}</span> {suffix}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LearningChangesTable({ changes }) {
+  const rows = Array.isArray(changes) ? changes : []
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-[16px] border border-white/8 bg-white/[0.025] px-4 py-5 text-sm text-white/58">
+        Содержательных изменений АгроТехКарты не найдено.
+      </div>
+    )
+  }
+
+  return (
+    <div className="custom-scrollbar overflow-x-auto rounded-[16px] border border-white/8">
+      <table className="min-w-[760px] w-full border-collapse text-left text-[13px]">
+        <thead className="bg-white/[0.045] text-white/62">
+          <tr>
+            {['Параметр', 'Было', 'Стало', 'Причина'].map((title) => (
+              <th key={title} className="border-b border-white/8 px-3 py-3 font-semibold">{title}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-white/8">
+          {rows.map((change, index) => (
+            <tr key={`${change?.parameter || 'change'}-${index}`} className="bg-white/[0.018]">
+              <td className="px-3 py-3 font-semibold text-white/84">{getLearningText(change?.parameter)}</td>
+              <td className="px-3 py-3 text-white/64">{getLearningText(change?.before)}</td>
+              <td className="bg-emerald-400/[0.09] px-3 py-3 font-semibold text-emerald-300">{getLearningText(change?.after)}</td>
+              <td className="px-3 py-3 text-white/66">{getLearningText(change?.reason, 'Параметр скорректирован по результатам анализа завершённого цикла.')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function LearningResultModal({ learningResult, onClose }) {
+  const canRender = Boolean(learningResult?.can_open_details && learningResult?.has_changes)
+  if (!canRender) return null
+
+  const evidence = learningResult?.evidence || {}
+  const steps = Array.isArray(learningResult?.steps) ? learningResult.steps : []
+  const versionText = getVersionText(learningResult?.version_from, learningResult?.version_to)
+  const nextVersionText = learningResult?.version_to
+    ? `Следующий цикл этой культуры будет запущен уже по версии ${learningResult.version_to}.`
+    : 'Следующий цикл этой культуры будет запущен с актуальной версией АгроТехКарты.'
+  const subtitle = getLearningText(
+    learningResult?.message,
+    'Анализ завершён. Сформирована новая версия АгроТехКарты.',
+  )
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-3 py-4 backdrop-blur-lg">
+      <div className="custom-scrollbar relative flex max-h-[94vh] w-full max-w-[1400px] flex-col overflow-y-auto rounded-[28px] border border-white/12 bg-slate-950/90 p-4 shadow-[0_26px_90px_rgba(0,0,0,0.58),0_0_54px_rgba(99,102,241,0.18)] sm:p-6">
+        <div className="pointer-events-none absolute inset-x-8 top-0 h-px bg-gradient-to-r from-transparent via-white/26 to-transparent" />
+        <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <h2 className="text-[26px] font-semibold tracking-tight text-white md:text-[32px]">Результат обучения цикла</h2>
+            <p className="mt-2 max-w-3xl text-sm leading-relaxed text-white/62 md:text-base">{subtitle}</p>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
+            <span className="inline-flex h-10 items-center gap-2 rounded-full border border-emerald-300/28 bg-emerald-400/10 px-3 text-sm font-semibold text-emerald-200">
+              <span className="text-lg leading-none">✓</span>
+              Обучение завершено
+            </span>
+            <span className="inline-flex h-10 items-center gap-2 rounded-full border border-emerald-300/16 bg-white/[0.04] px-3 text-sm font-semibold text-white/86">
+              <span className="flex h-7 w-7 items-center justify-center rounded-full border border-emerald-300/18 bg-emerald-400/10 text-emerald-300">⌁</span>
+              {getLearningText(learningResult?.crop_name_ru, 'Культура')}
+            </span>
+            <span className="inline-flex h-10 items-center rounded-full border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-white/78">
+              {versionText}
+            </span>
+            <button
+              type="button"
+              className="hidden h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/[0.045] text-xl text-white/64 transition hover:bg-white/[0.08] hover:text-white sm:flex"
+              aria-label="Меню результата обучения"
+            >
+              ≡
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/[0.045] text-2xl leading-none text-white/72 transition hover:bg-white/[0.08] hover:text-white"
+              aria-label="Закрыть"
+            >
+              ×
+            </button>
+          </div>
+        </header>
+
+        <div className="mt-6 grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
+          <aside className="rounded-[24px] border border-white/10 bg-white/[0.03] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+            <h3 className="text-lg font-semibold text-white">Этапы анализа</h3>
+            <div className="mt-5">
+              {steps.map((step, index) => {
+                const done = Boolean(step?.done)
+                const isLast = index === steps.length - 1
+                return (
+                  <div key={step?.key || `learning-result-modal-step-${index}`} className="relative flex gap-4 pb-5 last:pb-0">
+                    {!isLast ? <div className="absolute left-[15px] top-8 h-[calc(100%-24px)] w-px bg-emerald-300/38" /> : null}
+                    <div className={`relative z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-sm font-bold ${
+                      done
+                        ? 'border-emerald-300/65 bg-emerald-400/16 text-emerald-200 shadow-[0_0_18px_rgba(52,211,153,0.22)]'
+                        : 'border-white/14 bg-white/[0.035] text-white/46'
+                    }`}>
+                      {done ? '✓' : index + 1}
+                    </div>
+                    <div className="min-w-0 pt-1">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="text-base font-semibold text-emerald-300">{index + 1}</span>
+                        <span className="min-w-0 text-sm font-semibold text-white/82">{getLearningText(step?.label, `Шаг ${index + 1}`)}</span>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <div className="mt-5 border-t border-white/10 pt-5">
+              <div className="flex items-start gap-3 rounded-[18px] border border-emerald-300/14 bg-emerald-400/[0.055] px-3 py-3 text-sm leading-relaxed text-white/70">
+                <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-emerald-300/28 text-emerald-300">i</span>
+                <span>{nextVersionText}</span>
+              </div>
+            </div>
+          </aside>
+
+          <section className="min-w-0 space-y-5">
+            <div className="rounded-[24px] border border-white/10 bg-white/[0.03] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <h3 className="text-lg font-semibold text-white">A. На основании каких данных сделан вывод</h3>
+              <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                <LearningEvidenceCard title="pH" metric={evidence?.ph} accent="cyan" icon="pH" />
+                <LearningEvidenceCard title="EC" metric={evidence?.ec} accent="amber" icon="EC" />
+                <LearningEvidenceCard title="Температура воздуха" metric={evidence?.air_temp} accent="violet" icon="°" />
+                <LearningEvidenceCard title="Влажность" metric={evidence?.humidity} accent="emerald" icon="◌" />
+              </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+                <LearningEvidenceCounter title="pH Up:" value={evidence?.ph_up_doses ?? 0} suffix="микродозы" accent="cyan" icon="↑" />
+                <LearningEvidenceCounter title="pH Down:" value={evidence?.ph_down_doses ?? 0} suffix="микродозы" accent="cyan" icon="↓" />
+                <LearningEvidenceCounter title="EC ниже нормы:" value={evidence?.ec_alerts ?? 0} suffix="алертов" accent="amber" icon="⌁" />
+                <LearningEvidenceCounter title="pH ниже нормы:" value={evidence?.ph_alerts ?? 0} suffix="алерта" accent="violet" icon="△" />
+                <LearningEvidenceCounter title="Опросник:" value="урожай" suffix="пригоден" accent="emerald" icon="□" />
+                <LearningEvidenceCounter title="Комментарий:" value="оператора" suffix="учтён" accent="emerald" icon="◯" />
+              </div>
+            </div>
+
+            <div className="rounded-[24px] border border-white/10 bg-white/[0.03] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <h3 className="text-lg font-semibold text-white">B. Вывод ИИ</h3>
+              <p className="mt-3 whitespace-pre-line text-sm leading-relaxed text-white/72">
+                {getLearningText(learningResult?.ai_conclusion, 'ИИ-анализ завершён, но текстовый вывод отсутствует.')}
+              </p>
+            </div>
+
+            <div className="rounded-[24px] border border-white/10 bg-white/[0.03] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <h3 className="text-lg font-semibold text-white">C. Что изменилось в АгроТехКарте</h3>
+              <div className="mt-4">
+                <LearningChangesTable changes={learningResult?.changes} />
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer className="mt-5 flex flex-col gap-3 border-t border-white/10 pt-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-start gap-3 text-sm leading-relaxed text-white/58">
+            <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-white/16 text-white/60">i</span>
+            <span>Отчёт включает телеметрию, алерты, pH-дозирование, опросник и вывод ИИ.</span>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              disabled
+              className="min-h-[48px] rounded-[16px] border border-white/10 bg-white/[0.035] px-5 text-sm font-semibold text-white/42 disabled:cursor-not-allowed"
+            >
+              Скачать отчёт
+            </button>
+            <button
+              type="button"
+              onClick={() => console.log('Open new AgroTechCard', learningResult)}
+              className="min-h-[48px] rounded-[16px] border border-violet-200/30 bg-gradient-to-r from-sky-500 to-fuchsia-600 px-5 text-sm font-semibold text-white shadow-[0_0_28px_rgba(168,85,247,0.28)] transition hover:brightness-110"
+            >
+              Открыть новую АгроТехКарту
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
   )
 }
 
@@ -1062,12 +1358,16 @@ export default function App() {
   const [currentCycle, setCurrentCycle] = useState(null)
   const [lastFinishedCycle, setLastFinishedCycle] = useState(null)
   const [learningStatus, setLearningStatus] = useState(null)
+  const [learningResult, setLearningResult] = useState(null)
+  const [learningResultError, setLearningResultError] = useState('')
   const [learningTargetStatus, setLearningTargetStatus] = useState(null)
   const [visualLearningStatus, setVisualLearningStatus] = useState(null)
   const [learningStatusError, setLearningStatusError] = useState('')
   const [learningWidgetOpen, setLearningWidgetOpen] = useState(false)
   const [learningModalOpen, setLearningModalOpen] = useState(false)
   const learningVisualTimerRef = useRef(null)
+  const learningResultInitialCycleRef = useRef(null)
+  const learningResultFinalCycleRef = useRef(null)
   const [isCycleLoading, setIsCycleLoading] = useState(false)
   const [cycleError, setCycleError] = useState('')
   const [isFinishCycleModalOpen, setIsFinishCycleModalOpen] = useState(false)
@@ -1217,6 +1517,36 @@ export default function App() {
     }
   }, [])
 
+  const loadLearningResult = useCallback(async (cycleId) => {
+    if (!cycleId) return null
+
+    try {
+      const result = await requestJson(`/api/cycles/${cycleId}/learning-result`)
+      setLearningResult(result)
+      setLearningResultError('')
+      return result
+    } catch (error) {
+      console.error('Failed to load learning result', error)
+      setLearningResult(null)
+      setLearningResultError('Не удалось загрузить результат обучения')
+      return null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!DEV_LEARNING_RESULT_CYCLE_ID) return undefined
+
+    let isMounted = true
+    void loadLearningResult(DEV_LEARNING_RESULT_CYCLE_ID).then((result) => {
+      if (!isMounted || !result) return
+      setLearningWidgetOpen(true)
+    })
+
+    return () => {
+      isMounted = false
+    }
+  }, [loadLearningResult])
+
   const triggerLearningPipeline = (cycleId) => {
     if (!cycleId) return
     void requestJson(`/api/cycles/${cycleId}/learning-pipeline`, {
@@ -1311,22 +1641,40 @@ export default function App() {
     const cycleId = lastFinishedCycle?.id
     if (!cycleId) {
       setLearningStatus(null)
+      setLearningResult(null)
       setLearningTargetStatus(null)
       setVisualLearningStatus(null)
       setLearningStatusError('')
+      setLearningResultError('')
+      learningResultInitialCycleRef.current = null
+      learningResultFinalCycleRef.current = null
       return undefined
     }
 
     let isMounted = true
+    if (learningResultInitialCycleRef.current !== cycleId) {
+      learningResultInitialCycleRef.current = cycleId
+      learningResultFinalCycleRef.current = null
+      void loadLearningResult(cycleId)
+    }
+
     const pollLearningStatus = async () => {
       const status = await loadLearningStatus(cycleId)
       if (!isMounted) return null
+      if (['completed', 'failed'].includes(status?.status) && learningResultFinalCycleRef.current !== cycleId) {
+        learningResultFinalCycleRef.current = cycleId
+        void loadLearningResult(cycleId)
+      }
       return status
     }
 
     void pollLearningStatus()
 
     if (['completed', 'failed'].includes(learningStatus?.status)) {
+      if (learningResultFinalCycleRef.current !== cycleId) {
+        learningResultFinalCycleRef.current = cycleId
+        void loadLearningResult(cycleId)
+      }
       return () => {
         isMounted = false
       }
@@ -1340,7 +1688,7 @@ export default function App() {
       isMounted = false
       clearInterval(learningPoller)
     }
-  }, [lastFinishedCycle?.id, learningStatus?.status, loadLearningStatus])
+  }, [lastFinishedCycle?.id, learningStatus?.status, loadLearningStatus, loadLearningResult])
 
   useEffect(() => {
     if (learningVisualTimerRef.current) {
@@ -1400,6 +1748,14 @@ export default function App() {
     learningTargetStatus,
     visualLearningStatus,
   ])
+
+  const canOpenLearningDetails = Boolean(learningResult?.can_open_details && learningResult?.has_changes)
+
+  useEffect(() => {
+    if (learningModalOpen && !canOpenLearningDetails) {
+      setLearningModalOpen(false)
+    }
+  }, [learningModalOpen, canOpenLearningDetails])
 
   useEffect(() => {
     if (!isLedPlaying) return undefined
@@ -1967,10 +2323,15 @@ export default function App() {
                 <LearningWidget
                   isOpen={learningWidgetOpen}
                   learningStatus={lastFinishedCycle ? visualLearningStatus : null}
+                  learningResult={learningResult}
+                  learningResultError={learningResultError}
                   loadError={learningStatusError}
                   onToggle={() => setLearningWidgetOpen((prev) => !prev)}
                   onClose={() => setLearningWidgetOpen(false)}
-                  onExpand={() => setLearningModalOpen(true)}
+                  onExpand={() => {
+                    if (!canOpenLearningDetails) return
+                    setLearningModalOpen(true)
+                  }}
                 />
               </div>
 
@@ -2278,27 +2639,10 @@ export default function App() {
         />
       ) : null}
       {learningModalOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/62 px-3 py-4 backdrop-blur-md">
-          <div className="absolute inset-0" onClick={() => setLearningModalOpen(false)} />
-          <div className="relative z-10 w-full max-w-md rounded-[28px] border border-white/10 bg-slate-950/90 p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <div className="text-xl font-semibold text-white">Обучение АгроТехКарты</div>
-                <p className="mt-2 text-sm leading-relaxed text-white/62">
-                  Подробный результат обучения будет добавлен следующим этапом.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setLearningModalOpen(false)}
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.045] text-xl text-white/70 transition hover:bg-white/[0.08]"
-                aria-label="Закрыть"
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        </div>
+        <LearningResultModal
+          learningResult={learningResult}
+          onClose={() => setLearningModalOpen(false)}
+        />
       ) : null}
     </div>
   )
