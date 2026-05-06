@@ -1340,6 +1340,631 @@ function LearningResultModal({ learningResult, onClose }) {
   )
 }
 
+function formatGraphNumber(value, digits = 2) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  return number.toFixed(digits).replace(/\.?0+$/, '')
+}
+
+function formatGraphFixed(value, digits = 2) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  return number.toFixed(digits)
+}
+
+function toGraphNumber(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+function smoothPhPoints(points, alpha = 0.22) {
+  if (!Array.isArray(points) || points.length < 3) return points
+
+  let previousSmoothed = points[0].ph
+  let previousRaw = points[0].ph
+  return points.map((point, index) => {
+    const currentPh = toGraphNumber(point?.ph)
+    if (index === 0 || currentPh === null) {
+      previousSmoothed = currentPh ?? previousSmoothed
+      previousRaw = currentPh ?? previousRaw
+      return point
+    }
+
+    const delta = Math.abs(currentPh - previousRaw)
+    const effectiveAlpha = delta > 0.35 ? 0.55 : alpha
+    const smoothed = effectiveAlpha * currentPh + (1 - effectiveAlpha) * previousSmoothed
+    previousSmoothed = smoothed
+    previousRaw = currentPh
+    return {
+      ...point,
+      ph: smoothed,
+    }
+  })
+}
+
+const LIVE_RENDER_DELAY_MS = 2500
+const LIVE_WINDOW_MS = 90000
+const LIVE_RENDER_FPS_MS = 1000 / 30
+const BUFFER_EXTRA_MS = 20000
+const LIVE_BUFFER_LIMIT = 220
+
+function clampGraphValue(value, min, max) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function normalizeGraphPoints(points) {
+  if (!Array.isArray(points)) return []
+
+  return points
+    .map((point, index) => {
+      const ph = toGraphNumber(point?.ph)
+      const timestamp = Date.parse(point?.time)
+      if (ph === null || !Number.isFinite(timestamp)) return null
+      return {
+        ...point,
+        index,
+        ph,
+        timestamp,
+      }
+    })
+    .filter(Boolean)
+}
+
+function formatGraphTimeLabel(timestamp) {
+  if (!Number.isFinite(timestamp)) return ''
+
+  return new Date(timestamp).toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function getInterpolatedPointAtTime(buffer, timestamp) {
+  if (!Array.isArray(buffer) || buffer.length === 0 || !Number.isFinite(timestamp)) return null
+
+  let previousPoint = null
+  let nextPoint = null
+  for (const point of buffer) {
+    if (point.timestamp <= timestamp) {
+      previousPoint = point
+    } else {
+      nextPoint = point
+      break
+    }
+  }
+
+  if (previousPoint && nextPoint && nextPoint.timestamp !== previousPoint.timestamp) {
+    const ratio = clampGraphValue(
+      (timestamp - previousPoint.timestamp) / (nextPoint.timestamp - previousPoint.timestamp),
+      0,
+      1,
+    )
+    return {
+      ...previousPoint,
+      time: new Date(timestamp).toISOString(),
+      label: formatGraphTimeLabel(timestamp),
+      timestamp,
+      ph: previousPoint.ph + (nextPoint.ph - previousPoint.ph) * ratio,
+      isVirtual: true,
+    }
+  }
+
+  if (previousPoint) {
+    return {
+      ...previousPoint,
+      time: new Date(timestamp).toISOString(),
+      label: formatGraphTimeLabel(timestamp),
+      timestamp,
+      isVirtual: true,
+    }
+  }
+
+  if (nextPoint) {
+    return {
+      ...nextPoint,
+      time: new Date(timestamp).toISOString(),
+      label: formatGraphTimeLabel(timestamp),
+      timestamp,
+      isVirtual: true,
+    }
+  }
+
+  return null
+}
+
+function buildSmoothPath(points) {
+  if (!Array.isArray(points) || points.length === 0) return ''
+  if (points.length === 1) return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`
+
+  if (points.length === 2) {
+    return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)} L ${points[1].x.toFixed(1)} ${points[1].y.toFixed(1)}`
+  }
+
+  const midpoint = (from, to) => ({
+    x: (from.x + to.x) / 2,
+    y: (from.y + to.y) / 2,
+  })
+  let path = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`
+  path += ` L ${midpoint(points[0], points[1]).x.toFixed(1)} ${midpoint(points[0], points[1]).y.toFixed(1)}`
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const mid = midpoint(points[index], points[index + 1])
+    path += ` Q ${points[index].x.toFixed(1)} ${points[index].y.toFixed(1)}, ${mid.x.toFixed(1)} ${mid.y.toFixed(1)}`
+  }
+  const last = points[points.length - 1]
+  path += ` L ${last.x.toFixed(1)} ${last.y.toFixed(1)}`
+  return path
+}
+
+function PhLiveChart({ data }) {
+  const incomingPoints = useMemo(() => normalizeGraphPoints(data?.points), [data?.points])
+  const isCycleMode = data?.mode === 'cycle' || Boolean(data?.cycle_id)
+  const isLiveMode = !isCycleMode
+  const rawBufferRef = useRef([])
+  const [bufferVersion, setBufferVersion] = useState(0)
+  const [renderClock, setRenderClock] = useState(Date.now())
+
+  useEffect(() => {
+    if (incomingPoints.length === 0) {
+      rawBufferRef.current = []
+      setBufferVersion((version) => version + 1)
+      return
+    }
+
+    if (isCycleMode) {
+      rawBufferRef.current = incomingPoints.slice(-LIVE_BUFFER_LIMIT)
+      setBufferVersion((version) => version + 1)
+      return
+    }
+
+    const mergedByTime = new Map(rawBufferRef.current.map((point) => [point.time || String(point.timestamp), point]))
+    incomingPoints.forEach((point) => {
+      mergedByTime.set(point.time || String(point.timestamp), point)
+    })
+    const merged = Array.from(mergedByTime.values()).sort((a, b) => a.timestamp - b.timestamp)
+    const newestTimestamp = merged[merged.length - 1]?.timestamp ?? Date.now()
+    const retentionStart = newestTimestamp - (LIVE_RENDER_DELAY_MS + LIVE_WINDOW_MS + BUFFER_EXTRA_MS)
+    rawBufferRef.current = merged
+      .filter((point) => point.timestamp >= retentionStart)
+      .slice(-LIVE_BUFFER_LIMIT)
+      .map((point, index) => ({ ...point, index }))
+    setBufferVersion((version) => version + 1)
+  }, [incomingPoints, isCycleMode])
+
+  useEffect(() => {
+    if (!isLiveMode) {
+      setRenderClock(Date.now())
+      return undefined
+    }
+
+    let frameId = null
+    let lastUpdate = 0
+    const tick = (now) => {
+      if (now - lastUpdate >= LIVE_RENDER_FPS_MS) {
+        setRenderClock(Date.now())
+        lastUpdate = now
+      }
+      frameId = requestAnimationFrame(tick)
+    }
+
+    frameId = requestAnimationFrame(tick)
+    return () => {
+      if (frameId) cancelAnimationFrame(frameId)
+    }
+  }, [isLiveMode])
+
+  const bufferedLivePoints = useMemo(() => rawBufferRef.current, [bufferVersion])
+  const displayTime = renderClock - LIVE_RENDER_DELAY_MS
+  const windowStart = displayTime - LIVE_WINDOW_MS
+  const windowEnd = displayTime
+  const points = useMemo(() => {
+    if (!isLiveMode) {
+      return incomingPoints.slice(-80).map((point, index) => ({ ...point, index }))
+    }
+
+    const leftBoundaryPoint = getInterpolatedPointAtTime(bufferedLivePoints, windowStart)
+    const rightBoundaryPoint = getInterpolatedPointAtTime(bufferedLivePoints, displayTime)
+    const displayPointsByTime = new Map()
+    if (leftBoundaryPoint) {
+      displayPointsByTime.set(String(leftBoundaryPoint.timestamp), leftBoundaryPoint)
+    }
+    bufferedLivePoints
+      .filter((point) => point.timestamp > windowStart && point.timestamp < displayTime)
+      .forEach((point) => {
+        displayPointsByTime.set(String(point.timestamp), point)
+      })
+
+    if (rightBoundaryPoint) {
+      displayPointsByTime.set(String(rightBoundaryPoint.timestamp), rightBoundaryPoint)
+    }
+
+    return Array.from(displayPointsByTime.values())
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map((point, index) => ({ ...point, index }))
+  }, [bufferedLivePoints, displayTime, incomingPoints, isLiveMode, windowEnd, windowStart])
+  const dosingEvents = useMemo(
+    () => (Array.isArray(data?.dosing_events) ? data.dosing_events : []),
+    [data?.dosing_events],
+  )
+  const visibleDosingEvents = dosingEvents.slice(-12)
+  const targetPh = toGraphNumber(data?.target_ph)
+  const targetMin = toGraphNumber(data?.target_min)
+  const targetMax = toGraphNumber(data?.target_max)
+  const values = (isLiveMode ? bufferedLivePoints : points).map((point) => point.ph)
+  if (targetPh !== null) values.push(targetPh)
+  if (targetMin !== null) values.push(targetMin)
+  if (targetMax !== null) values.push(targetMax)
+  const visualPoints = useMemo(() => smoothPhPoints(points), [points])
+
+  if (points.length < 2) {
+    return (
+      <div className="flex h-[360px] items-center justify-center rounded-[22px] border border-white/[0.08] bg-white/[0.018] text-sm text-white/50">
+        Пока нет pH-точек для построения графика.
+      </div>
+    )
+  }
+
+  const width = 920
+  const height = 390
+  const pad = { left: 50, right: 28, top: 34, bottom: 48 }
+  const innerWidth = width - pad.left - pad.right
+  const innerHeight = height - pad.top - pad.bottom
+  const minValue = values.length ? Math.min(...values) : 5.5
+  const maxValue = values.length ? Math.max(...values) : 7.3
+  const liveBaseMin = 5.5
+  const liveBaseMax = 7.3
+  const yMin = isLiveMode && minValue >= liveBaseMin
+    ? liveBaseMin
+    : Math.max(3.5, Math.floor((minValue - 0.25) * 10) / 10)
+  const yMax = isLiveMode && maxValue <= liveBaseMax
+    ? liveBaseMax
+    : Math.min(9, Math.ceil((maxValue + 0.25) * 10) / 10)
+  const valueSpan = Math.max(0.2, yMax - yMin)
+  const validTimes = points.map((point) => point.timestamp).filter(Number.isFinite)
+  const minTime = isLiveMode ? windowStart : (validTimes.length > 1 ? Math.min(...validTimes) : null)
+  const maxTime = isLiveMode ? windowEnd : (validTimes.length > 1 ? Math.max(...validTimes) : null)
+  const timeSpan = minTime !== null && maxTime !== null ? Math.max(1, maxTime - minTime) : null
+  const xForPoint = (point) => {
+    if (timeSpan && Number.isFinite(point.timestamp)) {
+      return pad.left + ((point.timestamp - minTime) / timeSpan) * innerWidth
+    }
+    return pad.left + (point.index / Math.max(1, points.length - 1)) * innerWidth
+  }
+  const yForValue = (value) => pad.top + ((yMax - value) / valueSpan) * innerHeight
+  const chartPoints = visualPoints.map((point) => ({
+    ...point,
+    x: xForPoint(point),
+    y: yForValue(point.ph),
+  }))
+  const linePath = buildSmoothPath(chartPoints)
+  const baselineY = height - pad.bottom
+  const areaPath = `${linePath} L ${chartPoints[chartPoints.length - 1].x.toFixed(1)} ${baselineY} L ${chartPoints[0].x.toFixed(1)} ${baselineY} Z`
+  const gridValues = Array.from({ length: 4 }, (_, index) => yMin + (valueSpan * index) / 3)
+  const xLabels = isLiveMode
+    ? [
+      { x: pad.left, label: formatGraphTimeLabel(windowStart) },
+      { x: pad.left + innerWidth / 2, label: formatGraphTimeLabel(windowStart + LIVE_WINDOW_MS / 2) },
+      { x: width - pad.right, label: formatGraphTimeLabel(windowEnd) },
+    ]
+    : Array.from(new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])).map((index) => ({
+      x: xForPoint(points[index]),
+      label: points[index]?.label || '',
+    }))
+  const rawLastPoint = incomingPoints[incomingPoints.length - 1] || points[points.length - 1]
+  const lastStatus = targetMin !== null && rawLastPoint.ph < targetMin
+    ? 'below'
+    : targetMax !== null && rawLastPoint.ph > targetMax
+      ? 'above'
+      : 'ok'
+  const markerSourcePoints = isLiveMode ? bufferedLivePoints : points
+  const eventMarkers = visibleDosingEvents.map((event, index) => {
+    const eventTime = Date.parse(event?.time)
+    if (isLiveMode && (!Number.isFinite(eventTime) || eventTime < windowStart || eventTime > windowEnd)) return null
+    const nearestPoint = Number.isFinite(eventTime) && markerSourcePoints.length
+      ? markerSourcePoints.reduce((best, point) => (
+        Math.abs(point.timestamp - eventTime) < Math.abs(best.timestamp - eventTime) ? point : best
+      ), markerSourcePoints[0])
+      : markerSourcePoints[Math.min(index, markerSourcePoints.length - 1)]
+    const eventValue = nearestPoint?.ph ?? toGraphNumber(event?.current_ph) ?? rawLastPoint.ph
+    const rawX = Number.isFinite(eventTime) && timeSpan
+      ? pad.left + ((eventTime - minTime) / timeSpan) * innerWidth
+      : xForPoint(nearestPoint)
+    return {
+      key: `${event?.time || index}-${event?.pump_id || 'dose'}`,
+      x: clampGraphValue(rawX, pad.left + 12, width - pad.right - 12),
+      y: clampGraphValue(yForValue(eventValue), pad.top + 14, height - pad.bottom - 14),
+      pumpId: event?.pump_id,
+      label: event?.label || '',
+    }
+  }).filter(Boolean)
+  return (
+    <div className="overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/20 px-2 py-3">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full">
+        <defs>
+          <linearGradient id="phLineGradient" x1="0" x2="1" y1="0" y2="0">
+            <stop offset="0%" stopColor="#5fb8d3" />
+            <stop offset="100%" stopColor="#8fc7df" />
+          </linearGradient>
+          <linearGradient id="phAreaGradient" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="rgba(95,184,211,0.08)" />
+            <stop offset="55%" stopColor="rgba(95,184,211,0.025)" />
+            <stop offset="100%" stopColor="rgba(56,189,248,0)" />
+          </linearGradient>
+          <linearGradient id="phTargetZoneGradient" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="rgba(45,212,191,0.055)" />
+            <stop offset="50%" stopColor="rgba(52,211,153,0.045)" />
+            <stop offset="100%" stopColor="rgba(45,212,191,0.055)" />
+          </linearGradient>
+          <clipPath id="phChartClip">
+            <rect x={pad.left} y={pad.top} width={innerWidth} height={innerHeight} />
+          </clipPath>
+        </defs>
+
+        {gridValues.map((value) => {
+          const y = yForValue(value)
+          return (
+            <g key={`grid-${value}`}>
+              <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} stroke="rgba(255,255,255,0.055)" />
+              <text x={pad.left - 14} y={y + 4} textAnchor="end" className="fill-white/36 text-[11px]">
+                {formatGraphNumber(value, 1)}
+              </text>
+            </g>
+          )
+        })}
+
+        {targetMin !== null && targetMax !== null ? (
+          <rect
+            x={pad.left}
+            y={yForValue(targetMax)}
+            width={innerWidth}
+            height={Math.max(2, yForValue(targetMin) - yForValue(targetMax))}
+            rx="18"
+            fill="url(#phTargetZoneGradient)"
+          />
+        ) : null}
+
+        <path d={areaPath} fill="url(#phAreaGradient)" clipPath="url(#phChartClip)" />
+
+        {targetPh !== null ? (
+          <line
+            x1={pad.left}
+            x2={width - pad.right}
+            y1={yForValue(targetPh)}
+            y2={yForValue(targetPh)}
+            stroke="rgba(180,170,215,0.46)"
+            strokeDasharray="7 9"
+            strokeWidth="1.5"
+          />
+        ) : null}
+
+        <path d={linePath} fill="none" stroke="url(#phLineGradient)" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" clipPath="url(#phChartClip)" />
+
+        <g clipPath="url(#phChartClip)">
+          {eventMarkers.map((marker) => (
+            <g key={marker.key} transform={`translate(${marker.x} ${marker.y})`}>
+              <circle
+                r="8"
+                fill={marker.pumpId === 'ph_down' ? 'rgba(251,146,60,0.16)' : 'rgba(125,160,220,0.18)'}
+                stroke={marker.pumpId === 'ph_down' ? 'rgba(251,146,60,0.50)' : 'rgba(147,197,253,0.48)'}
+                strokeWidth="1.2"
+              />
+              <text
+                y="4"
+                textAnchor="middle"
+                className={marker.pumpId === 'ph_down' ? 'fill-orange-100 text-[11px] font-bold' : 'fill-blue-100 text-[11px] font-bold'}
+              >
+                {marker.pumpId === 'ph_down' ? '↓' : '↑'}
+              </text>
+            </g>
+          ))}
+        </g>
+
+        {xLabels.map((tick, index) => (
+          <text key={`x-${index}`} x={tick.x} y={height - 18} textAnchor="middle" className="fill-white/34 text-[11px]">
+            {tick.label || ''}
+          </text>
+        ))}
+      </svg>
+
+      {lastStatus !== 'ok' ? (
+        <div className="mt-3 inline-flex rounded-full border border-amber-300/16 bg-amber-300/[0.075] px-3 py-1 text-xs font-semibold text-amber-100/90">
+          pH {lastStatus === 'below' ? 'ниже' : 'выше'} диапазона удержания
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function PhGraphsView({
+  data,
+  loading,
+  error,
+  graphCycleId,
+  onLiveClick,
+  onReload,
+}) {
+  const points = Array.isArray(data?.points) ? data.points : []
+  const dosingEvents = Array.isArray(data?.dosing_events) ? data.dosing_events : []
+  const summary = data?.summary || {}
+  const dosingChannels = data?.dosing_channels || {}
+  const channels = dosingChannels.channels || dosingChannels
+  const phUpConnected = Boolean(channels.ph_up?.connected)
+  const phDownConnected = Boolean(channels.ph_down?.connected)
+  const anyDosingConnected = Boolean(dosingChannels.any_connected)
+  const hasStaleDosingChannel = [channels.ph_up?.status, channels.ph_down?.status].includes('stale')
+  const lastPoint = points[points.length - 1]
+  const targetText = data?.target_ph === null || data?.target_ph === undefined
+    ? 'Целевой pH не задан.'
+    : formatGraphNumber(data.target_ph)
+  const rangeText = data?.target_min === null || data?.target_min === undefined || data?.target_max === null || data?.target_max === undefined
+    ? 'Целевой pH не задан.'
+    : `${formatGraphNumber(data.target_min)}–${formatGraphNumber(data.target_max)}`
+  const phUp = summary.ph_up_doses ?? 0
+  const phDown = summary.ph_down_doses ?? 0
+  const dosingSummaryValue = anyDosingConnected ? `${phUp} / ${phDown}` : 'ожидание ESP32'
+  const dosingSummaryHint = anyDosingConnected
+    ? (dosingEvents.length ? 'подключённые каналы' : 'доз пока нет')
+    : hasStaleDosingChannel
+      ? 'статус дозаторов устарел'
+      : 'каналы не подключены'
+
+  const statCards = [
+    {
+      label: 'Последний pH',
+      value: formatGraphFixed(lastPoint?.ph),
+      hint: points.length ? `${points.length} точек` : 'нет данных',
+      icon: '∿',
+      accent: 'text-cyan-100',
+      shell: 'from-cyan-300/[0.11] to-slate-950/0',
+    },
+    {
+      label: 'Целевой pH',
+      value: targetText,
+      hint: data?.tolerance ? `±${formatGraphNumber(data.tolerance)}` : 'Целевой pH не задан.',
+      icon: '◎',
+      accent: 'text-violet-100',
+      shell: 'from-violet-300/[0.10] to-slate-950/0',
+    },
+    {
+      label: 'Диапазон удержания',
+      value: rangeText,
+      hint: data?.target_min !== null && data?.target_min !== undefined ? 'зона допуска' : 'Целевой диапазон не задан',
+      icon: '◌',
+      accent: 'text-emerald-100',
+      shell: 'from-emerald-300/[0.10] to-slate-950/0',
+    },
+    {
+      label: 'pH Up / pH Down',
+      value: dosingSummaryValue,
+      hint: dosingSummaryHint,
+      icon: '↕',
+      accent: 'text-fuchsia-100',
+      shell: 'from-fuchsia-300/[0.09] to-slate-950/0',
+    },
+  ]
+
+  return (
+    <div className="custom-scrollbar flex min-w-0 max-w-full flex-col gap-4 min-[1700px]:h-full min-[1700px]:min-h-0 min-[1700px]:overflow-y-auto min-[1700px]:pr-1">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[24px] font-semibold tracking-tight text-white md:text-[28px]">Графики цикла</div>
+          <p className="mt-1.5 text-sm text-white/62">Динамика pH, целевой диапазон и события дозирования.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {graphCycleId ? (
+            <span className="rounded-full border border-violet-300/18 bg-violet-300/[0.08] px-3 py-1.5 text-xs font-semibold text-violet-100/90">
+              DEMO cycle #{graphCycleId}
+            </span>
+          ) : (
+            <span className="rounded-full border border-emerald-300/16 bg-emerald-300/[0.075] px-3 py-1.5 text-xs font-semibold text-emerald-100/90">
+              LIVE
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={onLiveClick}
+            className={`h-8 rounded-xl border px-3 text-xs font-semibold transition ${
+              graphCycleId
+                ? 'border-cyan-200/18 bg-cyan-300/[0.08] text-cyan-100 hover:bg-cyan-300/[0.12]'
+                : 'border-emerald-200/18 bg-emerald-300/[0.08] text-emerald-100'
+            }`}
+          >
+            {graphCycleId ? 'Вернуться в Live' : 'Текущий цикл'}
+          </button>
+          <button
+            type="button"
+            onClick={onReload}
+            className="h-8 rounded-xl border border-white/10 bg-white/[0.035] px-3 text-xs font-semibold text-white/64 transition hover:bg-white/[0.07] hover:text-white"
+          >
+            Обновить
+          </button>
+        </div>
+      </div>
+
+      <div className="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-4">
+        {statCards.map((card) => (
+          <GlassCard key={card.label} className={`rounded-[22px] border-white/[0.08] bg-gradient-to-br ${card.shell}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-white/36">{card.label}</div>
+                <div className={`mt-3 truncate text-[25px] font-semibold leading-none ${card.accent}`}>{card.value}</div>
+                <div className="mt-2 truncate text-xs text-white/42">{card.hint}</div>
+              </div>
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-white/[0.08] bg-white/[0.035] text-sm font-semibold text-white/50">
+                {card.icon}
+              </div>
+            </div>
+          </GlassCard>
+        ))}
+      </div>
+
+      <GlassCard className="relative min-h-[520px] rounded-[28px] border-white/[0.08] bg-white/[0.018]">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-[20px] font-semibold text-white">{graphCycleId ? 'pH цикла' : 'Live pH раствора'}</div>
+            <p className="mt-1 text-sm text-white/52">
+              {graphCycleId ? 'Исторические данные завершённого цикла.' : 'Данные обновляются каждые 2 секунды в live-режиме.'}
+            </p>
+          </div>
+          <div className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+            data?.mode === 'cycle'
+              ? 'border-violet-300/18 bg-violet-300/[0.08] text-violet-100/86'
+              : 'border-emerald-300/16 bg-emerald-300/[0.075] text-emerald-100/86'
+          }`}>
+            {data?.mode === 'cycle' ? `DEMO cycle #${graphCycleId || data?.cycle_id || ''}` : 'LIVE'}
+          </div>
+        </div>
+
+        {error ? (
+          <div className="mb-3 rounded-2xl border border-amber-300/16 bg-amber-300/[0.075] px-4 py-3 text-sm text-amber-100/90">{error}</div>
+        ) : null}
+        {loading && !data ? (
+          <div className="flex h-[390px] items-center justify-center rounded-[24px] border border-white/[0.08] bg-white/[0.018]">
+            <div className="text-center">
+              <div className="mx-auto mb-3 h-2 w-40 overflow-hidden rounded-full bg-white/[0.06]">
+                <div className="h-full w-1/2 animate-pulse rounded-full bg-cyan-200/35" />
+              </div>
+              <div className="text-sm text-white/50">Загружаем pH-график...</div>
+            </div>
+          </div>
+        ) : (
+          <PhLiveChart data={data} />
+        )}
+
+        <div className="mt-4 flex flex-wrap gap-2 text-xs text-white/54">
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-1.5 w-5 rounded-full bg-cyan-300/70" />pH</span>
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-0.5 w-5 border-t border-dashed border-violet-300/70" />целевой pH</span>
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-2.5 w-5 rounded bg-emerald-300/14" />зона допуска</span>
+          {phUpConnected ? (
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="flex h-4 w-4 items-center justify-center rounded-full border border-blue-200/24 bg-blue-300/10 text-[10px] text-blue-100">↑</span>pH Up</span>
+          ) : null}
+          {phDownConnected ? (
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="flex h-4 w-4 items-center justify-center rounded-full border border-orange-200/24 bg-orange-300/10 text-[10px] text-orange-100">↓</span>pH Down</span>
+          ) : null}
+          {!anyDosingConnected ? (
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.07] bg-white/[0.018] px-3 py-1 text-white/36">дозаторы: ожидание ESP32</span>
+          ) : null}
+        </div>
+
+        {!anyDosingConnected ? (
+          <div className="mt-3 max-w-2xl text-xs leading-5 text-white/38">
+            {hasStaleDosingChannel
+              ? 'Статус дозаторов устарел, маркеры временно скрыты.'
+              : 'Дозаторы pH Up / pH Down ожидают подключения ESP32. Маркеры дозирования появятся после подключения каналов.'}
+          </div>
+        ) : null}
+
+        {data && data.target_ph === null ? (
+          <div className="mt-3 text-xs text-white/38">Целевой диапазон не задан.</div>
+        ) : null}
+        {data && dosingEvents.length === 0 ? (
+          <div className="mt-1 text-xs text-white/38">Событий дозирования пока нет.</div>
+        ) : null}
+      </GlassCard>
+    </div>
+  )
+}
+
 export default function App() {
   const [mode, setMode] = useState('monitoring')
   const [metrics, setMetrics] = useState(initialMetrics)
@@ -1388,6 +2013,10 @@ export default function App() {
   const [phTargetMessage, setPhTargetMessage] = useState('')
   const [phTargetError, setPhTargetError] = useState('')
   const [phTargetConfigured, setPhTargetConfigured] = useState(false)
+  const [phGraphData, setPhGraphData] = useState(null)
+  const [phGraphLoading, setPhGraphLoading] = useState(false)
+  const [phGraphError, setPhGraphError] = useState('')
+  const [graphCycleId, setGraphCycleId] = useState(null)
 
   const pushThought = () => undefined
 
@@ -1542,6 +2171,26 @@ export default function App() {
     }
   }, [])
 
+  const loadPhGraphData = useCallback(async ({ cycleId = null } = {}) => {
+    setPhGraphLoading(true)
+    setPhGraphError('')
+    try {
+      const path = cycleId
+        ? `/api/charts/ph-live?cycle_id=${encodeURIComponent(cycleId)}`
+        : `/api/charts/ph-live?tray_id=${encodeURIComponent(DEFAULT_TRAY_ID)}`
+      const data = await requestJson(path)
+      setPhGraphData(data)
+      return data
+    } catch (error) {
+      console.error('Failed to load pH graph', error)
+      setPhGraphError(getErrorMessage(error, 'Не удалось загрузить pH-график'))
+      setPhGraphData(null)
+      return null
+    } finally {
+      setPhGraphLoading(false)
+    }
+  }, [])
+
   const triggerLearningPipeline = (cycleId) => {
     if (!cycleId) return
     void requestJson(`/api/cycles/${cycleId}/learning-pipeline`, {
@@ -1627,10 +2276,12 @@ export default function App() {
       if (cycleId) {
         learningResultInitialCycleRef.current = cycleId
         learningResultFinalCycleRef.current = cycleId
+        setGraphCycleId(cycleId)
         setLastFinishedCycle({
           id: cycleId,
           crop_slug: response?.crop_slug || result.crop_slug || cropSlug,
         })
+        void loadPhGraphData({ cycleId })
       }
       setLearningResult(result)
       setLearningResultError('')
@@ -1638,7 +2289,7 @@ export default function App() {
       setLearningTargetStatus(null)
       setVisualLearningStatus(null)
       setLearningWidgetOpen(true)
-      setMode('monitoring')
+      setMode('graphs')
     } catch (error) {
       console.error('Failed to create demo learning result', error)
       setDemoLearningError(getErrorMessage(error, 'DEMO недоступен'))
@@ -1678,6 +2329,19 @@ export default function App() {
       isMounted = false
     }
   }, [])
+
+  useEffect(() => {
+    if (mode !== 'graphs') return undefined
+
+    void loadPhGraphData({ cycleId: graphCycleId })
+    if (graphCycleId) return undefined
+
+    const graphPoller = setInterval(() => {
+      void loadPhGraphData({ cycleId: null })
+    }, TELEMETRY_POLL_INTERVAL_MS)
+
+    return () => clearInterval(graphPoller)
+  }, [mode, graphCycleId, loadPhGraphData])
 
   useEffect(() => {
     if (!currentCycle) {
@@ -2657,8 +3321,11 @@ export default function App() {
   </div>
 )
 
-  const headerDevControls = DEV_FEATURES_ENABLED ? (
-    <div className="flex shrink-0 items-center gap-2">
+  const devDemoPanel = DEV_FEATURES_ENABLED ? (
+    <div className="flex w-full max-w-[340px] shrink-0 items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-2 py-1 shadow-[0_12px_36px_rgba(0,0,0,0.12)] backdrop-blur-xl">
+      <span className="rounded-lg border border-emerald-300/14 bg-emerald-300/[0.07] px-2 py-1 text-[11px] font-semibold text-emerald-200">
+        DEV
+      </span>
       <select
         value={selectedDemoCropSlug}
         onChange={(event) => {
@@ -2677,17 +3344,37 @@ export default function App() {
         type="button"
         onClick={handleCreateDemoLearningResult}
         disabled={demoLearningLoading}
-        className="h-8 w-[72px] rounded-xl border border-violet-200/20 bg-gradient-to-r from-violet-500/70 to-emerald-400/55 px-2 text-xs font-semibold text-white shadow-[0_0_18px_rgba(139,92,246,0.18)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+        className="h-8 w-[68px] rounded-xl border border-violet-200/20 bg-gradient-to-r from-violet-500/70 to-emerald-400/55 px-2 text-xs font-semibold text-white shadow-[0_0_18px_rgba(139,92,246,0.18)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
       >
         {demoLearningLoading ? '...' : 'DEMO'}
       </button>
       {demoLearningError ? (
-        <span className="max-w-[120px] truncate text-[11px] font-medium text-rose-200/90" title={demoLearningError}>
+        <span className="max-w-[58px] truncate text-[11px] font-medium text-rose-200/90" title={demoLearningError}>
           {demoLearningError}
         </span>
       ) : null}
     </div>
   ) : null
+
+  const renderActiveView = () => {
+    if (mode === 'graphs') {
+      return (
+        <PhGraphsView
+          data={phGraphData}
+          loading={phGraphLoading}
+          error={phGraphError}
+          graphCycleId={graphCycleId}
+          onLiveClick={() => {
+            setGraphCycleId(null)
+            void loadPhGraphData({ cycleId: null })
+          }}
+          onReload={() => void loadPhGraphData({ cycleId: graphCycleId })}
+        />
+      )
+    }
+
+    return mode === 'monitoring' ? renderMonitoring() : renderManual()
+  }
 
   return (
     <div className="farm-shell relative min-h-screen overflow-x-hidden px-3 py-3 md:px-4 md:py-4 lg:px-6 lg:py-6 min-[1700px]:h-screen min-[1700px]:overflow-hidden">
@@ -2697,11 +3384,16 @@ export default function App() {
           setMode={setMode}
           currentTime={currentTime}
           currentDate={currentDate}
-          devControls={headerDevControls}
         />
 
+        {devDemoPanel ? (
+          <div className="flex min-w-0 justify-end">
+            {devDemoPanel}
+          </div>
+        ) : null}
+
         <main className="grid min-w-0 gap-4 min-[1700px]:min-h-0 min-[1700px]:flex-1 min-[1700px]:grid-cols-[minmax(0,1fr)_340px] min-[1900px]:grid-cols-[minmax(0,1fr)_360px]">
-          <div className="flex min-w-0 flex-col min-[1700px]:h-full min-[1700px]:min-h-0">{mode === 'monitoring' ? renderMonitoring() : renderManual()}</div>
+          <div className="flex min-w-0 flex-col min-[1700px]:h-full min-[1700px]:min-h-0">{renderActiveView()}</div>
 
           <aside className="flex min-h-[520px] min-w-0 flex-col min-[1700px]:h-full min-[1700px]:min-h-0">
             <ChatPanel

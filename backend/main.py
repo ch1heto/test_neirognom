@@ -45,6 +45,9 @@ from db import (
     get_cycle_result,
     get_crop_agrotech_card_from_db,
     get_crop_learning_history,
+    get_cycle_ph_dosing_events,
+    get_cycle_ph_target_settings,
+    get_cycle_ph_telemetry_points,
     get_database_model_summary,
     get_agrotech_revision_proposal,
     get_cycle_agrotech_revision_proposal,
@@ -58,6 +61,7 @@ from db import (
     get_recent_anomaly_events,
     get_recent_device_events,
     get_recent_ph_dosing_events,
+    get_recent_ph_telemetry_points,
     get_recent_ai_logs,
     get_recent_ai_recommendations,
     get_recent_hourly_summary,
@@ -97,6 +101,7 @@ load_dotenv(BASE_DIR.parent / ".env")
 BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 SENSORS_TOPIC = "farm/+/sensors/#"
+PH_ACTUATOR_STATUS_TOPIC = "farm/+/actuators/ph/status"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
 DEV_FEATURES_ENABLED = os.getenv("DEV_FEATURES_ENABLED") == "true"
 client = AsyncOpenAI(
@@ -145,6 +150,61 @@ def parse_float_env(name: str, default: float) -> float:
     return value if math.isfinite(value) else default
 
 
+def format_runtime_timestamp(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return None
+
+
+def ph_pump_channel_status(last_seen: Any) -> str:
+    if not isinstance(last_seen, datetime):
+        return "waiting_for_esp32"
+    age_seconds = max(0.0, (datetime.now() - last_seen).total_seconds())
+    return "stale" if age_seconds > PH_PUMP_CHANNEL_STALE_SECONDS else "connected"
+
+
+def update_ph_pump_channel_state(pump_id: str, payload: dict[str, Any] | None = None) -> None:
+    normalized_pump_id = str(pump_id or "").strip()
+    if normalized_pump_id not in PH_PUMP_CHANNEL_IDS:
+        return
+    ph_pump_channel_state[normalized_pump_id]["last_seen"] = datetime.now()
+    ph_pump_channel_state[normalized_pump_id]["payload"] = payload if isinstance(payload, dict) else None
+    print(f"[PH_CHANNEL] {normalized_pump_id} connected")
+
+
+def get_ph_pump_channel_state() -> dict[str, Any]:
+    channels: dict[str, dict[str, Any]] = {}
+    for pump_id in PH_PUMP_CHANNEL_IDS:
+        channel = ph_pump_channel_state.get(pump_id, {})
+        last_seen = channel.get("last_seen")
+        status = ph_pump_channel_status(last_seen)
+        channels[pump_id] = {
+            "status": status,
+            "connected": status == "connected",
+            "last_seen": format_runtime_timestamp(last_seen),
+        }
+    any_connected = any(channel["connected"] for channel in channels.values())
+    any_seen = any(channel["last_seen"] for channel in channels.values())
+    any_stale = any(channel["status"] == "stale" for channel in channels.values())
+    if any_connected:
+        message = "pH-дозаторы подключены."
+    elif any_stale or any_seen:
+        message = "Статус pH-дозаторов устарел."
+    else:
+        message = "Ожидание подключения ESP32-дозаторов pH Up / pH Down."
+    return {
+        "channels": channels,
+        "any_connected": any_connected,
+        "message": message,
+    }
+
+
+def is_ph_pump_channel_connected(pump_id: str) -> bool:
+    state = get_ph_pump_channel_state()
+    channel = state.get("channels", {}).get(pump_id)
+    return bool(channel and channel.get("connected"))
+
+
 KNOWN_SENSOR_TOPICS = {
     "farm/tray_1/sensors/climate",
     "farm/tray_1/sensors/water",
@@ -166,6 +226,15 @@ PH_DOSING_BLOCKED_LOG_COOLDOWN_SECONDS = parse_positive_int_env(
     "PH_DOSING_BLOCKED_LOG_COOLDOWN_SECONDS",
     120,
 )
+PH_PUMP_CHANNEL_STALE_SECONDS = 30
+PH_PUMP_CHANNEL_IDS = ("ph_up", "ph_down")
+ph_pump_channel_state: dict[str, dict[str, Any]] = {
+    pump_id: {
+        "last_seen": None,
+        "payload": None,
+    }
+    for pump_id in PH_PUMP_CHANNEL_IDS
+}
 PREDICTIVE_WATCHDOG_INTERVAL_SECONDS = 600
 PREDICTIVE_HISTORY_HOURS = 8
 PREDICTIVE_HORIZON_HOURS = 4
@@ -4765,13 +4834,48 @@ def build_chat_prompt(
 def on_connect(client, userdata, flags, reason_code, properties) -> None:
     if reason_code == 0:
         client.subscribe(SENSORS_TOPIC)
+        client.subscribe(PH_ACTUATOR_STATUS_TOPIC)
     else:
         print(f"[БЭКЕНД] Ошибка подключения к MQTT: {reason_code}")
+
+
+def mqtt_truthy_status(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"online", "connected", "true", "ok", "ready"}
+    return False
+
+
+def handle_ph_actuator_status_message(topic: str, payload: str) -> None:
+    if not topic.endswith("/actuators/ph/status"):
+        return
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict):
+        return
+
+    channels = data.get("channels")
+    if isinstance(channels, dict):
+        for pump_id in PH_PUMP_CHANNEL_IDS:
+            if channels.get(pump_id) is True:
+                update_ph_pump_channel_state(pump_id, data)
+
+    pump_id = str(data.get("pump_id") or "").strip()
+    if pump_id in PH_PUMP_CHANNEL_IDS and (
+        data.get("connected") is True
+        or mqtt_truthy_status(data.get("status"))
+    ):
+        update_ph_pump_channel_state(pump_id, data)
 
 
 def on_message(client, userdata, msg) -> None:
     payload = msg.payload.decode("utf-8")
     parts = msg.topic.split("/")
+
+    handle_ph_actuator_status_message(msg.topic, payload)
 
     if "sensors" in msg.topic and msg.topic in KNOWN_SENSOR_TOPICS:
         save_telemetry(msg.topic, payload)
@@ -5614,6 +5718,165 @@ def api_get_ph_dosing_events(
     limit: int = Query(default=20, ge=1, le=200),
 ) -> list[dict[str, Any]]:
     return get_recent_ph_dosing_events(tray_id=tray_id, limit=limit)
+
+
+@app.get("/api/ph-dosing/channels/status")
+def api_get_ph_dosing_channels_status() -> dict[str, Any]:
+    return get_ph_pump_channel_state()
+
+
+def ph_chart_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def ph_chart_label(time_text: Any) -> str:
+    text = str(time_text or "")
+    return text[-8:] if len(text) >= 8 else text
+
+
+def normalize_ph_chart_event(event: dict[str, Any]) -> dict[str, Any]:
+    time_text = event.get("created_at")
+    return {
+        "time": time_text,
+        "label": ph_chart_label(time_text),
+        "pump_id": event.get("pump_id"),
+        "status": event.get("status"),
+        "current_ph": ph_chart_number(event.get("current_ph")),
+        "target_ph": ph_chart_number(event.get("target_ph")),
+        "duration_ms": event.get("duration_ms"),
+        "reason": event.get("reason") or event.get("safety_reason"),
+    }
+
+
+def build_ph_chart_summary(
+    points: list[dict[str, Any]],
+    dosing_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    values = [ph_chart_number(point.get("ph")) for point in points]
+    values = [value for value in values if value is not None]
+    ph_up_doses = sum(1 for event in dosing_events if event.get("pump_id") == "ph_up")
+    ph_down_doses = sum(1 for event in dosing_events if event.get("pump_id") == "ph_down")
+    return {
+        "min_ph": round(min(values), 2) if values else None,
+        "avg_ph": round(sum(values) / len(values), 2) if values else None,
+        "max_ph": round(max(values), 2) if values else None,
+        "ph_up_doses": ph_up_doses,
+        "ph_down_doses": ph_down_doses,
+    }
+
+
+def resolve_ph_chart_target(
+    dosing_events: list[dict[str, Any]],
+    settings: dict[str, Any] | None,
+) -> dict[str, float | None]:
+    for event in reversed(dosing_events):
+        target_ph = ph_chart_number(event.get("target_ph"))
+        tolerance = ph_chart_number(event.get("tolerance"))
+        target_min = ph_chart_number(event.get("target_min"))
+        target_max = ph_chart_number(event.get("target_max"))
+        if target_ph is not None or target_min is not None or target_max is not None:
+            if tolerance is None and target_ph is not None and target_min is not None:
+                tolerance = round(abs(target_ph - target_min), 3)
+            if target_min is None and target_ph is not None and tolerance is not None:
+                target_min = round(target_ph - tolerance, 3)
+            if target_max is None and target_ph is not None and tolerance is not None:
+                target_max = round(target_ph + tolerance, 3)
+            return {
+                "target_ph": target_ph,
+                "tolerance": tolerance,
+                "target_min": target_min,
+                "target_max": target_max,
+            }
+
+    if not settings:
+        return {"target_ph": None, "tolerance": None, "target_min": None, "target_max": None}
+
+    return {
+        "target_ph": ph_chart_number(settings.get("target_ph")),
+        "tolerance": ph_chart_number(settings.get("tolerance")),
+        "target_min": ph_chart_number(settings.get("target_min")),
+        "target_max": ph_chart_number(settings.get("target_max")),
+    }
+
+
+def filter_connected_ph_dosing_events(
+    events: list[dict[str, Any]],
+    channels_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    channels = channels_state.get("channels") if isinstance(channels_state, dict) else {}
+    filtered: list[dict[str, Any]] = []
+    for event in events:
+        pump_id = event.get("pump_id")
+        if pump_id not in PH_PUMP_CHANNEL_IDS:
+            continue
+        channel = channels.get(pump_id) if isinstance(channels, dict) else None
+        if isinstance(channel, dict) and channel.get("status") == "connected":
+            filtered.append(event)
+    return filtered
+
+
+@app.get("/api/charts/ph-live")
+def api_get_ph_live_chart(
+    tray_id: str = Query(default="tray_1"),
+    cycle_id: int | None = Query(default=None),
+    limit: int = Query(default=80, ge=1, le=300),
+) -> dict[str, Any]:
+    try:
+        if cycle_id is not None:
+            cycle = get_cycle_with_result(cycle_id)
+            resolved_tray_id = str(cycle.get("tray_id") or tray_id)
+            points = get_cycle_ph_telemetry_points(cycle_id, limit=limit)
+            raw_events = get_cycle_ph_dosing_events(cycle_id, limit=limit)
+            settings = get_cycle_ph_target_settings(cycle_id)
+            mode = "cycle"
+        else:
+            resolved_tray_id = tray_id
+            points = get_recent_ph_telemetry_points(tray_id=resolved_tray_id, limit=limit)
+            raw_events = list(reversed(get_recent_ph_dosing_events(tray_id=resolved_tray_id, limit=limit)))
+            try:
+                settings = get_current_ph_target_settings(resolved_tray_id)
+            except NoActiveGrowingCycleError:
+                settings = None
+            mode = "live"
+    except GrowingCycleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+    channels_state = get_ph_pump_channel_state()
+    visible_raw_events = filter_connected_ph_dosing_events(raw_events, channels_state)
+    dosing_events = [normalize_ph_chart_event(event) for event in visible_raw_events]
+    chart_dosing_channels = {
+        **channels_state.get("channels", {}),
+        "any_connected": channels_state.get("any_connected", False),
+        "message": channels_state.get("message"),
+    }
+    target = resolve_ph_chart_target(raw_events, settings)
+    return {
+        "mode": mode,
+        "cycle_id": cycle_id,
+        "tray_id": resolved_tray_id,
+        "target_ph": target["target_ph"],
+        "tolerance": target["tolerance"],
+        "target_min": target["target_min"],
+        "target_max": target["target_max"],
+        "points": [
+            {
+                "time": point.get("time"),
+                "label": point.get("label") or ph_chart_label(point.get("time")),
+                "ph": ph_chart_number(point.get("ph")),
+            }
+            for point in points
+            if ph_chart_number(point.get("ph")) is not None
+        ],
+        "dosing_events": dosing_events,
+        "dosing_channels": chart_dosing_channels,
+        "summary": build_ph_chart_summary(points, dosing_events),
+    }
 
 
 @app.post("/api/cycles/start")

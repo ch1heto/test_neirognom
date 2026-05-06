@@ -2201,6 +2201,186 @@ def get_latest_water_ph(tray_id: str = DEFAULT_TRAY_ID) -> dict[str, Any] | None
     }
 
 
+def format_chart_time_label(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M:%S")
+    text = format_timestamp(value)
+    return text[-8:] if len(text) >= 8 else text
+
+
+def row_to_ph_chart_point(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "time": format_timestamp(row["recorded_at"]),
+        "label": format_chart_time_label(row["recorded_at"]),
+        "ph": row["value"],
+    }
+
+
+def get_recent_ph_telemetry_points(
+    tray_id: str = DEFAULT_TRAY_ID,
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    normalized_tray_id = normalize_device_id(tray_id) or DEFAULT_TRAY_ID
+    normalized_limit = max(1, min(int(limit), 300))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT recorded_at, value
+                FROM (
+                    SELECT
+                        telemetry_readings.recorded_at,
+                        telemetry_values.value,
+                        telemetry_readings.id
+                    FROM telemetry_values
+                    JOIN telemetry_readings
+                      ON telemetry_readings.id = telemetry_values.reading_id
+                    JOIN catalog_items AS metrics
+                      ON metrics.id = telemetry_values.metric_id
+                     AND metrics.category = 'metric'
+                     AND metrics.code = 'ph'
+                    LEFT JOIN catalog_items AS sensor_types
+                      ON sensor_types.id = telemetry_readings.sensor_type_id
+                     AND sensor_types.category = 'sensor_type'
+                    WHERE telemetry_readings.tray_id = %s
+                      AND (
+                          sensor_types.code = 'water'
+                          OR telemetry_readings.topic = %s
+                          OR telemetry_readings.topic LIKE %s
+                      )
+                    ORDER BY telemetry_readings.recorded_at DESC, telemetry_readings.id DESC
+                    LIMIT %s
+                ) AS recent_points
+                ORDER BY recorded_at ASC, id ASC
+                """,
+                (normalized_tray_id, WATER_TOPIC, "%/water", normalized_limit),
+            )
+            return [row_to_ph_chart_point(row) for row in cursor.fetchall()]
+
+
+def get_cycle_ph_telemetry_points(cycle_id: int, limit: int = 80) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 300))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cycle_row = _select_growing_cycle_by_id(cursor, cycle_id)
+            if cycle_row is None:
+                raise GrowingCycleNotFoundError(f"Growing cycle '{cycle_id}' not found")
+
+            cursor.execute(
+                """
+                SELECT recorded_at, value
+                FROM (
+                    SELECT
+                        telemetry_readings.recorded_at,
+                        telemetry_values.value,
+                        telemetry_readings.id
+                    FROM telemetry_values
+                    JOIN telemetry_readings
+                      ON telemetry_readings.id = telemetry_values.reading_id
+                    JOIN catalog_items AS metrics
+                      ON metrics.id = telemetry_values.metric_id
+                     AND metrics.category = 'metric'
+                     AND metrics.code = 'ph'
+                    LEFT JOIN catalog_items AS sensor_types
+                      ON sensor_types.id = telemetry_readings.sensor_type_id
+                     AND sensor_types.category = 'sensor_type'
+                    WHERE telemetry_readings.tray_id = %s
+                      AND telemetry_readings.recorded_at >= %s
+                      AND (%s::timestamptz IS NULL OR telemetry_readings.recorded_at <= %s)
+                      AND (
+                          sensor_types.code = 'water'
+                          OR telemetry_readings.topic = %s
+                          OR telemetry_readings.topic LIKE %s
+                      )
+                    ORDER BY telemetry_readings.recorded_at DESC, telemetry_readings.id DESC
+                    LIMIT %s
+                ) AS cycle_points
+                ORDER BY recorded_at ASC, id ASC
+                """,
+                (
+                    cycle_row["tray_id"],
+                    cycle_row["started_at"],
+                    cycle_row["finished_at"],
+                    cycle_row["finished_at"],
+                    WATER_TOPIC,
+                    "%/water",
+                    normalized_limit,
+                ),
+            )
+            return [row_to_ph_chart_point(row) for row in cursor.fetchall()]
+
+
+def get_cycle_ph_dosing_events(cycle_id: int, limit: int = 80) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 300))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_dosing_events_schema(cursor)
+            if _select_growing_cycle_by_id(cursor, cycle_id) is None:
+                raise GrowingCycleNotFoundError(f"Growing cycle '{cycle_id}' not found")
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    tray_id,
+                    cycle_id,
+                    status,
+                    action,
+                    pump_id,
+                    reason,
+                    current_ph,
+                    target_ph,
+                    tolerance,
+                    target_min,
+                    target_max,
+                    duration_ms,
+                    mqtt_topic,
+                    mqtt_payload,
+                    safety_reason,
+                    created_at
+                FROM ph_dosing_events
+                WHERE cycle_id = %s
+                ORDER BY created_at ASC, id ASC
+                LIMIT %s
+                """,
+                (cycle_id, normalized_limit),
+            )
+            return [row_to_ph_dosing_event(row) for row in cursor.fetchall()]
+
+
+def get_cycle_ph_target_settings(cycle_id: int) -> dict[str, Any] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            ensure_ph_target_settings_schema(cursor)
+            cycle_row = _select_growing_cycle_by_id(cursor, cycle_id)
+            if cycle_row is None:
+                raise GrowingCycleNotFoundError(f"Growing cycle '{cycle_id}' not found")
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    tray_id,
+                    cycle_id,
+                    target_ph,
+                    tolerance,
+                    autodosing_enabled,
+                    source,
+                    created_at,
+                    updated_at
+                FROM ph_target_settings
+                WHERE cycle_id = %s
+                  AND tray_id = %s
+                LIMIT 1
+                """,
+                (cycle_id, cycle_row["tray_id"]),
+            )
+            settings_row = cursor.fetchone()
+            if settings_row is None:
+                return None
+            return row_to_ph_target_settings(cycle_row, settings_row)
+
+
 def get_ph_dosing_hourly_usage(
     tray_id: str = DEFAULT_TRAY_ID,
     cycle_id: int | None = None,

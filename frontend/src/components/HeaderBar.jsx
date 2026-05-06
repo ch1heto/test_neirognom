@@ -1,7 +1,7 @@
 import { BellIcon, LeafIcon } from './Icons'
 import ModeSwitch from './ModeSwitch'
 
-export default function HeaderBar({ mode, setMode, currentTime, currentDate, devControls = null }) {
+export default function HeaderBar({ mode, setMode, currentTime, currentDate }) {
   return (
     <header className="grid gap-4 xl:grid-cols-[1.18fr_0.82fr_0.5fr]">
       <div className="glass-panel relative overflow-hidden rounded-[28px] px-5 py-4 md:px-6">
@@ -20,10 +20,7 @@ export default function HeaderBar({ mode, setMode, currentTime, currentDate, dev
               </p>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            {devControls}
-            <ModeSwitch mode={mode} onChange={setMode} />
-          </div>
+          <ModeSwitch mode={mode} onChange={setMode} />
         </div>
       </div>
 
