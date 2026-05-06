@@ -3852,6 +3852,51 @@ def get_cycle_agrotech_revision_proposal(cycle_id: int) -> dict[str, Any] | None
             return row_to_agrotech_revision_proposal(cursor.fetchone())
 
 
+def get_cycle_ph_dosing_counts(cycle_id: int) -> dict[str, int]:
+    counts = {"ph_up_doses": 0, "ph_down_doses": 0}
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cycle_row = _select_growing_cycle_by_id(cursor, cycle_id)
+                if cycle_row is None:
+                    return counts
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE status = 'executed'
+                              AND lower(COALESCE(pump_id, action, '')) = 'ph_up'
+                        )::integer AS ph_up_doses,
+                        COUNT(*) FILTER (
+                            WHERE status = 'executed'
+                              AND lower(COALESCE(pump_id, action, '')) = 'ph_down'
+                        )::integer AS ph_down_doses
+                    FROM ph_dosing_events
+                    WHERE cycle_id = %s
+                       OR (
+                            cycle_id IS NULL
+                        AND tray_id = %s
+                        AND created_at >= %s
+                        AND created_at <= COALESCE(%s, now())
+                       )
+                    """,
+                    (
+                        cycle_id,
+                        cycle_row["tray_id"],
+                        cycle_row["started_at"],
+                        cycle_row["finished_at"],
+                    ),
+                )
+                row = cursor.fetchone() or {}
+                return {
+                    "ph_up_doses": int(row.get("ph_up_doses") or 0),
+                    "ph_down_doses": int(row.get("ph_down_doses") or 0),
+                }
+    except psycopg.Error as exc:
+        print(f"[LEARNING RESULT] cycle {cycle_id}: ph dosing counts unavailable - {exc}")
+        return counts
+
+
 def get_agrotech_revision_proposal(proposal_id: int) -> dict[str, Any] | None:
     with get_connection() as connection:
         with connection.cursor() as cursor:

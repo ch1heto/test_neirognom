@@ -67,6 +67,7 @@ from db import (
     get_cycle_ai_recommendations,
     get_cycle_analysis_report,
     get_cycle_ai_analysis,
+    get_cycle_ph_dosing_counts,
     get_cycle_with_result,
     get_cycle_source_revision_context,
     init_db,
@@ -3666,6 +3667,328 @@ def build_cycle_learning_status(cycle_id: int) -> dict[str, Any]:
     }
 
 
+LEARNING_RESULT_BASE_STEPS = (
+    ("questionnaire_saved", "Опросник сохранён"),
+    ("telemetry_collected", "Телеметрия собрана"),
+    ("ph_dosing_collected", "События pH-дозирования учтены"),
+    ("alerts_collected", "Алерты EC / pH / температуры учтены"),
+    ("ai_analysis", "AI-анализ выполнен"),
+    ("proposal_created", "Предложение новой АгроТехКарты"),
+)
+LEARNING_RESULT_FALLBACK_REASONS = {
+    "ph": "Диапазон скорректирован по результатам отклонений pH в завершённом цикле.",
+    "ec": "Диапазон скорректирован по результатам мониторинга электропроводности.",
+    "air_temp": "Параметр скорректирован по результатам температурной динамики цикла.",
+    "humidity": "Параметр скорректирован по результатам динамики влажности.",
+    "control": "Параметр скорректирован по результатам анализа завершённого цикла.",
+}
+LEARNING_RESULT_METRICS = (
+    ("ph", "pH"),
+    ("ec", "EC"),
+    ("air_temp", "Температура воздуха"),
+    ("humidity", "Влажность"),
+)
+
+
+def safe_learning_read(label: str, cycle_id: int, reader) -> Any:
+    try:
+        return reader(cycle_id)
+    except Exception as exc:
+        print(f"[LEARNING RESULT] cycle {cycle_id}: {label} unavailable - {exc}")
+        return None
+
+
+def learning_result_steps(
+    completed_steps: list[str],
+    *,
+    outcome: str | None,
+    has_changes: bool,
+) -> list[dict[str, Any]]:
+    completed = set(completed_steps or [])
+    steps = [
+        {"key": key, "label": label, "done": key in completed}
+        for key, label in LEARNING_RESULT_BASE_STEPS
+    ]
+    last_label = "Новая версия не требуется" if outcome == "no_new_revision" else "Новая версия сохранена"
+    if has_changes:
+        last_label = "Новая версия сохранена"
+    steps.append(
+        {
+            "key": "new_version_saved",
+            "label": last_label,
+            "done": "new_version_saved" in completed,
+        }
+    )
+    return steps
+
+
+def learning_result_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, 3)
+
+
+def learning_result_metric_evidence(summary: dict[str, Any], metric_key: str) -> dict[str, float | None]:
+    metric = summary.get(metric_key) if isinstance(summary, dict) else None
+    if not isinstance(metric, dict) or not metric.get("has_data"):
+        return {"min": None, "avg": None, "max": None}
+    return {
+        "min": learning_result_number(metric.get("min")),
+        "avg": learning_result_number(metric.get("avg")),
+        "max": learning_result_number(metric.get("max")),
+    }
+
+
+def learning_result_alert_count(anomalies_summary: dict[str, Any], metric_key: str) -> int:
+    total = 0
+    groups = anomalies_summary.get("groups") if isinstance(anomalies_summary, dict) else []
+    if not isinstance(groups, list):
+        return 0
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        metric_name = str(group.get("metric_name") or "").lower()
+        event_type = str(group.get("event_type") or "").lower()
+        if metric_name == metric_key or metric_key in event_type:
+            try:
+                total += int(group.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def build_learning_result_evidence(
+    cycle_id: int,
+    report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = report.get("report_payload") if isinstance(report, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    telemetry_summary = payload.get("telemetry_summary") if isinstance(payload.get("telemetry_summary"), dict) else {}
+    anomalies_summary = payload.get("anomalies_summary") if isinstance(payload.get("anomalies_summary"), dict) else {}
+    dosing_counts = safe_learning_read("ph dosing counts", cycle_id, get_cycle_ph_dosing_counts) or {}
+    return {
+        "ph": learning_result_metric_evidence(telemetry_summary, "ph"),
+        "ec": learning_result_metric_evidence(telemetry_summary, "ec"),
+        "air_temp": learning_result_metric_evidence(telemetry_summary, "air_temp"),
+        "humidity": learning_result_metric_evidence(telemetry_summary, "humidity"),
+        "ph_up_doses": int(dosing_counts.get("ph_up_doses") or 0),
+        "ph_down_doses": int(dosing_counts.get("ph_down_doses") or 0),
+        "ec_alerts": learning_result_alert_count(anomalies_summary, "ec"),
+        "ph_alerts": learning_result_alert_count(anomalies_summary, "ph"),
+    }
+
+
+def learning_result_norm_key(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key in ("min", "target", "max"):
+            if key in value:
+                normalized[key] = learning_result_number(value.get(key))
+        if normalized:
+            return normalized
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    number = learning_result_number(value)
+    if number is not None:
+        return number
+    return str(value).strip() if value is not None else None
+
+
+def learning_result_format_number(value: Any) -> str:
+    number = learning_result_number(value)
+    if number is None:
+        return str(value)
+    return f"{number:g}"
+
+
+def learning_result_format_norm(value: Any) -> str:
+    if isinstance(value, dict):
+        low = value.get("min")
+        high = value.get("max")
+        if low is not None and high is not None:
+            return f"{learning_result_format_number(low)}–{learning_result_format_number(high)}"
+        target = value.get("target")
+        if target is not None:
+            return learning_result_format_number(target)
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    if value is None:
+        return ""
+    return learning_result_format_number(value)
+
+
+def learning_result_change_matches(change: dict[str, Any], metric_key: str) -> bool:
+    haystack = " ".join(
+        str(change.get(key) or "")
+        for key in ("parameter", "metric", "section", "section_title", "change_type", "old_value", "new_value")
+    ).lower()
+    if metric_key == "ph":
+        return "ph" in haystack or "pH" in haystack
+    if metric_key == "ec":
+        return "ec" in haystack
+    if metric_key == "air_temp":
+        return any(token in haystack for token in ("air_temp", "temperature", "температур"))
+    if metric_key == "humidity":
+        return any(token in haystack for token in ("humidity", "влажн"))
+    return any(token in haystack for token in ("control", "контрол", "рекомендац"))
+
+
+def learning_result_reason(
+    proposal: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+    metric_key: str,
+) -> str:
+    changes = proposal.get("proposed_changes") if isinstance(proposal, dict) else []
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict) or not learning_result_change_matches(change, metric_key):
+                continue
+            reason = str(change.get("reason") or "").strip()
+            if reason:
+                return reason
+    if isinstance(proposal, dict):
+        reason = str(proposal.get("ai_reasoning") or "").strip()
+        if reason:
+            return reason[:240]
+    if isinstance(analysis, dict):
+        reason = str(analysis.get("revision_reason") or "").strip()
+        if reason:
+            return reason[:240]
+    return LEARNING_RESULT_FALLBACK_REASONS.get(metric_key, LEARNING_RESULT_FALLBACK_REASONS["control"])
+
+
+def build_learning_result_changes(
+    *,
+    proposal: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+    source_revision: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    if not isinstance(proposal, dict) or not proposal.get("applied_revision_id") or not isinstance(source_revision, dict):
+        return []
+    source_norms = source_revision.get("norms") if isinstance(source_revision.get("norms"), dict) else {}
+    proposed_norms = proposal.get("proposed_norms") if isinstance(proposal.get("proposed_norms"), dict) else {}
+    effective_norms = dict(source_norms)
+    for key, value in proposed_norms.items():
+        if value is not None:
+            effective_norms[key] = value
+
+    changes: list[dict[str, str]] = []
+    for metric_key, label in LEARNING_RESULT_METRICS:
+        before_value = source_norms.get(metric_key)
+        after_value = effective_norms.get(metric_key)
+        if learning_result_norm_key(before_value) == learning_result_norm_key(after_value):
+            continue
+        before_text = learning_result_format_norm(before_value)
+        after_text = learning_result_format_norm(after_value)
+        if not before_text or not after_text:
+            continue
+        changes.append(
+            {
+                "parameter": label,
+                "before": before_text,
+                "after": after_text,
+                "reason": learning_result_reason(proposal, analysis, metric_key),
+            }
+        )
+
+    source_content = str(source_revision.get("content") or "").strip()
+    proposed_content = str(proposal.get("proposed_content") or "").strip()
+    proposed_changes = proposal.get("proposed_changes") if isinstance(proposal.get("proposed_changes"), list) else []
+    if source_content and proposed_content and source_content != proposed_content:
+        for change in proposed_changes:
+            if not isinstance(change, dict) or not learning_result_change_matches(change, "control"):
+                continue
+            before_text = str(change.get("old_value") or "").strip()
+            after_text = str(change.get("new_value") or "").strip()
+            if not before_text or not after_text or before_text == after_text:
+                continue
+            changes.append(
+                {
+                    "parameter": "Рекомендации контроля",
+                    "before": before_text[:180],
+                    "after": after_text[:180],
+                    "reason": learning_result_reason(proposal, analysis, "control"),
+                }
+            )
+            break
+    return changes
+
+
+def build_cycle_learning_result(cycle_id: int) -> dict[str, Any]:
+    learning_status = build_cycle_learning_status(cycle_id)
+    report = safe_learning_read("analysis report", cycle_id, get_cycle_analysis_report)
+    analysis = safe_learning_read("ai analysis", cycle_id, get_cycle_ai_analysis)
+    proposal = safe_learning_read("revision proposal", cycle_id, get_cycle_agrotech_revision_proposal)
+    source_revision = (
+        safe_learning_read("source revision", cycle_id, get_cycle_source_revision_context)
+        if isinstance(proposal, dict)
+        else None
+    )
+
+    status = learning_status.get("status") or "idle"
+    outcome = learning_status.get("outcome")
+    version_from = learning_status.get("old_version_label")
+    version_to = learning_status.get("new_version_label")
+    proposal_id = proposal.get("id") if isinstance(proposal, dict) else learning_status.get("proposal_id")
+    changes: list[dict[str, str]] = []
+    has_changes = False
+
+    if status == "completed" and outcome != "no_new_revision":
+        changes = build_learning_result_changes(
+            proposal=proposal,
+            analysis=analysis,
+            source_revision=source_revision,
+        )
+        has_changes = bool(changes)
+
+    if outcome == "no_new_revision":
+        version_to = version_to or version_from
+
+    if status in {"idle", "running"}:
+        message = "Анализ цикла ещё не завершён."
+        changes = []
+        has_changes = False
+    elif status == "failed":
+        message = "Анализ цикла завершился с ошибкой."
+        changes = []
+        has_changes = False
+    elif outcome == "no_new_revision" or not has_changes:
+        message = "Анализ завершён. АгроТехКарта не изменена."
+        changes = []
+        has_changes = False
+        if outcome != "no_new_revision":
+            version_to = version_to or None
+    else:
+        message = "Анализ завершён. Сформирована новая версия АгроТехКарты."
+
+    return {
+        "cycle_id": learning_status.get("cycle_id") or cycle_id,
+        "status": status,
+        "outcome": outcome,
+        "has_changes": has_changes,
+        "can_open_details": has_changes,
+        "crop_slug": learning_status.get("crop_slug"),
+        "crop_name_ru": learning_status.get("crop_name_ru"),
+        "version_from": version_from,
+        "version_to": version_to,
+        "proposal_id": proposal_id,
+        "message": message,
+        "steps": learning_result_steps(
+            learning_status.get("completed_steps") or [],
+            outcome=outcome,
+            has_changes=has_changes,
+        ),
+        "changes": changes,
+        "ai_conclusion": analysis.get("summary") if isinstance(analysis, dict) else None,
+        "evidence": build_learning_result_evidence(cycle_id, report),
+    }
+
+
 async def run_cycle_learning_pipeline_once(
     cycle_id: int,
     auto_apply: bool = True,
@@ -5385,6 +5708,14 @@ async def api_run_cycle_learning_pipeline(
 def api_get_cycle_learning_status(cycle_id: int) -> dict[str, Any]:
     try:
         return build_cycle_learning_status(cycle_id)
+    except GrowingCycleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+
+@app.get("/api/cycles/{cycle_id}/learning-result")
+def api_get_cycle_learning_result(cycle_id: int) -> dict[str, Any]:
+    try:
+        return build_cycle_learning_result(cycle_id)
     except GrowingCycleNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
 
