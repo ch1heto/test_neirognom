@@ -1384,8 +1384,8 @@ function smoothPhPoints(points, alpha = 0.22) {
 
 const LIVE_WINDOW_MS = 90000
 const LIVE_RENDER_FPS_MS = 1000 / 30
-const VISUAL_SAMPLE_INTERVAL_MS = 120
-const VISUAL_FOLLOW_SPEED = 0.035
+const VISUAL_SAMPLE_INTERVAL_MS = 50
+const VISUAL_FOLLOW_TAU_MS = 850
 const VISUAL_INITIAL_POINTS_LIMIT = 80
 
 function clampGraphValue(value, min, max) {
@@ -1452,6 +1452,7 @@ function PhLiveChart({ data }) {
   const visualStreamRef = useRef([])
   const lastSampleTimeRef = useRef(0)
   const lastRenderTimeRef = useRef(0)
+  const lastFrameTimeRef = useRef(Date.now())
   const [renderTick, setRenderTick] = useState(Date.now())
 
   useEffect(() => {
@@ -1465,6 +1466,7 @@ function PhLiveChart({ data }) {
       visualPhRef.current = null
       visualStreamRef.current = []
       lastSampleTimeRef.current = 0
+      lastFrameTimeRef.current = Date.now()
       setRenderTick(Date.now())
       return
     }
@@ -1514,13 +1516,16 @@ function PhLiveChart({ data }) {
     let frameId = null
     const tick = () => {
       const now = Date.now()
+      const deltaMs = Math.min(100, Math.max(0, now - lastFrameTimeRef.current))
+      lastFrameTimeRef.current = now
       const targetPh = targetPhRef.current
       let visualPh = visualPhRef.current
 
       if (targetPh !== null) {
+        const alpha = 1 - Math.exp(-deltaMs / VISUAL_FOLLOW_TAU_MS)
         visualPh = visualPh === null
           ? targetPh
-          : visualPh + (targetPh - visualPh) * VISUAL_FOLLOW_SPEED
+          : visualPh + (targetPh - visualPh) * alpha
         visualPhRef.current = visualPh
 
         if (now - lastSampleTimeRef.current >= VISUAL_SAMPLE_INTERVAL_MS) {
@@ -1553,7 +1558,18 @@ function PhLiveChart({ data }) {
       return incomingPoints.slice(-80).map((point, index) => ({ ...point, index }))
     }
 
-    return visualStreamRef.current
+    const liveTailPoint = visualPhRef.current === null
+      ? null
+      : {
+        timestamp: windowEnd,
+        ph: visualPhRef.current,
+        isLiveTail: true,
+      }
+    const liveLinePoints = liveTailPoint
+      ? [...visualStreamRef.current, liveTailPoint]
+      : visualStreamRef.current
+
+    return liveLinePoints
       .filter((point) => point.timestamp >= windowStart && point.timestamp <= windowEnd)
       .map((point, index) => ({ ...point, index }))
   }, [incomingPoints, isLiveMode, renderTick, windowEnd, windowStart])
