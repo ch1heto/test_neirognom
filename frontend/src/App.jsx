@@ -1382,11 +1382,11 @@ function smoothPhPoints(points, alpha = 0.22) {
   })
 }
 
-const LIVE_RENDER_DELAY_MS = 2500
 const LIVE_WINDOW_MS = 90000
 const LIVE_RENDER_FPS_MS = 1000 / 30
-const BUFFER_EXTRA_MS = 20000
-const LIVE_BUFFER_LIMIT = 220
+const VISUAL_SAMPLE_INTERVAL_MS = 120
+const VISUAL_FOLLOW_SPEED = 0.035
+const VISUAL_INITIAL_POINTS_LIMIT = 80
 
 function clampGraphValue(value, min, max) {
   return Math.min(max, Math.max(min, value))
@@ -1420,59 +1420,6 @@ function formatGraphTimeLabel(timestamp) {
   })
 }
 
-function getInterpolatedPointAtTime(buffer, timestamp) {
-  if (!Array.isArray(buffer) || buffer.length === 0 || !Number.isFinite(timestamp)) return null
-
-  let previousPoint = null
-  let nextPoint = null
-  for (const point of buffer) {
-    if (point.timestamp <= timestamp) {
-      previousPoint = point
-    } else {
-      nextPoint = point
-      break
-    }
-  }
-
-  if (previousPoint && nextPoint && nextPoint.timestamp !== previousPoint.timestamp) {
-    const ratio = clampGraphValue(
-      (timestamp - previousPoint.timestamp) / (nextPoint.timestamp - previousPoint.timestamp),
-      0,
-      1,
-    )
-    return {
-      ...previousPoint,
-      time: new Date(timestamp).toISOString(),
-      label: formatGraphTimeLabel(timestamp),
-      timestamp,
-      ph: previousPoint.ph + (nextPoint.ph - previousPoint.ph) * ratio,
-      isVirtual: true,
-    }
-  }
-
-  if (previousPoint) {
-    return {
-      ...previousPoint,
-      time: new Date(timestamp).toISOString(),
-      label: formatGraphTimeLabel(timestamp),
-      timestamp,
-      isVirtual: true,
-    }
-  }
-
-  if (nextPoint) {
-    return {
-      ...nextPoint,
-      time: new Date(timestamp).toISOString(),
-      label: formatGraphTimeLabel(timestamp),
-      timestamp,
-      isVirtual: true,
-    }
-  }
-
-  return null
-}
-
 function buildSmoothPath(points) {
   if (!Array.isArray(points) || points.length === 0) return ''
   if (points.length === 1) return `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`
@@ -1500,49 +1447,94 @@ function PhLiveChart({ data }) {
   const incomingPoints = useMemo(() => normalizeGraphPoints(data?.points), [data?.points])
   const isCycleMode = data?.mode === 'cycle' || Boolean(data?.cycle_id)
   const isLiveMode = !isCycleMode
-  const rawBufferRef = useRef([])
-  const [bufferVersion, setBufferVersion] = useState(0)
-  const [renderClock, setRenderClock] = useState(Date.now())
-
-  useEffect(() => {
-    if (incomingPoints.length === 0) {
-      rawBufferRef.current = []
-      setBufferVersion((version) => version + 1)
-      return
-    }
-
-    if (isCycleMode) {
-      rawBufferRef.current = incomingPoints.slice(-LIVE_BUFFER_LIMIT)
-      setBufferVersion((version) => version + 1)
-      return
-    }
-
-    const mergedByTime = new Map(rawBufferRef.current.map((point) => [point.time || String(point.timestamp), point]))
-    incomingPoints.forEach((point) => {
-      mergedByTime.set(point.time || String(point.timestamp), point)
-    })
-    const merged = Array.from(mergedByTime.values()).sort((a, b) => a.timestamp - b.timestamp)
-    const newestTimestamp = merged[merged.length - 1]?.timestamp ?? Date.now()
-    const retentionStart = newestTimestamp - (LIVE_RENDER_DELAY_MS + LIVE_WINDOW_MS + BUFFER_EXTRA_MS)
-    rawBufferRef.current = merged
-      .filter((point) => point.timestamp >= retentionStart)
-      .slice(-LIVE_BUFFER_LIMIT)
-      .map((point, index) => ({ ...point, index }))
-    setBufferVersion((version) => version + 1)
-  }, [incomingPoints, isCycleMode])
+  const targetPhRef = useRef(null)
+  const visualPhRef = useRef(null)
+  const visualStreamRef = useRef([])
+  const lastSampleTimeRef = useRef(0)
+  const lastRenderTimeRef = useRef(0)
+  const [renderTick, setRenderTick] = useState(Date.now())
 
   useEffect(() => {
     if (!isLiveMode) {
-      setRenderClock(Date.now())
+      return
+    }
+
+    const latestRawPoint = incomingPoints[incomingPoints.length - 1]
+    if (!latestRawPoint) {
+      targetPhRef.current = null
+      visualPhRef.current = null
+      visualStreamRef.current = []
+      lastSampleTimeRef.current = 0
+      setRenderTick(Date.now())
+      return
+    }
+
+    targetPhRef.current = latestRawPoint.ph
+    if (visualPhRef.current === null) {
+      visualPhRef.current = latestRawPoint.ph
+    }
+
+    if (visualStreamRef.current.length === 0) {
+      const now = Date.now()
+      const initialRawPoints = incomingPoints.slice(-VISUAL_INITIAL_POINTS_LIMIT)
+      if (initialRawPoints.length >= 3) {
+        const oldestTimestamp = initialRawPoints[0].timestamp
+        const newestTimestamp = initialRawPoints[initialRawPoints.length - 1].timestamp
+        const shouldShiftIntoWindow = newestTimestamp < now - LIVE_WINDOW_MS || newestTimestamp > now
+        const timestampOffset = shouldShiftIntoWindow ? now - newestTimestamp : 0
+        visualStreamRef.current = initialRawPoints
+          .map((point) => ({
+            timestamp: point.timestamp + timestampOffset,
+            ph: point.ph,
+            isVisual: true,
+          }))
+          .filter((point, index, allPoints) => (
+            point.timestamp >= now - LIVE_WINDOW_MS || index >= Math.max(0, allPoints.length - 3)
+          ))
+
+        if (visualStreamRef.current.length < 3 && Number.isFinite(oldestTimestamp)) {
+          visualStreamRef.current = initialRawPoints.slice(-3).map((point) => ({
+            timestamp: point.timestamp + timestampOffset,
+            ph: point.ph,
+            isVisual: true,
+          }))
+        }
+        lastSampleTimeRef.current = now
+        setRenderTick(now)
+      }
+    }
+  }, [incomingPoints, isLiveMode])
+
+  useEffect(() => {
+    if (!isLiveMode) {
+      setRenderTick(Date.now())
       return undefined
     }
 
     let frameId = null
-    let lastUpdate = 0
-    const tick = (now) => {
-      if (now - lastUpdate >= LIVE_RENDER_FPS_MS) {
-        setRenderClock(Date.now())
-        lastUpdate = now
+    const tick = () => {
+      const now = Date.now()
+      const targetPh = targetPhRef.current
+      let visualPh = visualPhRef.current
+
+      if (targetPh !== null) {
+        visualPh = visualPh === null
+          ? targetPh
+          : visualPh + (targetPh - visualPh) * VISUAL_FOLLOW_SPEED
+        visualPhRef.current = visualPh
+
+        if (now - lastSampleTimeRef.current >= VISUAL_SAMPLE_INTERVAL_MS) {
+          visualStreamRef.current = [
+            ...visualStreamRef.current,
+            { timestamp: now, ph: visualPh, isVisual: true },
+          ].filter((point) => point.timestamp >= now - LIVE_WINDOW_MS)
+          lastSampleTimeRef.current = now
+        }
+      }
+
+      if (now - lastRenderTimeRef.current >= LIVE_RENDER_FPS_MS) {
+        setRenderTick(now)
+        lastRenderTimeRef.current = now
       }
       frameId = requestAnimationFrame(tick)
     }
@@ -1553,35 +1545,18 @@ function PhLiveChart({ data }) {
     }
   }, [isLiveMode])
 
-  const bufferedLivePoints = useMemo(() => rawBufferRef.current, [bufferVersion])
-  const displayTime = renderClock - LIVE_RENDER_DELAY_MS
-  const windowStart = displayTime - LIVE_WINDOW_MS
-  const windowEnd = displayTime
+  const liveNow = isLiveMode ? renderTick : Date.now()
+  const windowStart = liveNow - LIVE_WINDOW_MS
+  const windowEnd = liveNow
   const points = useMemo(() => {
     if (!isLiveMode) {
       return incomingPoints.slice(-80).map((point, index) => ({ ...point, index }))
     }
 
-    const leftBoundaryPoint = getInterpolatedPointAtTime(bufferedLivePoints, windowStart)
-    const rightBoundaryPoint = getInterpolatedPointAtTime(bufferedLivePoints, displayTime)
-    const displayPointsByTime = new Map()
-    if (leftBoundaryPoint) {
-      displayPointsByTime.set(String(leftBoundaryPoint.timestamp), leftBoundaryPoint)
-    }
-    bufferedLivePoints
-      .filter((point) => point.timestamp > windowStart && point.timestamp < displayTime)
-      .forEach((point) => {
-        displayPointsByTime.set(String(point.timestamp), point)
-      })
-
-    if (rightBoundaryPoint) {
-      displayPointsByTime.set(String(rightBoundaryPoint.timestamp), rightBoundaryPoint)
-    }
-
-    return Array.from(displayPointsByTime.values())
-      .sort((a, b) => a.timestamp - b.timestamp)
+    return visualStreamRef.current
+      .filter((point) => point.timestamp >= windowStart && point.timestamp <= windowEnd)
       .map((point, index) => ({ ...point, index }))
-  }, [bufferedLivePoints, displayTime, incomingPoints, isLiveMode, windowEnd, windowStart])
+  }, [incomingPoints, isLiveMode, renderTick, windowEnd, windowStart])
   const dosingEvents = useMemo(
     () => (Array.isArray(data?.dosing_events) ? data.dosing_events : []),
     [data?.dosing_events],
@@ -1590,11 +1565,13 @@ function PhLiveChart({ data }) {
   const targetPh = toGraphNumber(data?.target_ph)
   const targetMin = toGraphNumber(data?.target_min)
   const targetMax = toGraphNumber(data?.target_max)
-  const values = (isLiveMode ? bufferedLivePoints : points).map((point) => point.ph)
+  const values = isLiveMode ? [] : points.map((point) => point.ph)
   if (targetPh !== null) values.push(targetPh)
   if (targetMin !== null) values.push(targetMin)
   if (targetMax !== null) values.push(targetMax)
-  const visualPoints = useMemo(() => smoothPhPoints(points), [points])
+  const visualPoints = useMemo(() => (
+    isLiveMode ? points : smoothPhPoints(points)
+  ), [isLiveMode, points])
 
   if (points.length < 2) {
     return (
@@ -1613,18 +1590,21 @@ function PhLiveChart({ data }) {
   const maxValue = values.length ? Math.max(...values) : 7.3
   const liveBaseMin = 5.5
   const liveBaseMax = 7.3
-  const yMin = isLiveMode && minValue >= liveBaseMin
+  const yMin = isLiveMode
     ? liveBaseMin
     : Math.max(3.5, Math.floor((minValue - 0.25) * 10) / 10)
-  const yMax = isLiveMode && maxValue <= liveBaseMax
+  const yMax = isLiveMode
     ? liveBaseMax
     : Math.min(9, Math.ceil((maxValue + 0.25) * 10) / 10)
   const valueSpan = Math.max(0.2, yMax - yMin)
   const validTimes = points.map((point) => point.timestamp).filter(Number.isFinite)
-  const minTime = isLiveMode ? windowStart : (validTimes.length > 1 ? Math.min(...validTimes) : null)
-  const maxTime = isLiveMode ? windowEnd : (validTimes.length > 1 ? Math.max(...validTimes) : null)
+  const minTime = !isLiveMode && validTimes.length > 1 ? Math.min(...validTimes) : null
+  const maxTime = !isLiveMode && validTimes.length > 1 ? Math.max(...validTimes) : null
   const timeSpan = minTime !== null && maxTime !== null ? Math.max(1, maxTime - minTime) : null
   const xForPoint = (point) => {
+    if (isLiveMode && Number.isFinite(point?.timestamp)) {
+      return pad.left + ((point.timestamp - windowStart) / LIVE_WINDOW_MS) * innerWidth
+    }
     if (timeSpan && Number.isFinite(point.timestamp)) {
       return pad.left + ((point.timestamp - minTime) / timeSpan) * innerWidth
     }
@@ -1637,8 +1617,6 @@ function PhLiveChart({ data }) {
     y: yForValue(point.ph),
   }))
   const linePath = buildSmoothPath(chartPoints)
-  const baselineY = height - pad.bottom
-  const areaPath = `${linePath} L ${chartPoints[chartPoints.length - 1].x.toFixed(1)} ${baselineY} L ${chartPoints[0].x.toFixed(1)} ${baselineY} Z`
   const gridValues = Array.from({ length: 4 }, (_, index) => yMin + (valueSpan * index) / 3)
   const xLabels = isLiveMode
     ? [
@@ -1650,25 +1628,33 @@ function PhLiveChart({ data }) {
       x: xForPoint(points[index]),
       label: points[index]?.label || '',
     }))
-  const rawLastPoint = incomingPoints[incomingPoints.length - 1] || points[points.length - 1]
-  const lastStatus = targetMin !== null && rawLastPoint.ph < targetMin
+  const rawLastPoint = incomingPoints[incomingPoints.length - 1] || (!isLiveMode ? points[points.length - 1] : null)
+  const rawStatusPh = rawLastPoint?.ph
+  const lastStatus = targetMin !== null && rawStatusPh < targetMin
     ? 'below'
-    : targetMax !== null && rawLastPoint.ph > targetMax
+    : targetMax !== null && rawStatusPh > targetMax
       ? 'above'
       : 'ok'
-  const markerSourcePoints = isLiveMode ? bufferedLivePoints : points
+  const statusText = lastStatus === 'below'
+    ? 'pH ниже диапазона удержания'
+    : lastStatus === 'above'
+      ? 'pH выше диапазона удержания'
+      : 'pH в диапазоне удержания'
   const eventMarkers = visibleDosingEvents.map((event, index) => {
     const eventTime = Date.parse(event?.time)
     if (isLiveMode && (!Number.isFinite(eventTime) || eventTime < windowStart || eventTime > windowEnd)) return null
-    const nearestPoint = Number.isFinite(eventTime) && markerSourcePoints.length
-      ? markerSourcePoints.reduce((best, point) => (
+    const nearestPoint = !isLiveMode && Number.isFinite(eventTime) && points.length
+      ? points.reduce((best, point) => (
         Math.abs(point.timestamp - eventTime) < Math.abs(best.timestamp - eventTime) ? point : best
-      ), markerSourcePoints[0])
-      : markerSourcePoints[Math.min(index, markerSourcePoints.length - 1)]
-    const eventValue = nearestPoint?.ph ?? toGraphNumber(event?.current_ph) ?? rawLastPoint.ph
-    const rawX = Number.isFinite(eventTime) && timeSpan
-      ? pad.left + ((eventTime - minTime) / timeSpan) * innerWidth
-      : xForPoint(nearestPoint)
+      ), points[0])
+      : points[Math.min(index, points.length - 1)]
+    const eventValue = toGraphNumber(event?.current_ph) ?? nearestPoint?.ph ?? rawStatusPh ?? visualPhRef.current
+    const rawX = isLiveMode
+      ? (Number.isFinite(eventTime) ? pad.left + ((eventTime - windowStart) / LIVE_WINDOW_MS) * innerWidth : width - pad.right)
+      : (Number.isFinite(eventTime) && timeSpan
+        ? pad.left + ((eventTime - minTime) / timeSpan) * innerWidth
+        : xForPoint(nearestPoint))
+    if (!Number.isFinite(rawX) || eventValue === null) return null
     return {
       key: `${event?.time || index}-${event?.pump_id || 'dose'}`,
       x: clampGraphValue(rawX, pad.left + 12, width - pad.right - 12),
@@ -1678,22 +1664,17 @@ function PhLiveChart({ data }) {
     }
   }).filter(Boolean)
   return (
-    <div className="overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/20 px-2 py-3">
-      <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full">
+    <div className="overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/20 px-0 pt-0 pb-4">
+      <svg viewBox={`0 0 ${width} ${height}`} className="block h-auto w-full">
         <defs>
           <linearGradient id="phLineGradient" x1="0" x2="1" y1="0" y2="0">
             <stop offset="0%" stopColor="#5fb8d3" />
             <stop offset="100%" stopColor="#8fc7df" />
           </linearGradient>
-          <linearGradient id="phAreaGradient" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="rgba(95,184,211,0.08)" />
-            <stop offset="55%" stopColor="rgba(95,184,211,0.025)" />
-            <stop offset="100%" stopColor="rgba(56,189,248,0)" />
-          </linearGradient>
           <linearGradient id="phTargetZoneGradient" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="rgba(45,212,191,0.055)" />
-            <stop offset="50%" stopColor="rgba(52,211,153,0.045)" />
-            <stop offset="100%" stopColor="rgba(45,212,191,0.055)" />
+            <stop offset="0%" stopColor="rgba(125,211,190,0.014)" />
+            <stop offset="50%" stopColor="rgba(125,211,190,0.022)" />
+            <stop offset="100%" stopColor="rgba(125,211,190,0.014)" />
           </linearGradient>
           <clipPath id="phChartClip">
             <rect x={pad.left} y={pad.top} width={innerWidth} height={innerHeight} />
@@ -1714,26 +1695,12 @@ function PhLiveChart({ data }) {
 
         {targetMin !== null && targetMax !== null ? (
           <rect
-            x={pad.left}
+            x="0"
             y={yForValue(targetMax)}
-            width={innerWidth}
-            height={Math.max(2, yForValue(targetMin) - yForValue(targetMax))}
-            rx="18"
+            width={width}
+            height={Math.max(1, yForValue(targetMin) - yForValue(targetMax))}
+            rx="0"
             fill="url(#phTargetZoneGradient)"
-          />
-        ) : null}
-
-        <path d={areaPath} fill="url(#phAreaGradient)" clipPath="url(#phChartClip)" />
-
-        {targetPh !== null ? (
-          <line
-            x1={pad.left}
-            x2={width - pad.right}
-            y1={yForValue(targetPh)}
-            y2={yForValue(targetPh)}
-            stroke="rgba(180,170,215,0.46)"
-            strokeDasharray="7 9"
-            strokeWidth="1.5"
           />
         ) : null}
 
@@ -1766,11 +1733,13 @@ function PhLiveChart({ data }) {
         ))}
       </svg>
 
-      {lastStatus !== 'ok' ? (
-        <div className="mt-3 inline-flex rounded-full border border-amber-300/16 bg-amber-300/[0.075] px-3 py-1 text-xs font-semibold text-amber-100/90">
-          pH {lastStatus === 'below' ? 'ниже' : 'выше'} диапазона удержания
-        </div>
-      ) : null}
+      <div className={`ml-3 mt-3 inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${
+        lastStatus === 'ok'
+          ? 'border-emerald-300/16 bg-emerald-300/[0.075] text-emerald-100/90'
+          : 'border-amber-300/16 bg-amber-300/[0.075] text-amber-100/90'
+      }`}>
+        {statusText}
+      </div>
     </div>
   )
 }
@@ -1784,14 +1753,6 @@ function PhGraphsView({
   onReload,
 }) {
   const points = Array.isArray(data?.points) ? data.points : []
-  const dosingEvents = Array.isArray(data?.dosing_events) ? data.dosing_events : []
-  const summary = data?.summary || {}
-  const dosingChannels = data?.dosing_channels || {}
-  const channels = dosingChannels.channels || dosingChannels
-  const phUpConnected = Boolean(channels.ph_up?.connected)
-  const phDownConnected = Boolean(channels.ph_down?.connected)
-  const anyDosingConnected = Boolean(dosingChannels.any_connected)
-  const hasStaleDosingChannel = [channels.ph_up?.status, channels.ph_down?.status].includes('stale')
   const lastPoint = points[points.length - 1]
   const targetText = data?.target_ph === null || data?.target_ph === undefined
     ? 'Целевой pH не задан.'
@@ -1799,14 +1760,6 @@ function PhGraphsView({
   const rangeText = data?.target_min === null || data?.target_min === undefined || data?.target_max === null || data?.target_max === undefined
     ? 'Целевой pH не задан.'
     : `${formatGraphNumber(data.target_min)}–${formatGraphNumber(data.target_max)}`
-  const phUp = summary.ph_up_doses ?? 0
-  const phDown = summary.ph_down_doses ?? 0
-  const dosingSummaryValue = anyDosingConnected ? `${phUp} / ${phDown}` : 'ожидание ESP32'
-  const dosingSummaryHint = anyDosingConnected
-    ? (dosingEvents.length ? 'подключённые каналы' : 'доз пока нет')
-    : hasStaleDosingChannel
-      ? 'статус дозаторов устарел'
-      : 'каналы не подключены'
 
   const statCards = [
     {
@@ -1833,14 +1786,6 @@ function PhGraphsView({
       accent: 'text-emerald-100',
       shell: 'from-emerald-300/[0.10] to-slate-950/0',
     },
-    {
-      label: 'pH Up / pH Down',
-      value: dosingSummaryValue,
-      hint: dosingSummaryHint,
-      icon: '↕',
-      accent: 'text-fuchsia-100',
-      shell: 'from-fuchsia-300/[0.09] to-slate-950/0',
-    },
   ]
 
   return (
@@ -1848,7 +1793,7 @@ function PhGraphsView({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-[24px] font-semibold tracking-tight text-white md:text-[28px]">Графики цикла</div>
-          <p className="mt-1.5 text-sm text-white/62">Динамика pH, целевой диапазон и события дозирования.</p>
+          <p className="mt-1.5 text-sm text-white/62">Динамика pH и диапазон удержания.</p>
         </div>
         <div className="flex items-center gap-2">
           {graphCycleId ? (
@@ -1881,7 +1826,7 @@ function PhGraphsView({
         </div>
       </div>
 
-      <div className="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid min-w-0 gap-3 md:grid-cols-3">
         {statCards.map((card) => (
           <GlassCard key={card.label} className={`rounded-[22px] border-white/[0.08] bg-gradient-to-br ${card.shell}`}>
             <div className="flex items-start justify-between gap-3">
@@ -1898,7 +1843,7 @@ function PhGraphsView({
         ))}
       </div>
 
-      <GlassCard className="relative min-h-[520px] rounded-[28px] border-white/[0.08] bg-white/[0.018]">
+      <GlassCard className="relative rounded-[28px] border-white/[0.08] bg-white/[0.018]">
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="text-[20px] font-semibold text-white">{graphCycleId ? 'pH цикла' : 'Live pH раствора'}</div>
@@ -1931,35 +1876,6 @@ function PhGraphsView({
           <PhLiveChart data={data} />
         )}
 
-        <div className="mt-4 flex flex-wrap gap-2 text-xs text-white/54">
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-1.5 w-5 rounded-full bg-cyan-300/70" />pH</span>
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-0.5 w-5 border-t border-dashed border-violet-300/70" />целевой pH</span>
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="h-2.5 w-5 rounded bg-emerald-300/14" />зона допуска</span>
-          {phUpConnected ? (
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="flex h-4 w-4 items-center justify-center rounded-full border border-blue-200/24 bg-blue-300/10 text-[10px] text-blue-100">↑</span>pH Up</span>
-          ) : null}
-          {phDownConnected ? (
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.025] px-3 py-1"><span className="flex h-4 w-4 items-center justify-center rounded-full border border-orange-200/24 bg-orange-300/10 text-[10px] text-orange-100">↓</span>pH Down</span>
-          ) : null}
-          {!anyDosingConnected ? (
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/[0.07] bg-white/[0.018] px-3 py-1 text-white/36">дозаторы: ожидание ESP32</span>
-          ) : null}
-        </div>
-
-        {!anyDosingConnected ? (
-          <div className="mt-3 max-w-2xl text-xs leading-5 text-white/38">
-            {hasStaleDosingChannel
-              ? 'Статус дозаторов устарел, маркеры временно скрыты.'
-              : 'Дозаторы pH Up / pH Down ожидают подключения ESP32. Маркеры дозирования появятся после подключения каналов.'}
-          </div>
-        ) : null}
-
-        {data && data.target_ph === null ? (
-          <div className="mt-3 text-xs text-white/38">Целевой диапазон не задан.</div>
-        ) : null}
-        {data && dosingEvents.length === 0 ? (
-          <div className="mt-1 text-xs text-white/38">Событий дозирования пока нет.</div>
-        ) : null}
       </GlassCard>
     </div>
   )
