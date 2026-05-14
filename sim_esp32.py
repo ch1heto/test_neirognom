@@ -12,26 +12,43 @@ load_dotenv(BASE_DIR / ".env")
 
 BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
-DEVICE_ID = "tray_1"
-COMMANDS_TOPIC = "farm/tray_1/cmd/#"
+TRAY_ID = os.getenv("TRAY_ID", "tray_1")
+DEVICE_ID = TRAY_ID
+COMMANDS_TOPIC = f"farm/{TRAY_ID}/cmd/#"
+TARGETS_TOPIC = f"farm/{TRAY_ID}/settings/targets"
 CONTROL_TOPIC = "farm/sim/control"
-CLIMATE_TOPIC = "farm/tray_1/sensors/climate"
-WATER_TOPIC = "farm/tray_1/sensors/water"
+CLIMATE_TOPIC = f"farm/{TRAY_ID}/sensors/climate"
+WATER_TOPIC = f"farm/{TRAY_ID}/sensors/water"
 current_mode = "NORMAL"
+last_targets = None
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         client.subscribe(COMMANDS_TOPIC)
         client.subscribe(CONTROL_TOPIC)
+        client.subscribe(TARGETS_TOPIC)
     else:
         print(f"[СИМУЛЯТОР] Ошибка подключения: {reason_code}")
 
 
 def on_message(client, userdata, msg):
-    global current_mode
+    global current_mode, last_targets
 
     payload = msg.payload.decode("utf-8")
+
+    if msg.topic == TARGETS_TOPIC:
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            print(f"[ESP32 SIM] Invalid targets payload: {payload}")
+            return
+        if isinstance(decoded, dict):
+            last_targets = decoded
+            print(f"[ESP32 SIM] Received targets: {decoded}")
+        else:
+            print(f"[ESP32 SIM] Invalid targets payload: {payload}")
+        return
 
     if msg.topic == CONTROL_TOPIC:
         next_mode = payload.strip().upper()

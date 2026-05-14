@@ -102,6 +102,7 @@ BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
 SENSORS_TOPIC = "farm/+/sensors/#"
 PH_ACTUATOR_STATUS_TOPIC = "farm/+/actuators/ph/status"
+TARGET_SETPOINTS_TOPIC_TEMPLATE = "farm/{tray_id}/settings/targets"
 POLZA_API_KEY = os.getenv("POLZA_API_KEY")
 DEV_FEATURES_ENABLED = os.getenv("DEV_FEATURES_ENABLED") == "true"
 client = AsyncOpenAI(
@@ -473,14 +474,14 @@ CHAT_SYSTEM_PROMPT = (
     "'Целевой pH', 'pH который пользователь выставил', 'pH в настройках', 'настройки pH' — это ph_target_settings.target_ph. "
     "Если пользователь спрашивает про pH, который он выставил, целевой pH, настройки pH, pH-контроль или дозаторы, отвечай по ph_target_settings, а не по текущему датчику и не по норме АгроТехКарты. "
     "Если ph_target_settings есть, говори: 'Сейчас в настройках сохранён целевой pH X с допуском ±Y, диапазон удержания A–B.' "
-    "Если autodosing_enabled=true, добавь: 'pH-контроль активен, backend-контроллер будет использовать ph_up/ph_down с защитными паузами.' "
+    "Если autodosing_enabled=true, добавь: 'pH-контроль активен: backend publishes pH/EC target setpoints; ESP32 performs local dosing with safety limits.' "
     "Если autodosing_enabled=false, добавь: 'pH-контроль сохранён, но автодозирование выключено.' "
     "Не говори, что пользователь выставил текущий pH датчика: это разные вещи. "
-    "Если текущий pH датчика есть и он выше или ниже пользовательского диапазона target_ph ± tolerance, можно сказать, что текущий pH датчика Z выше/ниже целевого диапазона, поэтому контроллер может выполнить микродозу pH Down/pH Up с учётом cooldown/mixing delay. "
+    "Если текущий pH датчика есть и он выше или ниже пользовательского диапазона target_ph ± tolerance, можно сказать, что текущий pH датчика Z выше/ниже целевого диапазона; backend публикует уставки, а решение о микродозе pH Down/pH Up принимает ESP32 с учётом safety limits. "
     "Не обещай, что насос уже сработал, если в recent ph_dosing_events нет события со status=executed. "
     "Если пользователь спрашивает, поменялся ли pH, который он выставил, отвечай про сохранённый target_ph и updated_at, а не про current_ph датчика. "
     "Если пользователь спрашивает, какой pH лучше выставить, можно использовать активную АгроТехКарту и текущий pH, но отдельно скажи, какой целевой pH уже сохранён в настройках, если настройка существует. "
-    "LLM не управляет насосами и не имеет права включать дозаторы. LLM только объясняет состояние и советует. Управление насосами выполняет backend pH auto-dosing controller по сохранённым настройкам и safety-ограничениям."
+    "LLM не управляет насосами и не имеет права включать дозаторы. LLM только объясняет состояние и советует. backend publishes pH/EC target setpoints; ESP32 performs local dosing with safety limits."
 )
 
 CROP_ALIASES: dict[str, tuple[str, ...]] = {
@@ -2356,7 +2357,7 @@ def build_ph_target_settings_context_for_prompt(tray_id: str = "tray_1") -> str:
                 "- это целевой pH контроллера, не текущий pH датчика и не норма АгроТехКарты",
             ])
             if settings.get("autodosing_enabled"):
-                lines.append("- статус pH-контроля: активен; backend-контроллер использует ph_up/ph_down с safety-паузами")
+                lines.append("- статус pH-контроля: активен; backend publishes pH/EC target setpoints; ESP32 performs local dosing with safety limits")
             else:
                 lines.append("- статус pH-контроля: настройки сохранены, автодозирование выключено")
         else:
@@ -4886,6 +4887,150 @@ def on_message(client, userdata, msg) -> None:
         print(f"[БЭКЕНД] Данные от {device_id}: {payload}")
 
 
+def target_setpoint_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def extract_ec_target(norms: Any) -> float | None:
+    if not isinstance(norms, dict):
+        return None
+    ec_norm = norms.get("ec")
+    if isinstance(ec_norm, dict):
+        for key in ("target", "target_value", "value"):
+            number = target_setpoint_number(ec_norm.get(key))
+            if number is not None:
+                return number
+        min_value = target_setpoint_number(ec_norm.get("min"))
+        max_value = target_setpoint_number(ec_norm.get("max"))
+        if min_value is not None and max_value is not None:
+            return round((min_value + max_value) / 2, 3)
+        return None
+    return target_setpoint_number(ec_norm)
+
+
+def build_target_setpoints_payload(
+    tray_id: str = "tray_1",
+    source: str = "server",
+) -> dict[str, Any]:
+    normalized_tray_id = str(tray_id or "tray_1").strip() or "tray_1"
+    payload: dict[str, Any] = {
+        "tray_id": normalized_tray_id,
+        "cycle_id": None,
+        "ph": None,
+        "ph_tolerance": None,
+        "ec": None,
+        "ec_tolerance": 0.1,
+        "autodosing_enabled": False,
+        "source": source,
+        "updated_at": datetime.now().replace(microsecond=0).isoformat(),
+    }
+
+    try:
+        cycle = get_current_growing_cycle(normalized_tray_id)
+    except Exception as exc:
+        print(f"[TARGETS] Warning: active cycle lookup failed for {normalized_tray_id}: {exc}")
+        cycle = None
+
+    if isinstance(cycle, dict):
+        payload["cycle_id"] = cycle.get("id")
+        payload["ec"] = extract_ec_target(cycle.get("norms"))
+        if payload["ec"] is None:
+            print(f"[TARGETS] Warning: EC target is not configured for {normalized_tray_id}")
+    else:
+        print(f"[TARGETS] Warning: active cycle not found for {normalized_tray_id}")
+
+    try:
+        ph_settings = get_current_ph_target_settings(normalized_tray_id)
+    except NoActiveGrowingCycleError as exc:
+        print(f"[TARGETS] Warning: pH target settings unavailable for {normalized_tray_id}: {exc}")
+        ph_settings = None
+    except Exception as exc:
+        print(f"[TARGETS] Warning: pH target settings lookup failed for {normalized_tray_id}: {exc}")
+        ph_settings = None
+
+    if isinstance(ph_settings, dict) and ph_settings.get("is_configured"):
+        payload["ph"] = target_setpoint_number(ph_settings.get("target_ph"))
+        payload["ph_tolerance"] = target_setpoint_number(ph_settings.get("tolerance"))
+        payload["autodosing_enabled"] = bool(ph_settings.get("autodosing_enabled"))
+    else:
+        print(f"[TARGETS] Warning: pH target settings are not configured for {normalized_tray_id}")
+
+    return payload
+
+
+def get_mqtt_client() -> mqtt.Client | None:
+    try:
+        return app.state.mqtt_client
+    except Exception:
+        return None
+
+
+def publish_target_setpoints(
+    tray_id: str = "tray_1",
+    source: str = "server",
+) -> dict[str, Any]:
+    normalized_tray_id = str(tray_id or "tray_1").strip() or "tray_1"
+    topic = TARGET_SETPOINTS_TOPIC_TEMPLATE.format(tray_id=normalized_tray_id)
+    payload = build_target_setpoints_payload(normalized_tray_id, source=source)
+    result = {
+        "topic": topic,
+        "payload": payload,
+        "published": False,
+    }
+
+    mqtt_client = get_mqtt_client()
+    if mqtt_client is None or not mqtt_client.is_connected():
+        print(f"[TARGETS] Warning: MQTT client is not connected; setpoints were not published to {topic}")
+        return result
+
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    try:
+        try:
+            message_info = mqtt_client.publish(topic, payload_json, qos=1, retain=True)
+        except TypeError:
+            message_info = mqtt_client.publish(topic, payload_json)
+        publish_rc = getattr(message_info, "rc", mqtt.MQTT_ERR_SUCCESS)
+    except Exception as exc:
+        print(f"[TARGETS] MQTT publish failed for {topic}: {exc}")
+        return result
+
+    if publish_rc != mqtt.MQTT_ERR_SUCCESS:
+        print(f"[TARGETS] MQTT publish returned rc={publish_rc} for {topic}")
+        return result
+
+    result["published"] = True
+    print(f"[TARGETS] Published setpoints to {topic}: {payload_json}")
+    return result
+
+
+async def publish_startup_target_setpoints_once(
+    tray_id: str = "tray_1",
+    timeout_seconds: float = 5.0,
+) -> None:
+    deadline = datetime.now() + timedelta(seconds=timeout_seconds)
+    while datetime.now() < deadline:
+        mqtt_client = get_mqtt_client()
+        if mqtt_client is not None and mqtt_client.is_connected():
+            break
+        await asyncio.sleep(0.2)
+
+    try:
+        active_cycle = await asyncio.to_thread(get_current_growing_cycle, tray_id)
+    except Exception as exc:
+        print(f"[TARGETS] Warning: startup active cycle lookup failed for {tray_id}: {exc}")
+        return
+    if active_cycle is None:
+        return
+
+    await asyncio.to_thread(publish_target_setpoints, tray_id, "server")
+
+
 async def internal_watchdog() -> None:
     in_alert_mode = False
     print("[WATCHDOG] Запущен внутри FastAPI. Проверка аномалий каждые 5 сек.")
@@ -5369,18 +5514,19 @@ async def lifespan(app: FastAPI):
     aggregation_task = asyncio.create_task(hourly_aggregation_worker())
     predictive_task = asyncio.create_task(predictive_watchdog_worker())
     recommendation_effect_task = asyncio.create_task(recommendation_effect_worker())
-    ph_dosing_task = asyncio.create_task(ph_dosing_controller_worker(mqtt_client))
+    startup_targets_task = asyncio.create_task(publish_startup_target_setpoints_once("tray_1"))
+    print("[TARGETS] ESP32 target setpoints mode enabled; server-side pH dosing worker is disabled")
 
     try:
         yield
     finally:
-        ph_dosing_task.cancel()
+        startup_targets_task.cancel()
         recommendation_effect_task.cancel()
         predictive_task.cancel()
         aggregation_task.cancel()
         watchdog_task.cancel()
         with suppress(asyncio.CancelledError):
-            await ph_dosing_task
+            await startup_targets_task
         with suppress(asyncio.CancelledError):
             await recommendation_effect_task
         with suppress(asyncio.CancelledError):
@@ -5699,17 +5845,32 @@ def api_get_current_ph_target_settings(
 @app.put("/api/ph-target-settings/current")
 def api_upsert_current_ph_target_settings(request: PhTargetSettingsRequest) -> dict[str, Any]:
     try:
-        return upsert_current_ph_target_settings(
+        settings = upsert_current_ph_target_settings(
             tray_id=request.tray_id,
             target_ph=request.target_ph,
             tolerance=request.tolerance,
             autodosing_enabled=request.autodosing_enabled,
             source=request.source,
         )
+        publish_target_setpoints(tray_id=request.tray_id, source="server")
+        return settings
     except NoActiveGrowingCycleError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
     except InvalidPhTargetSettingsError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+
+@app.post("/api/targets/publish")
+def api_publish_target_setpoints(
+    tray_id: str = Query(default="tray_1"),
+) -> dict[str, Any]:
+    result = publish_target_setpoints(tray_id=tray_id, source="manual")
+    return {
+        "ok": True,
+        "topic": result["topic"],
+        "payload": result["payload"],
+        "published": result["published"],
+    }
 
 
 @app.get("/api/ph-dosing/events")
@@ -5882,11 +6043,13 @@ def api_get_ph_live_chart(
 @app.post("/api/cycles/start")
 def api_start_growing_cycle(request: StartGrowingCycleRequest) -> dict[str, Any]:
     try:
-        return start_growing_cycle(
+        cycle = start_growing_cycle(
             request.crop_slug,
             tray_id=request.tray_id,
             notes=request.notes,
         )
+        publish_target_setpoints(tray_id=cycle.get("tray_id") or request.tray_id, source="server")
+        return cycle
     except CropNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
     except ActiveCardRevisionNotFoundError as exc:
