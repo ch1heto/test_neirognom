@@ -1,62 +1,196 @@
+# Нейрогном / Neuroagronomist
+
 ![Neuroagronomist](frontend/src/assets/gnome_2.png)
 
-# Neuroagronomist
+**Нейрогном** — дипломный проект AI-системы для компактной гидропонной сити-фермы. Система собирает телеметрию с ESP32 по MQTT, сохраняет данные в PostgreSQL, показывает состояние фермы в React-интерфейсе и помогает оператору через AI-чат. Backend на FastAPI связывает MQTT, REST API, АгроТехКарты, watchdog-аналитику и публикацию уставок pH/EC для ESP32.
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-Backend-009688?logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-Frontend-61DAFB?logo=react&logoColor=111111)
-![SQLite](https://img.shields.io/badge/SQLite-Database-003B57?logo=sqlite&logoColor=white)
-![ESP32](https://img.shields.io/badge/ESP32-Simulator-E7352C?logo=espressif&logoColor=white)
+AI-помощник Нейрогном отвечает с учётом активного цикла выращивания, текущих датчиков, pH-настроек, прошлого опыта и краткосрочной истории диалога в браузере. Он даёт рекомендации и объяснения, но не управляет насосами напрямую: backend публикует MQTT-уставки, а реальная ESP32 должна локально выполнять дозирование с safety limits.
 
-**Neuroagronomist** - прототип системы автоматизации гидропонной теплицы. Проект принимает телеметрию датчиков по MQTT, сохраняет измерения в SQLite, показывает состояние фермы в React-интерфейсе и отправляет команды исполнительным устройствам через симулятор ESP32.
+## Возможности
 
-## Описание проекта
+- сбор телеметрии по MQTT с ESP32 или локального `sim_esp32.py`;
+- активные циклы выращивания по выбранной культуре и лотку;
+- АгроТехКарты культур с нормами температуры воздуха, влажности, температуры воды, pH, EC, светового дня и интенсивности света;
+- контроль pH/EC, климата, устройств и событий фермы;
+- публикация MQTT-уставок pH/EC для ESP32;
+- локальное дозирование на ESP32 по уставкам и safety limits;
+- AI-чат Нейрогнома с контекстом активного цикла, датчиков, pH-настроек и истории диалога;
+- краткосрочное сохранение истории чата в `localStorage` браузера;
+- watchdog, события аномалий, рекомендации и журнал системных событий;
+- анализ завершённых циклов, обучение на результатах и предложения улучшений АгроТехКарт.
 
-Система построена как связка из трёх основных компонентов:
-
-- **FastAPI backend** принимает MQTT-телеметрию, сохраняет показания в SQLite, предоставляет REST API для frontend и запускает внутренний watchdog для AI-анализа аномалий климата.
-- **React frontend** отображает температуру, влажность, температуру воды, состояние устройств, журнал AI-решений, переключение режимов симуляции и чат с ассистентом.
-- **ESP32 simulator** имитирует контроллер лотка: публикует синтетические данные датчиков и слушает MQTT-команды для помпы, света и вентилятора.
-
-Схема обмена данными:
+## Архитектура
 
 ```text
-sim_esp32.py -> MQTT broker -> backend/main.py -> SQLite farm.db
-                                      |
-                                      v
-                              React dashboard
-                                      |
-                                      v
-                         MQTT commands to devices
+ESP32 / sim_esp32.py
+   ↕ MQTT
+MQTT Broker
+   ↕
+FastAPI Backend ↔ PostgreSQL
+   ↕ REST API
+React Frontend
 ```
+
+Поток уставок для дозирования:
+
+```text
+Backend → MQTT topic farm/{tray_id}/settings/targets → ESP32 local dosing
+```
+
+### ESP32 / sim_esp32.py
+
+- публикует телеметрию климата и воды;
+- подписывается на MQTT-команды устройств и target setpoints;
+- в реальной прошивке должна локально сравнивать датчики с уставками и выполнять дозирование с safety limits;
+- `sim_esp32.py` нужен для локальной проверки без железа и не заменяет аппаратную безопасность.
+
+### MQTT broker
+
+MQTT broker, например Mosquitto, служит транспортом между ESP32/симулятором и backend.
+
+### FastAPI backend
+
+- подписывается на MQTT-телеметрию и статусы;
+- сохраняет данные в PostgreSQL;
+- отдаёт REST API для frontend;
+- публикует target setpoints для ESP32;
+- формирует AI-контекст для Нейрогнома;
+- запускает watchdog, аналитику, рекомендации и pipeline обучения по завершённым циклам.
+
+### PostgreSQL
+
+Хранит телеметрию, циклы выращивания, АгроТехКарты, события, рекомендации, AI-логи, результаты циклов и предложения улучшений.
+
+### React frontend
+
+- dashboard состояния фермы;
+- чат Нейрогнома;
+- управление циклами выращивания;
+- pH-настройки;
+- графики, события, рекомендации и состояние устройств.
+
+## MQTT topics
+
+### Датчики климата
+
+Topic:
+
+```text
+farm/tray_1/sensors/climate
+```
+
+Payload:
+
+```json
+{"air_temp":23.4,"humidity":58.1}
+```
+
+### Датчики воды
+
+Topic:
+
+```text
+farm/tray_1/sensors/water
+```
+
+Payload:
+
+```json
+{"water_temp":20.1,"ph":6.2,"ec":1.45}
+```
+
+### Уставки для ESP32
+
+Topic:
+
+```text
+farm/tray_1/settings/targets
+```
+
+Payload:
+
+```json
+{
+  "tray_id": "tray_1",
+  "cycle_id": 13,
+  "ph": 5.8,
+  "ph_tolerance": 0.2,
+  "ec": 1.8,
+  "ec_tolerance": 0.1,
+  "autodosing_enabled": true,
+  "source": "server",
+  "updated_at": "2026-05-15T05:07:10"
+}
+```
+
+Backend публикует этот topic с `retain=True`, поэтому ESP32 может получить последнюю уставку после переподключения.
+
+### Статус pH-дозаторов
+
+```text
+farm/tray_1/actuators/ph/status
+```
+
+### Ручные команды устройств
+
+```text
+farm/tray_1/cmd/pump
+farm/tray_1/cmd/light
+farm/tray_1/cmd/fan
+```
+
+## pH/EC и дозирование
+
+Backend знает активную культуру, день цикла и нормы из активной АгроТехКарты. pH-уставка берётся из пользовательских pH-настроек, а EC-цель вычисляется из нормы EC активной АгроТехКарты.
+
+Backend публикует уставки в MQTT topic `farm/{tray_id}/settings/targets`. ESP32 локально сравнивает свои датчики с уставками, сама решает, какой насос включить, и применяет safety limits: паузы, лимиты доз за час, ограничения длительности и проверки свежести данных. LLM/чат не управляет насосами напрямую и не должен обещать, что насос уже сработал.
+
+Старый сценарий, где сервер напрямую выполняет pH-дозирование как основной режим, больше не является основной архитектурой. Актуальный путь: backend публикует уставки, ESP32 дозирует локально.
 
 ## Структура репозитория
 
 ```text
 .
-|-- backend/
-|   |-- main.py              # FastAPI, MQTT-клиент, SQLite, AI watchdog
-|   |-- .env.example         # безопасный шаблон переменных окружения
-|   `-- farm.db              # локальная SQLite-БД, создаётся при запуске
-|-- frontend/
-|   |-- package.json         # зависимости и npm-скрипты React/Vite
-|   `-- src/                 # UI, компоненты, стили и ассеты
-|-- sim_esp32.py             # симулятор датчиков и исполнительных устройств ESP32
-|-- start_farm.bat           # запуск всей системы в один клик на Windows
-|-- requirements.txt         # Python-зависимости backend и симулятора
+|-- backend/          # FastAPI, MQTT-клиент, PostgreSQL, AI-контекст, watchdog
+|-- frontend/         # React/Vite dashboard и чат Нейрогнома
+|-- sim_esp32.py      # локальный симулятор ESP32 для разработки
+|-- requirements.txt  # Python-зависимости backend и симулятора
+|-- .env.example      # пример переменных окружения
+|-- start_farm.bat    # быстрый локальный запуск на Windows
 `-- README.md
 ```
 
-## Требования к окружению
+## Требования
 
-- **Python 3.11+** для backend и симулятора ESP32.
-- **Node.js 20+** и npm для frontend на React/Vite.
-- **Windows** для запуска через `start_farm.bat`.
-- Доступ к MQTT-брокеру и AI API, указанным в настройках проекта.
+- Python 3.11+;
+- Node.js и npm;
+- PostgreSQL;
+- MQTT broker, например Mosquitto;
+- доступ к AI API через `POLZA_API_KEY`, если нужен AI-чат и аналитика;
+- ESP32 или `sim_esp32.py` для локальной симуляции.
 
-## Установка
+## Настройка `.env`
 
-Создайте и активируйте виртуальное окружение Python из корня репозитория:
+Создайте `.env` в корне проекта на основе `.env.example`. Не вставляйте реальные секреты в README, git или публичные чаты.
+
+Пример:
+
+```dotenv
+DATABASE_URL=postgresql://postgres:password@localhost:5432/neirognom
+BROKER_HOST=127.0.0.1
+BROKER_PORT=1883
+TRAY_ID=tray_1
+POLZA_API_KEY=replace_with_your_key
+AI_MODEL=gpt-5-nano
+POLZA_BASE_URL=https://polza.ai/api/v1/chat/completions
+DEV_FEATURES_ENABLED=false
+```
+
+В актуальном `.env.example` используются `BROKER_HOST`, `BROKER_PORT`, `DATABASE_URL`, `POLZA_API_KEY`, `AI_MODEL` и `POLZA_BASE_URL`. `TRAY_ID` поддерживается симулятором и по умолчанию равен `tray_1`; `DEV_FEATURES_ENABLED` включает dev-only возможности backend, если они нужны при разработке.
+
+## Локальный запуск
+
+### Установка зависимостей
 
 ```powershell
 python -m venv venv
@@ -64,110 +198,100 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Установите зависимости frontend:
-
 ```powershell
 cd frontend
 npm install
 cd ..
 ```
 
-## Настройка
+### Backend
 
-Backend и симулятор читают переменные окружения из файла:
-
-```text
-.env
+```powershell
+cd backend
+..\venv\Scripts\activate
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Создайте этот файл по шаблону `.env.example`.
+### Frontend
 
-MQTT-брокер настраивается через переменные окружения `BROKER_HOST` и `BROKER_PORT`. По умолчанию используется локальный брокер на `localhost`.
-
-Пример файла `.env`:
-
-```dotenv
-BROKER_HOST=127.0.0.1
-BROKER_PORT=1883
-POLZA_API_KEY=replace_with_your_polza_api_key
-AI_MODEL=gpt-5-nano
-POLZA_BASE_URL=https://polza.ai/api/v1/chat/completions
+```powershell
+cd frontend
+npm run dev
 ```
 
-Что это означает:
+Обычно Vite откроет frontend на `http://localhost:5173` или соседнем свободном порту. `start_farm.bat` запускает frontend на `http://localhost:5174`.
 
-- `BROKER_HOST=127.0.0.1` - локальный MQTT-брокер на текущем компьютере.
-- `BROKER_PORT=1883` - стандартный MQTT-порт.
-- Для сервера можно указать внешний адрес, например изменить `BROKER_HOST` на DNS-имя или IP нужного брокера.
+### Симулятор ESP32
 
-Остальные настройки выполнения:
+```powershell
+python sim_esp32.py
+```
 
-- SQLite-БД создаётся автоматически по пути `backend/farm.db`.
-- Backend запускается на порту `8000`.
-- Frontend запускается на порту `5174`.
+Симулятор полезен для локальной проверки MQTT, датчиков и получения target setpoints без реального железа. Для аппаратной проверки и продакшен-сценария предпочтительнее реальная ESP32 с локальной логикой дозирования и safety limits.
 
-## Запуск проекта
-
-Самый простой запуск всей системы на Windows:
+### Быстрый запуск на Windows
 
 ```powershell
 start_farm.bat
 ```
 
-Скрипт открывает отдельные терминалы и поднимает три процесса:
+Скрипт поднимает три процесса: `sim_esp32.py`, FastAPI backend и React frontend. Это удобно для разработки, но на сервере вместо симулятора обычно подключается реальная ESP32.
 
-- **ESP32 simulator**: выполняет `python sim_esp32.py`, раз в секунду публикует climate/water телеметрию в MQTT и принимает команды устройств.
-- **FastAPI backend**: выполняет `uvicorn main:app --reload --host 0.0.0.0 --port 8000` из папки `backend/`, инициализирует SQLite, подписывается на MQTT, открывает REST API и запускает внутренний watchdog.
-- **React frontend**: выполняет `npm run dev -- --host 0.0.0.0 --port 5174` из папки `frontend/`.
+## Серверный запуск
 
-После запуска откройте интерфейс:
+На сервере обычно работают отдельные сервисы:
 
-```text
-http://localhost:5174
-```
+- `neirognom-backend.service`;
+- `nginx`;
+- `postgresql`;
+- `mosquitto`.
 
-Backend API доступен по адресу:
+Полезные команды диагностики:
 
-```text
-http://localhost:8000
+```bash
+systemctl status neirognom-backend
+systemctl restart neirognom-backend
+systemctl status nginx
+systemctl status mosquitto
+systemctl status postgresql
 ```
 
 ## Полезные API endpoints
 
-- `GET /` - проверка состояния backend.
-- `GET /api/telemetry` - последние значения температуры, влажности и температуры воды.
-- `POST /api/device/control` - отправка команды устройству через MQTT.
-- `POST /api/ai/decide` - ручной запрос AI-решения по текущей телеметрии.
-- `GET /api/logs` - последние решения и действия AI.
-- `POST /api/chat` - чат с AI-ассистентом.
+- `GET /` — health check backend;
+- `GET /api/telemetry` — последние показатели датчиков;
+- `POST /api/chat` — чат Нейрогнома;
+- `POST /api/cycles/start` — запуск цикла выращивания;
+- `GET /api/cycles/current` — текущий активный цикл;
+- `GET /api/cycles/current/health` — оценка здоровья активного цикла;
+- `GET /api/crops` — список культур;
+- `GET /api/ph-target-settings/current` — текущие pH-настройки;
+- `PUT /api/ph-target-settings/current` — сохранить pH-настройки;
+- `POST /api/targets/publish?tray_id=tray_1` — вручную опубликовать target setpoints;
+- `POST /api/device/control` — ручная команда устройству через MQTT;
+- `GET /api/ph-dosing/events` — последние события pH-дозирования;
+- `GET /api/charts/ph-live` — данные live-графика pH;
+- `GET /api/system-feed` — журнал системных событий;
+- `GET /api/recommendations/recent` — последние рекомендации.
 
-## Ручной запуск
+## Проверка MQTT-уставок
 
-Если `start_farm.bat` не используется, запустите процессы в отдельных терминалах.
+Подпишитесь на topic уставок:
 
-Симулятор ESP32:
-
-```powershell
-venv\Scripts\activate
-python sim_esp32.py
+```bash
+mosquitto_sub -h 127.0.0.1 -p 1883 -t 'farm/tray_1/settings/targets' -v
 ```
 
-Backend:
+В другом терминале попросите backend опубликовать уставки:
 
-```powershell
-cd backend
-..\venv\Scripts\activate
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```bash
+curl -X POST "http://127.0.0.1:8000/api/targets/publish?tray_id=tray_1"
 ```
 
-Frontend:
+Ожидаемо: в MQTT приходит JSON с pH/EC уставками, например `ph`, `ph_tolerance`, `ec`, `ec_tolerance`, `autodosing_enabled`, `source` и `updated_at`.
 
-```powershell
-cd frontend
-npm run dev -- --host 0.0.0.0 --port 5174
-```
+## Статус проекта
 
-## Примечания
+Проект находится в состоянии дипломного прототипа / MVP. Он работает с локальным симулятором и рассчитан на подключение реальной ESP32.
 
-- Симулятор поддерживает режимы `NORMAL`, `HEAT` и `COLD` через MQTT-топик `farm/sim/control`.
-- Команды устройствам публикуются в топики вида `farm/tray_1/cmd/{pump|light|fan}`.
+Ключевая идея безопасности: AI объясняет и рекомендует, backend публикует уставки, а дозирование должно выполняться локально на ESP32 с safety limits. Аппаратная прошивка ESP32 остаётся критически важной частью безопасной работы фермы.
