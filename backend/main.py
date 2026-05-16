@@ -398,6 +398,7 @@ SYSTEM_FEED_PH_DOSING_TEXTS = {
     ("failed", None, "mqtt_publish_failed"): "Не удалось отправить команду pH-дозирования",
 }
 ADVISOR_HISTORY_HOURS = 24
+CHAT_PROMPT_HISTORY_LIMIT = 18
 AI_CONTEXT_NORM_KEYS = (
     "air_temp",
     "humidity",
@@ -442,6 +443,13 @@ CHAT_SYSTEM_PROMPT = (
     "11. Если пользователь задаёт follow-up вопрос с местоимениями вроде 'он', 'она', 'сколько раз', "
     "'когда последний раз', используй расширенный контекст фермы, который backend добавил на основе недавней темы диалога. "
     "Не говори, что точных данных нет, если в расширенном контексте есть counts/history из device_events.\n"
+    "11a. Если пользователь пишет короткое согласие или продолжение вроде 'да', 'давай', 'ок', 'ага', 'угу', "
+    "'продолжай', 'расскажи', 'расскажи подробнее', 'поясни', 'подробнее', 'а дальше', 'что дальше', "
+    "интерпретируй это как продолжение последней понятной темы из диалога, особенно последнего содержательного ответа Нейрогнома. "
+    "Не начинай новый диалог и не повторяй прошлый ответ целиком. Продолжи новым полезным блоком, который логически следует из предыдущего ответа. "
+    "Если в истории нет понятной темы, честно уточни, что именно продолжить. "
+    "Если пользователь использует местоимения или короткие фразы 'это', 'он', 'она', 'так', 'почему', 'а если так', 'давай так', "
+    "используй историю диалога для определения темы; если контекст очевиден, отвечай по нему и не проси лишнее уточнение.\n"
     "12. Если backend передал блок 'Прошлый опыт культуры', используй его как дополнительный источник фактов только для активной культуры. "
     "Не смешивай опыт разных культур. Не утверждай, что новая версия АгроТехКарты эффективнее, если завершённых циклов на ней ещё нет или данных недостаточно. "
     "Не делай жёсткие причинно-следственные выводы: формулируй осторожно, через 'раньше наблюдалось', 'в прошлых циклах было видно'. "
@@ -481,7 +489,17 @@ CHAT_SYSTEM_PROMPT = (
     "Не обещай, что насос уже сработал, если в recent ph_dosing_events нет события со status=executed. "
     "Если пользователь спрашивает, поменялся ли pH, который он выставил, отвечай про сохранённый target_ph и updated_at, а не про current_ph датчика. "
     "Если пользователь спрашивает, какой pH лучше выставить, можно использовать активную АгроТехКарту и текущий pH, но отдельно скажи, какой целевой pH уже сохранён в настройках, если настройка существует. "
-    "LLM не управляет насосами и не имеет права включать дозаторы. LLM только объясняет состояние и советует. backend publishes pH/EC target setpoints; ESP32 performs local dosing with safety limits."
+    "LLM не управляет насосами и не имеет права включать дозаторы. LLM только объясняет состояние и советует. backend publishes pH/EC target setpoints; ESP32 performs local dosing with safety limits.\n"
+    "18. Операторский протокол ответа: Используй это как внутренний каркас, но не показывай пользователю механически и не пиши одинаковые заголовки в каждом ответе. "
+    "Перед ответом внутренне определи намерение пользователя: обычный разговор; вопрос о текущем состоянии; практическая инструкция, план ухода или параметры для поддержания; диагностика отклонения; вопрос про pH/EC/дозаторы/ESP32/уставки; объяснение работы системы. "
+    "Если пользователь просто общается, отвечай живо и кратко, не вываливай датчики и нормы без запроса. "
+    "Если пользователь просит инструкцию, план ухода, нормы, параметры, что поддерживать, как выращивать или что делать весь цикл, начни с конкретных числовых целей из блока 'Операторские факты активного цикла', если они есть. "
+    "Обязательно используй pH, EC, температуру воды, температуру воздуха, влажность и свет, если они есть в фактах; не заменяй числа общими словами вроде 'тёплая', 'умеренная' или 'в пределах нормы'. Затем дай понятные действия по этапам или по параметрам и короткие ограничения безопасности. "
+    "Если пользователь спрашивает, что делать, когда показатель выше или ниже нормы, сравни текущий показатель с нормой, если данные свежие; если данных нет или они stale, сначала скажи проверить датчик и повторить замер. "
+    "Для EC выше нормы основной безопасный способ — разбавление чистой водой небольшими порциями или частичная замена раствора, затем перемешать и повторить замер. "
+    "Для pH не обещай, что насос сработал: backend публикует уставки, ESP32 дозирует локально с safety limits. "
+    "Если пользователь спрашивает про pH/EC/дозаторы/ESP32, всегда различай текущий датчик, норму культуры, пользовательскую pH-уставку и MQTT target setpoints; не путай текущий pH датчика с pH, который пользователь задал. "
+    "Если вопрос обучающий или разговорный, отвечай естественно, как живой помощник, но не придумывай факты."
 )
 
 CROP_ALIASES: dict[str, tuple[str, ...]] = {
@@ -4710,6 +4728,102 @@ def build_farm_facts_context_for_prompt(
     return "\n".join(lines)
 
 
+def add_operator_fact_line(lines: list[str], label: str, value: Any, unit: str = "") -> None:
+    if value is None or value == "":
+        return
+    suffix = f" {unit}" if unit else ""
+    lines.append(f"- {label}: {format_ai_norm_value(value)}{suffix}")
+
+
+def build_operator_facts_context(
+    tray_id: str = "tray_1",
+    sensor_freshness: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    lines = ["Операторские факты активного цикла:"]
+
+    try:
+        active_cycle = get_active_cycle_ai_context(tray_id)
+    except Exception as exc:
+        print(f"[AI_OPERATOR_CONTEXT] active cycle unavailable for prompt: {exc}")
+        active_cycle = None
+
+    if not isinstance(active_cycle, dict):
+        lines.extend([
+            "- Активный цикл: нет",
+            "- Нормы активной АгроТехКарты: нет данных, потому что цикл не запущен",
+        ])
+        return "\n".join(lines)
+
+    crop_name = active_cycle.get("crop_name_ru") or active_cycle.get("crop_slug") or "нет данных"
+    norms = active_cycle.get("norms") if isinstance(active_cycle.get("norms"), dict) else {}
+    latest_data = get_latest_data_snapshot()
+    water_is_fresh = is_sensor_type_fresh(sensor_freshness, "water")
+    climate_is_fresh = is_sensor_type_fresh(sensor_freshness, "climate")
+
+    lines.extend([
+        "- Активный цикл: да",
+        f"- Культура: {crop_name}",
+        f"- День цикла: {active_cycle.get('day_number') or 1}",
+        f"- Версия АгроТехКарты: {active_cycle.get('version_label') or 'нет данных'}",
+        f"- Лоток: {active_cycle.get('tray_id') or tray_id}",
+    ])
+
+    if norms:
+        lines.append("Целевые нормы АгроТехКарты:")
+        add_operator_fact_line(lines, "Температура воздуха", norms.get("air_temp"), "°C")
+        add_operator_fact_line(lines, "Влажность", norms.get("humidity"), "%")
+        add_operator_fact_line(lines, "Температура воды", norms.get("water_temp"), "°C")
+        add_operator_fact_line(lines, "pH норма культуры", norms.get("ph"))
+        add_operator_fact_line(lines, "EC норма культуры", norms.get("ec"), "mS/cm")
+        add_operator_fact_line(lines, "Световой день", norms.get("light_hours"), "ч")
+        add_operator_fact_line(lines, "Интенсивность света", norms.get("light_intensity"))
+    else:
+        lines.append("Целевые нормы АгроТехКарты: нет данных")
+
+    try:
+        ph_settings = get_current_ph_target_settings(tray_id)
+    except NoActiveGrowingCycleError:
+        ph_settings = None
+    except Exception as exc:
+        print(f"[AI_OPERATOR_CONTEXT] pH target settings unavailable for prompt: {exc}")
+        ph_settings = None
+
+    if isinstance(ph_settings, dict) and ph_settings.get("is_configured"):
+        lines.extend([
+            "Пользовательская pH-уставка:",
+            f"- Целевой pH: {format_ph_context_value(ph_settings.get('target_ph'))}",
+            f"- Допуск: ±{format_ph_context_value(ph_settings.get('tolerance'))}",
+            f"- Диапазон удержания: {format_ph_context_value(ph_settings.get('target_min'))}–{format_ph_context_value(ph_settings.get('target_max'))}",
+            f"- Автодозирование: {'включено' if ph_settings.get('autodosing_enabled') else 'выключено'}",
+        ])
+    else:
+        lines.append("Пользовательская pH-уставка: нет данных или не настроена")
+
+    lines.extend([
+        "Текущие показатели:",
+        f"- Температура воздуха: {format_current_or_stale_value(latest_data.get('Температура'), ' °C', climate_is_fresh)}",
+        f"- Влажность: {format_current_or_stale_value(latest_data.get('Влажность'), '%', climate_is_fresh)}",
+        f"- Температура воды: {format_current_or_stale_value(latest_data.get('Темп. воды'), ' °C', water_is_fresh)}",
+        f"- pH датчика: {format_current_or_stale_value(latest_data.get('pH'), '', water_is_fresh)}",
+        f"- EC датчика: {format_current_or_stale_value(latest_data.get('EC'), '', water_is_fresh)}",
+    ])
+
+    topic = TARGET_SETPOINTS_TOPIC_TEMPLATE.format(tray_id=active_cycle.get("tray_id") or tray_id)
+    ec_target = extract_ec_target(norms)
+    lines.extend([
+        "Уставки, публикуемые для ESP32:",
+        f"- MQTT topic: {topic}",
+        f"- pH: {format_ph_context_value(ph_settings.get('target_ph') if isinstance(ph_settings, dict) and ph_settings.get('is_configured') else None)}",
+        f"- pH tolerance: {format_ph_context_value(ph_settings.get('tolerance') if isinstance(ph_settings, dict) and ph_settings.get('is_configured') else None)}",
+        f"- EC: {format_ph_context_value(ec_target)}",
+        "- EC tolerance: 0.1",
+        f"- autodosing_enabled: {bool(ph_settings.get('autodosing_enabled')) if isinstance(ph_settings, dict) and ph_settings.get('is_configured') else False}",
+        "- Правило: backend только публикует уставки; ESP32 дозирует локально с safety limits.",
+    ])
+
+    return "\n".join(lines)
+
+
 def resolve_crop_context_target(message: str, messages: list | None = None, tray_id: str = "tray_1") -> tuple[str | None, str | None]:
     current_crop = extract_last_explicit_crop_from_messages(None, message)
     if current_crop:
@@ -4788,6 +4902,10 @@ def build_chat_prompt(
         messages=history,
         sensor_freshness=sensor_freshness_for_prompt,
     )
+    operator_facts_context = build_operator_facts_context(
+        "tray_1",
+        sensor_freshness=sensor_freshness_for_prompt,
+    )
     crop_context = build_crop_context_for_prompt(message, messages=history, tray_id="tray_1")
     ph_target_settings_context = build_ph_target_settings_context_for_prompt("tray_1")
     if stale_sensor_context:
@@ -4800,6 +4918,7 @@ def build_chat_prompt(
         prompt_parts.append(stale_sensor_context)
     prompt_parts.extend([
         f"Данные датчиков: {translated_data_string}",
+        operator_facts_context,
         format_active_cycle_for_prompt("tray_1"),
         ph_target_settings_context,
         (
@@ -4818,7 +4937,7 @@ def build_chat_prompt(
 
     if history:
         history_lines: list[str] = []
-        for item in history:
+        for item in history[-CHAT_PROMPT_HISTORY_LIMIT:]:
             role = item.get("role", "").strip().lower()
             text = str(item.get("text") or item.get("content") or "").strip()
             if not text:
@@ -4826,7 +4945,7 @@ def build_chat_prompt(
             speaker = "Пользователь" if role == "user" else "Нейрогном"
             history_lines.append(f"{speaker}: {text}")
         if history_lines:
-            prompt_parts.append("История диалога:\n" + "\n".join(history_lines))
+            prompt_parts.append("Недавний диалог:\n" + "\n".join(history_lines))
 
     prompt_parts.append(f"Пользователь: {message.strip()}\nНейрогном:")
     return "\n\n".join(prompt_parts)

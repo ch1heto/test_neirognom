@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import GlassCard from './GlassCard'
 import gnomeAvatar from '../assets/gnome.gif'
 import { SendIcon } from './Icons'
@@ -75,10 +75,32 @@ export default function ChatPanel({
   input,
   onInput,
   onSend,
+  onClearHistory,
   isThinking = false,
   thinkingSteps = [],
   className = "",
 }) {
+  const messagesContainerRef = useRef(null)
+  const messagesEndRef = useRef(null)
+  const hasScrolledInitiallyRef = useRef(false)
+
+  useEffect(() => {
+    const container = messagesContainerRef.current
+    const bottomAnchor = messagesEndRef.current
+    if (!container || !bottomAnchor) return
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    const isNearBottom = distanceFromBottom < 120
+    const behavior = hasScrolledInitiallyRef.current && isNearBottom ? 'smooth' : 'auto'
+
+    const frameId = window.requestAnimationFrame(() => {
+      bottomAnchor.scrollIntoView({ block: 'end', behavior })
+      hasScrolledInitiallyRef.current = true
+    })
+
+    return () => window.cancelAnimationFrame(frameId)
+  }, [messages.length, isThinking])
+
   return (
     <GlassCard className={`flex h-full min-h-0 flex-col rounded-[28px] ${className}`}>
       <div className="flex items-center gap-3 shrink-0">
@@ -96,20 +118,33 @@ export default function ChatPanel({
           />
           <div className="absolute inset-0 bg-violet-500/25 mix-blend-color pointer-events-none" />
         </div>
-        <div className="min-w-0">
-          <div className="text-[18px] font-semibold tracking-tight md:text-[20px]">Чат Нейрогнома</div>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <div className="truncate text-[18px] font-semibold tracking-tight md:text-[20px]">Чат Нейрогнома</div>
+            {onClearHistory ? (
+              <button
+                type="button"
+                onClick={onClearHistory}
+                disabled={isThinking}
+                className="shrink-0 rounded-full border border-white/10 bg-white/[0.035] px-2.5 py-1 text-[11px] font-medium text-white/45 transition hover:border-white/16 hover:bg-white/[0.06] hover:text-white/68 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                Очистить
+              </button>
+            ) : null}
+          </div>
           <div className="mt-1.5 inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-300">
             <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" /> Онлайн
           </div>
         </div>
       </div>
 
-      <div className="custom-scrollbar mt-2 flex-1 space-y-2 overflow-y-auto pr-1">
+      <div ref={messagesContainerRef} className="custom-scrollbar mt-2 flex-1 space-y-2 overflow-y-auto pr-1">
         {messages.map((message) => (
           <Bubble key={message.id} message={message} />
         ))}
 
         {isThinking && <ThinkingStatus steps={thinkingSteps} />}
+        <div ref={messagesEndRef} aria-hidden="true" />
       </div>
 
       <form

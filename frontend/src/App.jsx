@@ -273,6 +273,20 @@ const CHAT_THINKING_STEPS = [
   'Сверяю показатели с нормами',
   'Формирую ответ Нейрогнома',
 ]
+const INITIAL_CHAT_MESSAGES = [
+  {
+    id: 'initial-neirognom-message',
+    from: 'assistant',
+    role: 'assistant',
+    text: 'Привет! Я Нейрогном. Могу помочь с фермой, pH/EC, циклом выращивания и уходом за растениями.',
+    content: 'Привет! Я Нейрогном. Могу помочь с фермой, pH/EC, циклом выращивания и уходом за растениями.',
+  },
+]
+const CHAT_MESSAGES_STORAGE_KEY = 'neirognom_chat_messages_v1'
+const CHAT_SAVED_AT_STORAGE_KEY = 'neirognom_chat_saved_at_v1'
+const CHAT_HISTORY_TTL_MS = 24 * 60 * 60 * 1000
+const CHAT_STORAGE_MESSAGE_LIMIT = 50
+const CHAT_BACKEND_HISTORY_LIMIT = 25
 
 function makeId() {
   if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -482,10 +496,107 @@ function buildFinalVisualLearningStatus(baseStatus) {
   }
 }
 
+function getMessageRole(message) {
+  const role = String(message?.role || message?.from || '').trim().toLowerCase()
+  return role === 'assistant' ? 'assistant' : role === 'user' ? 'user' : ''
+}
+
+function getMessageText(message) {
+  const text = message?.text ?? message?.content
+  return typeof text === 'string' ? text : ''
+}
+
+function isRegularChatMessage(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return false
+  if (message.isTemporary || message.temporary || message.loading || message.isLoading) return false
+  if (['thinking', 'loading'].includes(String(message.type || '').toLowerCase())) return false
+
+  const role = getMessageRole(message)
+  const text = getMessageText(message).trim()
+  return (role === 'assistant' || role === 'user') && text.length > 0
+}
+
+function normalizeChatMessage(message) {
+  const role = getMessageRole(message)
+  const text = getMessageText(message).trim()
+
+  return {
+    id: message.id || makeId(),
+    from: role,
+    role,
+    text,
+    content: text,
+    time: message.time || formatTime(),
+  }
+}
+
+function normalizeChatMessages(messages) {
+  return Array.isArray(messages)
+    ? messages.filter(isRegularChatMessage).map(normalizeChatMessage)
+    : []
+}
+
+function createInitialChatMessages() {
+  return normalizeChatMessages(INITIAL_CHAT_MESSAGES)
+}
+
+function clearStoredChatMessages() {
+  try {
+    window.localStorage.removeItem(CHAT_MESSAGES_STORAGE_KEY)
+    window.localStorage.removeItem(CHAT_SAVED_AT_STORAGE_KEY)
+  } catch (error) {
+    console.warn('Failed to clear chat history from localStorage', error)
+  }
+}
+
+function loadChatMessages() {
+  try {
+    const savedAt = Number(window.localStorage.getItem(CHAT_SAVED_AT_STORAGE_KEY))
+    const isExpired = !Number.isFinite(savedAt) || Date.now() - savedAt > CHAT_HISTORY_TTL_MS
+
+    if (isExpired) {
+      clearStoredChatMessages()
+      return createInitialChatMessages()
+    }
+
+    const rawMessages = window.localStorage.getItem(CHAT_MESSAGES_STORAGE_KEY)
+    if (!rawMessages) {
+      return createInitialChatMessages()
+    }
+
+    const parsedMessages = JSON.parse(rawMessages)
+    if (!Array.isArray(parsedMessages) || !parsedMessages.every(isRegularChatMessage)) {
+      clearStoredChatMessages()
+      return createInitialChatMessages()
+    }
+
+    return normalizeChatMessages(parsedMessages).slice(-CHAT_STORAGE_MESSAGE_LIMIT)
+  } catch (error) {
+    console.warn('Failed to restore chat history from localStorage', error)
+    return createInitialChatMessages()
+  }
+}
+
+function saveChatMessages(messages) {
+  try {
+    const messagesToSave = normalizeChatMessages(messages).slice(-CHAT_STORAGE_MESSAGE_LIMIT)
+    window.localStorage.setItem(CHAT_MESSAGES_STORAGE_KEY, JSON.stringify(messagesToSave))
+    window.localStorage.setItem(CHAT_SAVED_AT_STORAGE_KEY, String(Date.now()))
+  } catch (error) {
+    console.warn('Failed to save chat history to localStorage', error)
+  }
+}
+
 function buildChatHistory(messages, userMessage) {
-  return [...messages, userMessage].map((message) => ({
-    role: message.from === 'assistant' ? 'assistant' : 'user',
-    content: message.text,
+  const userMessageId = userMessage?.id
+  const previousMessages = normalizeChatMessages(messages)
+    .filter((message) => !userMessageId || message.id !== userMessageId)
+    .slice(-CHAT_BACKEND_HISTORY_LIMIT)
+  const nextMessages = normalizeChatMessages([...previousMessages, userMessage])
+
+  return nextMessages.map((message) => ({
+    role: message.role,
+    content: message.content,
   }))
 }
 
@@ -1907,7 +2018,7 @@ export default function App() {
     led: { title: 'LED', scenario: 'Ожидание' }
   })
   const [thoughts, setThoughts] = useState([])
-  const [messages, setMessages] = useState([])
+  const [messages, setMessages] = useState(loadChatMessages)
   const [chatInput, setChatInput] = useState('')
   const [isChatThinking, setIsChatThinking] = useState(false)
   const [currentTime, setCurrentTime] = useState(formatTime())
@@ -1964,6 +2075,12 @@ export default function App() {
     ])
   }
 
+  const handleClearChatHistory = () => {
+    clearStoredChatMessages()
+    setMessages(createInitialChatMessages())
+    setChatInput('')
+  }
+
   useEffect(() => {
     const timer = setInterval(() => {
       const now = new Date()
@@ -1973,6 +2090,10 @@ export default function App() {
 
     return () => clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    saveChatMessages(messages)
+  }, [messages])
 
   useEffect(() => {
     let isMounted = true
@@ -3333,6 +3454,7 @@ export default function App() {
               input={chatInput}
               onInput={setChatInput}
               onSend={handleSendMessage}
+              onClearHistory={handleClearChatHistory}
               isThinking={isChatThinking}
               thinkingSteps={CHAT_THINKING_STEPS}
               className="flex-1"
