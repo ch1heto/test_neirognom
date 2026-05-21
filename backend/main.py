@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -5682,6 +5683,12 @@ class DeviceControlRequest(BaseModel):
     duration: float | None = None
 
 
+class LightDayRequest(BaseModel):
+    target_id: str = "tray_1"
+    duration_ms: int = 15000
+    start_delay_ms: int = 1200
+
+
 class ChatRequest(BaseModel):
     messages: list
 
@@ -5827,6 +5834,40 @@ def control_device(request: DeviceControlRequest) -> dict[str, str]:
         "device_type": device_type,
         "state": state,
         "payload": payload,
+    }
+
+
+@app.post("/api/light/day")
+def start_light_day(request: LightDayRequest) -> dict[str, Any]:
+    target_id = request.target_id.strip() or "tray_1"
+    payload = {
+        "command": "DAY_SCENARIO",
+        "duration_ms": request.duration_ms,
+        "start_delay_ms": request.start_delay_ms,
+    }
+    topic = f"farm/{target_id}/cmd/light"
+    server_now_ms = int(time.time() * 1000)
+    start_at_ms = server_now_ms + request.start_delay_ms
+
+    mqtt_client = get_mqtt_client()
+    if mqtt_client is None:
+        raise HTTPException(status_code=503, detail="MQTT client is not initialized")
+
+    message_info = mqtt_client.publish(
+        topic,
+        json.dumps(payload, ensure_ascii=False),
+        qos=0,
+    )
+    mqtt_rc = getattr(message_info, "rc", None)
+
+    return {
+        "ok": mqtt_rc in (None, mqtt.MQTT_ERR_SUCCESS),
+        "topic": topic,
+        "payload": payload,
+        "server_now_ms": server_now_ms,
+        "start_at_ms": start_at_ms,
+        "duration_ms": request.duration_ms,
+        "mqtt_rc": mqtt_rc,
     }
 
 

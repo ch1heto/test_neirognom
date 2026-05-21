@@ -2726,6 +2726,25 @@ export default function App() {
     }
   }
 
+  const handleStartDayScenario = async () => {
+    try {
+      const data = await requestJson('/api/light/day', {
+        method: 'POST',
+        body: JSON.stringify({
+          target_id: DEFAULT_TRAY_ID,
+          duration_ms: 15000,
+          start_delay_ms: 1200,
+        }),
+      })
+
+      setActiveLedStage(0)
+      setIsLedPlaying(true)
+      console.log('LED day scenario started', data)
+    } catch (error) {
+      console.error('Failed to start LED day scenario', error)
+    }
+  }
+
   const handlePhTargetFieldChange = (field) => (event) => {
     const value = event.target.value
     setPhTargetMessage('')
@@ -3364,10 +3383,7 @@ export default function App() {
         stages={ledStages}
         activeIndex={activeLedStage}
         isPlaying={isLedPlaying}
-        onPlay={() => {
-          setActiveLedStage(0)
-          setIsLedPlaying(true)
-        }}
+        onPlay={handleStartDayScenario}
         compact
       />
     </div>
