@@ -1429,22 +1429,22 @@ function LearningResultModal({ learningResult, onClose }) {
             <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-white/16 text-white/60">i</span>
             <span>Отчёт включает телеметрию, алерты, pH-дозирование, опросник и вывод ИИ.</span>
           </div>
-          <div className="flex flex-col gap-2 sm:flex-row">
+          {/*<div className="flex flex-col gap-2 sm:flex-row">
             <button
               type="button"
               disabled
               className="min-h-[48px] rounded-[16px] border border-white/10 bg-white/[0.035] px-5 text-sm font-semibold text-white/42 disabled:cursor-not-allowed"
             >
               Скачать отчёт
-            </button>
+            </button> 
             <button
               type="button"
               onClick={() => console.log('Open new AgroTechCard', learningResult)}
               className="min-h-[48px] rounded-[16px] border border-violet-200/30 bg-gradient-to-r from-sky-500 to-fuchsia-600 px-5 text-sm font-semibold text-white shadow-[0_0_28px_rgba(168,85,247,0.28)] transition hover:brightness-110"
             >
               Открыть новую АгроТехКарту
-            </button>
-          </div>
+            </button> 
+          </div> */}
         </footer>
       </div>
     </div>

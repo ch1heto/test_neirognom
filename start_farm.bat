@@ -13,7 +13,7 @@ echo Starting FastAPI backend with internal watchdog...
 start "FastAPI Backend" cmd /k "cd /d backend && call ..\venv\Scripts\activate.bat && uvicorn main:app --reload --host 0.0.0.0 --port 8000"
 
 echo Starting React frontend on http://localhost:5174...
-start "React Frontend" cmd /k "cd /d frontend && npm run dev -- --host 0.0.0.0 --port 5174"
+start "React Frontend" cmd /k "cd /d frontend && set VITE_DEV_FEATURES_ENABLED=true&& npm run dev -- --host 0.0.0.0 --port 5174"
 
 echo ==========================================
 echo Started 3 terminals:

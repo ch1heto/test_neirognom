@@ -100,6 +100,8 @@ load_dotenv(BASE_DIR.parent / ".env")
 
 BROKER_HOST = os.getenv("BROKER_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
+BROKER_USERNAME = os.getenv("BROKER_USERNAME", "").strip()
+BROKER_PASSWORD = os.getenv("BROKER_PASSWORD", "")
 SENSORS_TOPIC = "farm/+/sensors/#"
 PH_ACTUATOR_STATUS_TOPIC = "farm/+/actuators/ph/status"
 TARGET_SETPOINTS_TOPIC_TEMPLATE = "farm/{tray_id}/settings/targets"
@@ -5625,6 +5627,10 @@ async def lifespan(app: FastAPI):
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="backend_service")
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
+
+    if BROKER_USERNAME:
+        mqtt_client.username_pw_set(BROKER_USERNAME, BROKER_PASSWORD or None)
+
     mqtt_client.connect(BROKER_HOST, BROKER_PORT, 60)
     mqtt_client.loop_start()
 
